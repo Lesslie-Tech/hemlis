@@ -7,10 +7,10 @@ edition = "2021"
 [dependencies]
 logos = { version = "0.14.2", features = [] }
 rayon = "1.10.0"
-dashmap = "6.1.0"
 hemlis_macros = { path = "hemlis_macros/" }
 serde = { version = "1.0.215", features = [ "derive" ] }
 tracing = "0.1.41"
+papaya = "0.1.8"
 
 [dev-dependencies]
 insta = "1.40.0"

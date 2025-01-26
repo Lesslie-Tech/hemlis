@@ -5,7 +5,7 @@ use std::{
 };
 
 use ast::Ast;
-use dashmap::DashMap;
+use papaya::HashMap;
 
 pub mod ast;
 pub mod lexer;
@@ -75,22 +75,22 @@ pub fn version() -> String {
 }
 
 pub fn build_builtins() -> (
-    DashMap<ast::Ud, Vec<nr::Export>>,
+    HashMap<ast::Ud, Vec<nr::Export>>,
     ast::Ud,
-    DashMap<ast::Ud, String>,
+    HashMap<ast::Ud, String>,
 ) {
     use nr::Scope;
     use nr::Scope::*;
-    let names = DashMap::new();
+    let names = HashMap::new();
 
     let prim = ast::Ud::new("Prim");
 
     let h = |a: Scope, n: &'static str, s: &'static str| -> (Scope, ast::Ud, ast::Ud) {
         let s_ud = ast::Ud::new(s);
-        names.insert(s_ud, s.into());
+        names.pin().insert(s_ud, s.into());
 
         let n_ud = ast::Ud::new(n);
-        names.insert(n_ud, n.into());
+        names.pin().insert(n_ud, n.into());
         (a, n_ud, s_ud)
     };
 
@@ -155,12 +155,17 @@ pub fn build_builtins() -> (
         //
     ];
 
-    let exports = DashMap::new();
+    let exports = HashMap::new();
     for (s, m, n) in compiler_defines {
-        exports
-            .entry(m)
-            .or_insert(Vec::new())
-            .push(nr::Export::Just(nr::Name(s, m, n, nr::Visibility::Public)))
+        exports.pin().update_or_insert_with(
+            m,
+            |x: &Vec<_>| {
+                let mut out = x.clone();
+                out.push(nr::Export::Just(nr::Name(s, m, n, nr::Visibility::Public)));
+                out
+            },
+            Vec::new,
+        );
     }
 
     (exports, prim, names)
@@ -177,7 +182,7 @@ fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
                 panic!("ERR: {} {:?}", arg, e);
             }
             Ok(src) => {
-                let l = lexer::lex(&src, ast::Fi(i as usize));
+                let l = lexer::lex(&src, ast::Fi(i));
                 let mut p = parser::P::new(&l, &names);
                 if let Some(m) = parser::module(&mut p) {
                     let header = m.0.clone()?;
@@ -198,11 +203,8 @@ fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
         })
         .collect();
 
-    let names_: BTreeMap<_, _> = names
-        .iter()
-        .map(|k| (*k.key(), k.value().clone()))
-        .collect();
-    let mut done: BTreeSet<_> = exports.iter().map(|k| *k.key()).collect();
+    let names_: BTreeMap<_, _> = names.pin().iter().map(|(k, v)| (*k, v.clone())).collect();
+    let mut done: BTreeSet<_> = exports.pin().keys().cloned().collect();
     let mut imports = BTreeMap::new();
     let mut usages = BTreeMap::new();
     let mut resolved = BTreeMap::new();
@@ -232,7 +234,7 @@ fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
             let mut n = nr::N::new(*me, &exports);
             nr::resolve_names(&mut n, prim, m);
             errors.append(&mut n.errors);
-            exports.insert(*me, n.exports);
+            exports.pin().insert(*me, n.exports);
             imports.insert(*me, n.imports);
             for (name, x) in n.global_usages.iter() {
                 for (span, sort) in x.iter() {
@@ -311,8 +313,9 @@ fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
     if flags.contains(&Flag::ShowExports) {
         println!("EXPORTS");
         let mut ee = exports
+            .pin()
             .iter()
-            .map(|a| (*a.key(), a.value().clone()))
+            .map(|(k, v)| (*k, v.clone()))
             .collect::<Vec<_>>();
         ee.sort();
         for (k, v) in ee.iter() {
@@ -358,8 +361,8 @@ fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
             Ok(src) => {
                 use std::io::BufWriter;
 
-                let l = lexer::lex(&src, ast::Fi(i as usize));
-                let n = DashMap::new();
+                let l = lexer::lex(&src, ast::Fi(i));
+                let n = HashMap::new();
                 let mut p = parser::P::new(&l, &n);
 
                 let out = parser::module(&mut p);

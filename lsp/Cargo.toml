@@ -7,7 +7,6 @@ edition = "2021"
 
 [dependencies]
 hemlis = { path = "../." }
-dashmap = "6.1.0"
 glob = "0.3.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0.78", features = [] }
@@ -19,3 +18,4 @@ tracing = "0.1.41"
 json-subscriber = "0.2.4"
 tracing-subscriber = "0.3.19"
 chrono = "0.4.39"
+papaya = "0.1.8"

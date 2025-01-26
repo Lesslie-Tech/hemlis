@@ -2,6 +2,7 @@
 {
   "version": "0.2.0",
   "configurations": [
+
     {
       "type": "extensionHost",
       "request": "launch",
@@ -18,7 +19,7 @@
         "script": "watch"
       },
       "env": {
-        "SERVER_PATH": "${workspaceRoot}/target/debug/nrs-language-server"
+        "SERVER_PATH": "${workspaceRoot}/../target/debug/hemlis-language-server"
       }
     },
     // {
@@ -42,6 +43,13 @@
       "outFiles": [
         "${workspaceRoot}/client/out/test/**/*.js"
       ]
+    },
+    {
+      "name": "Attach to Rust Process",
+      "type": "lldb",
+      "sourceLanguages": ["rust"],
+      "request": "attach",
+      "pid": "${command:pickProcess}",
     }
   ],
   "compounds": [

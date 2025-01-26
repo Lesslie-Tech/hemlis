@@ -1,5 +1,5 @@
 use crate::ast::{self, Ast, Pos};
-use dashmap::DashMap;
+use papaya::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::instrument;
 
@@ -139,7 +139,7 @@ impl Sort {
 pub struct N<'s> {
     pub me: ast::Ud,
 
-    pub global_exports: &'s DashMap<ast::Ud, Vec<Export>>,
+    pub global_exports: &'s HashMap<ast::Ud, Vec<Export>>,
     pub global_usages: BTreeMap<Name, BTreeSet<(ast::Span, Sort)>>,
 
     pub references: BTreeMap<Name, BTreeSet<(ast::Span, Sort)>>,
@@ -157,7 +157,7 @@ pub struct N<'s> {
 }
 
 impl<'s> N<'s> {
-    pub fn new(me: ast::Ud, global_exports: &'s DashMap<ast::Ud, Vec<Export>>) -> Self {
+    pub fn new(me: ast::Ud, global_exports: &'s HashMap<ast::Ud, Vec<Export>>) -> Self {
         Self {
             me,
             references: BTreeMap::new(),
@@ -223,8 +223,9 @@ impl<'s> N<'s> {
         if !names.is_empty() {
             let valid: Vec<Export> = self
                 .global_exports
+                .pin()
                 .get(&from.0 .0)
-                .map(|x| x.value().clone())
+                .cloned()
                 .unwrap_or_default();
 
             for import in names {
@@ -646,15 +647,16 @@ impl<'s> N<'s> {
             self.errors.push(NRerrors::CannotImportSelf(import.span()));
             return;
         }
-        if !self.global_exports.contains_key(&from.0 .0) {
+        if !self.global_exports.pin().contains_key(&from.0 .0) {
             self.errors
                 .push(NRerrors::CouldNotFindImport(from.0 .0, from.0 .1));
             return;
         }
         let exports: Vec<Export> = self
             .global_exports
+            .pin()
             .get(&from.0 .0)
-            .map(|x| x.value().clone())
+            .cloned()
             .unwrap_or_default();
 
         let valid: BTreeMap<_, _> = exports

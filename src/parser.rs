@@ -1,6 +1,6 @@
 #![allow(clippy::needless_lifetimes)]
 
-use dashmap::DashMap;
+use papaya::HashMap;
 
 use crate::ast::*;
 use crate::lexer::Token as T;
@@ -1717,13 +1717,13 @@ pub struct P<'s> {
     pub errors: Vec<Serror<'s>>,
     pub panic: bool,
     pub steps: std::cell::RefCell<usize>,
-    pub names: &'s DashMap<Ud, String>,
+    pub names: &'s HashMap<Ud, String>,
 }
 
 impl<'s> P<'s> {
     pub fn new(
         tokens: &'s Vec<(Result<Token<'s>, ()>, Span)>,
-        names: &'s DashMap<Ud, String>,
+        names: &'s HashMap<Ud, String>,
     ) -> Self {
         Self {
             i: 0,
@@ -1739,9 +1739,7 @@ impl<'s> P<'s> {
         let ud = Ud::new(s);
         // NOTE: This is faster than a normal insert and avoids all possibilities of deadlocks
         // while maintaining data-correctness.
-        if let Some(dashmap::Entry::Vacant(e)) = self.names.try_entry(ud) {
-            e.insert(s.into());
-        }
+        self.names.pin().get_or_insert_with(ud, || s.into());
         ud
     }
 
@@ -1894,7 +1892,7 @@ mod tests {
                 use std::io::BufWriter;
 
                 let l = lexer::lex(&src, Fi(0));
-                let d = dashmap::DashMap::new();
+                let d = papaya::HashMap::new();
                 let mut p = P::new(&l, &d);
 
                 let mut buf = BufWriter::new(Vec::new());
