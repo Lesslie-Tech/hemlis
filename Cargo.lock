@@ -398,6 +398,7 @@ dependencies = [
  "hemlis",
  "json-subscriber",
  "papaya",
+ "rayon",
  "serde",
  "serde_json",
  "sungod",

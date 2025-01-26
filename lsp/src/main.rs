@@ -12,6 +12,7 @@ use futures::future::join_all;
 use hemlis_lib::*;
 use nr::{Export, NRerrors, Name, Scope, Visibility};
 use papaya::Operation;
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tower_lsp::jsonrpc::{Error, ErrorCode, Result};
@@ -248,7 +249,8 @@ impl LanguageServer for Backend {
         {
             tracing::info!("version {}", hemlis_lib::version());
             tracing::info!("Scanning...");
-            self.load_workspace().await;
+            let folders = self.client.workspace_folders().await.ok().flatten().unwrap_or_default();
+            self.load_workspace(folders).await;
             tracing::info!("Done scanning");
             let mut futures = Vec::new();
             for k in self.fi_to_url.pin().keys().copied() {
@@ -993,7 +995,8 @@ impl LanguageServer for Backend {
             self.client
                 .log_message(MessageType::INFO, "Loading entire workspace...".to_string())
                 .await;
-            self.load_workspace().await;
+            let folders = self.client.workspace_folders().await.ok().flatten().unwrap_or_default();
+            self.load_workspace(folders).await;
             self.client
                 .log_message(MessageType::INFO, "Done loading!".to_string())
                 .await;
@@ -1379,24 +1382,18 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    async fn load_workspace(&self) -> Option<()> {
+    async fn load_workspace(&self, folders: Vec<WorkspaceFolder>) -> Option<()> {
         tracing::info!("Load start");
-        let folders = self.client.workspace_folders().await.ok()??;
 
         for folder in folders {
             use glob::glob;
-            let mut deps_future: Vec<_> = Vec::new();
-            for path in glob(&format!(
+            let deps = glob(&format!(
                 "{}/lib/**/*.purs",
                 folder.uri.to_string().strip_prefix("file://")?
             ))
-            .ok()?
-            {
-                let path = path.as_ref().ok()?.clone();
-                deps_future.push(async { self.load_file(path) });
-            }
-            tracing::info!("=========");
-            let deps: Vec<_> = join_all(deps_future).await.into_iter().flatten().collect();
+            .ok()?.collect::<Vec<_>>().par_iter().filter_map(|path|
+                self.load_file(path.as_ref().ok()?.clone())
+            ).collect::<Vec<_>>();
             tracing::info!("=========");
 
             // NOTE: Not adding them to the name lookup
@@ -1434,14 +1431,8 @@ impl Backend {
                     }
                     break;
                 }
-                tracing::info!("BULK {:?}", todo.len());
-                let mut futures = Vec::new();
-                for (_, fi, _, m) in todo.iter() {
-                    futures.push(async {
-                        self.resolve_module(m, *fi, None);
-                    });
-                }
-                join_all(futures).await;
+                tracing::info!("BULK {:?} + {}/{}", todo.len(), done.len(), deps.len());
+                todo.par_iter().for_each(|(_, fi, _, m)| { self.resolve_module(m, *fi, None); });
                 done.append(&mut todo.into_iter().map(|(m, _, _, _)| *m).collect());
             }
         }
@@ -1477,6 +1468,9 @@ impl Backend {
             return None;
         }
         tracing::info!("GETTING LOCK {:?} {:?}", fi, version);
+        self.modules.pin().insert(me, m.clone());
+        // self.modules.pin().insert(me, m.clone());
+        // let modules = self.modules.pin();
         // let lock = self.locked.write();
         if self.got_refresh(fi, version) {
             tracing::info!("EARLY OUT 2 {:?} {:?}", fi, version);
@@ -1484,7 +1478,6 @@ impl Backend {
         }
         tracing::info!("HOLDING LOCK {:?} {:?}", fi, version);
 
-        self.modules.pin().insert(me, m.clone());
         self.fi_to_ud.pin().insert(fi, me);
         self.ud_to_fi.pin().insert(me, fi);
 
@@ -1652,7 +1645,7 @@ impl Backend {
                 );
             }
         }
-        // drop(lock);
+        // drop(modules);
         tracing::info!("RESOLVE_ENDED {:?} {:?}", fi, version);
         Some((exports_changed, n.me))
     }

@@ -1737,8 +1737,6 @@ impl<'s> P<'s> {
 
     fn intern(&self, s: &'_ str) -> Ud {
         let ud = Ud::new(s);
-        // NOTE: This is faster than a normal insert and avoids all possibilities of deadlocks
-        // while maintaining data-correctness.
         self.names.pin().get_or_insert_with(ud, || s.into());
         ud
     }
