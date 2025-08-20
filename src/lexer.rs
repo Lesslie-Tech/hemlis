@@ -205,7 +205,7 @@ pub enum Token<'t> {
     #[regex("[A-ZÅÄÖ][[:alnum:]'åäöÅÄÖ_]*", priority = 20)]
     Upper(&'t str),
 
-    #[regex(r"[!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤]+")]
+    #[regex(r"([!|#|$|%|&|*|+|.|\||\\|/|<|=|>|?|@|^|~|:|;|¤][!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤]+|[!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤][!|#|$|%|&|*|+|.|\||\\|/|<|=|>|?|@|^|~|:|;|¤][!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤]+)")]
     Op(&'t str),
 
     #[token("(", |lex| lex_symbol(lex))]
@@ -232,8 +232,8 @@ pub enum Token<'t> {
     #[regex("\"\"\"", |lex| lex_raw_string(lex))]
     RawString(&'t str),
 
-    #[regex("--+", |lex| lex_line_comment(lex), priority=100)]
-    #[token("--|", |lex| lex_line_comment(lex), priority=100)]
+    #[token("--", lex_line_comment, priority=100)]
+    #[token("--|", lex_line_comment, priority=100)]
     LineComment(&'t str),
 
     #[token("{-", |lex| lex_block_comment(lex))]
@@ -1111,6 +1111,16 @@ instance A A where
 
 a :: A
 a = 1
+        "#))
+    }
+
+    #[test]
+    fn weird_comments() {
+        assert_snapshot!(p(r#"
+            -- comment
+            --| comment
+            --# comment
+            --@@@@ comment
         "#))
     }
 }
