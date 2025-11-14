@@ -5,26 +5,6 @@ use logos::Logos;
 use crate::ast::{Fi, Span};
 // NOTE: Might not support unicode?
 
-fn lex_string<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> Option<&'t str> {
-    while let Some(at) = lex.remainder().find("\"") {
-        if at == 0 {
-            lex.bump(at + 1);
-            return Some(lex.slice());
-        }
-        match lex.remainder().get(at - 1..at + 1) {
-            Some("\\\"") => {
-                lex.bump(at + 1);
-            }
-            _ => {
-                lex.bump(at + 1);
-                let s = lex.slice();
-                return Some(&s[1..s.len() - 1]);
-            }
-        }
-    }
-    None
-}
-
 fn lex_raw_string<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> Option<&'t str> {
     while let Some(at) = lex.remainder().find("\"\"\"") {
         match lex.remainder().get(at + 3..at + 4) {
@@ -218,7 +198,7 @@ pub enum Token<'t> {
     #[regex(r#"'.'|'\\x.{1,8}'|'\\[trn"\\]'"#)]
     Char(&'t str),
 
-    #[regex("\"", |lex| lex_string(lex))]
+    #[regex(r#""([^"\\\x00-\x1F]|\\(["\\bnfrt/]|u[a-fA-F0-9]{4}))*""#)]
     String(&'t str),
 
     #[regex("\"\"\"", |lex| lex_raw_string(lex))]
@@ -920,6 +900,11 @@ mod tests {
     #[test]
     fn raw_string_8() {
         assert_snapshot!(p("\"\"\"\"\"\"\"\""))
+    }
+
+    #[test]
+    fn escaped_backslash() {
+        assert_snapshot!(p(r#""\\""#))
     }
 
     #[test]
