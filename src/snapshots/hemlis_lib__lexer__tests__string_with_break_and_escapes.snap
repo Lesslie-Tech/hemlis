@@ -1,0 +1,6 @@
+---
+source: src/lexer.rs
+expression: "p(r#\"\"\\\n            \\\\\"\"\"#)"
+---
+Ok(String("\"\\\n            \\\\\"\""))
+Ok(LayTop)

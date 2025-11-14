@@ -1,0 +1,6 @@
+---
+source: src/lexer.rs
+expression: "p(r#\"\"\\x00a0\"\"#)"
+---
+Ok(String("\"\\x00a0\""))
+Ok(LayTop)

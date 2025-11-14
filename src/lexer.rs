@@ -198,7 +198,7 @@ pub enum Token<'t> {
     #[regex(r#"'.'|'\\x.{1,8}'|'\\[trn"\\]'"#)]
     Char(&'t str),
 
-    #[regex(r#""([^"\\\x00-\x1F]|\\(["\\bnfrt/]|u[a-fA-F0-9]{4}))*""#)]
+    #[regex(r#""([^"\\]|\\([tnr\\"']|x[a-fA-F0-9]{1,6}|[ \t\n\r]+\\))*""#)]
     String(&'t str),
 
     #[regex("\"\"\"", |lex| lex_raw_string(lex))]
@@ -990,6 +990,17 @@ mod tests {
     #[test]
     fn funky_string() {
         assert_snapshot!(p("\"\""))
+    }
+
+    #[test]
+    fn string_with_break_and_escapes() {
+        assert_snapshot!(p(r#""\
+            \\"""#))
+    }
+
+    #[test]
+    fn string_hex() {
+        assert_snapshot!(p(r#""\x00a0""#))
     }
 
     #[test]
