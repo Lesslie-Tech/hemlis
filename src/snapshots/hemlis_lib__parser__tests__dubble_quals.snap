@@ -1,0 +1,21 @@
+---
+source: src/parser.rs
+expression: "p_module(r\"\nmodule H () where\n\nh = A. B. C.\n        \")"
+---
+12 of 12
+===
+Module
+ Header
+  MName
+   (1, 7)->(1, 8)
+  (1, 0)->(1, 6)
+  (1, 12)->(1, 17)
+  Decl::Def
+   Name
+    (3, 0)->(3, 1)
+   GuardedExpr::Unconditional
+    Expr::Error
+     (3, 4)->(3, 6)
+===
+Unexpected(Known(Fi(0), (3, 4), (3, 6)), Some(Qual("A.")), "Expected an expression")
+FailedToParseDecl(Known(Fi(0), (3, 0), (3, 1)), 1, 8, 11)

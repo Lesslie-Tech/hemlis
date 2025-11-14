@@ -1,6 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(r\"1.0\")"
----
-Ok(Number("1.0"))
-Ok(LayTop)

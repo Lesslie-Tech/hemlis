@@ -1,6 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(r#\"\"I like pie\"\"#)"
----
-Ok(String("\"I like pie\""))
-Ok(LayTop)

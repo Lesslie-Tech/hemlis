@@ -1,6 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(\"\\\"\\\"\")"
----
-Ok(String("\"\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\u{f61a}\""))
-Ok(LayTop)

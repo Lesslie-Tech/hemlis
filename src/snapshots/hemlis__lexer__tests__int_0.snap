@@ -1,6 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(\"123\")"
----
-Ok(Number("123"))
-Ok(LayTop)

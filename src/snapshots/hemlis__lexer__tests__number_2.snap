@@ -1,6 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(\"1e+10\")"
----
-Ok(Number("1e+10"))
-Ok(LayTop)

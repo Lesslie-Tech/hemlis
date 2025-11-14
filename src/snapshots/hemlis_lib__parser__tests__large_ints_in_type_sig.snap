@@ -1,6 +1,6 @@
 ---
 source: src/parser.rs
-expression: "p_typ(\"a\")"
+expression: "p_typ(\"2147483648\")"
 ---
 8 of 8
 ===
@@ -9,10 +9,12 @@ Module
   MName
    (0, 7)->(0, 10)
   NULL
+  (0, 0)->(0, 6)
+  (0, 11)->(0, 16)
   Decl::Sig
    Name
     (2, 0)->(2, 1)
-   Typ::Var
-    Name
-     (2, 5)->(2, 6)
+   Typ::Int
+    Int
+     (2, 5)->(2, 15)
 ===

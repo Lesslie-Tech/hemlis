@@ -1,6 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(\"'-'\")"
----
-Ok(Char("'-'"))
-Ok(LayTop)

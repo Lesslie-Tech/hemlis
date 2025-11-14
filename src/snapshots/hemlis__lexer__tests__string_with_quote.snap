@@ -1,6 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(r#\"\"Qotes are \\\"rad\\\"\"\"#)"
----
-Ok(String("\"Qotes are \\\"rad\\\"\""))
-Ok(LayTop)
