@@ -1,0 +1,8 @@
+---
+source: src/lexer.rs
+expression: "p(\"a\\n--+ comment\\nb\")"
+---
+Ok(Lower("a"))
+Ok(LayTop)
+Ok(Lower("b"))
+Ok(LayTop)

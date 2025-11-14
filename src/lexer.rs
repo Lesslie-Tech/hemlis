@@ -1091,13 +1091,37 @@ a = 1
     }
 
     #[test]
-    fn weird_comments() {
-        assert_snapshot!(p(r#"
-            -- comment
-            --+ comment
-            --| comment
-            --# comment
-            --@@@@ comment
-        "#))
+    fn weird_comment1() {
+        assert_snapshot!(p("a\n--\nb"))
+    }
+
+    #[test]
+    fn weird_comment2() {
+        assert_snapshot!(p("a\n-- comment\nb"))
+    }
+
+    #[test]
+    fn weird_comment3() {
+        assert_snapshot!(p("a\n--+ comment\nb"))
+    }
+
+    #[test]
+    fn weird_comment4() {
+        assert_snapshot!(p("a\n--| comment\nb"))
+    }
+
+    #[test]
+    fn weird_comment5() {
+        assert_snapshot!(p("a\n--# comment\nb"))
+    }
+
+    #[test]
+    fn weird_comment6() {
+        assert_snapshot!(p("a\n--@@@@ comment\nb"))
+    }
+
+    #[test]
+    fn weird_comment7() {
+        assert_snapshot!(p("a\n--: comment\nb"))
     }
 }

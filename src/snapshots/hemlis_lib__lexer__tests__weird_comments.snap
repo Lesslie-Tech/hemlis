@@ -1,5 +1,0 @@
----
-source: src/lexer.rs
-expression: "p(r#\"\n            -- comment\n            --+ comment\n            --| comment\n            --# comment\n            --@@@@ comment\n        \"#)"
----
-Ok(LayTop)
