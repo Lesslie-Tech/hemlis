@@ -776,7 +776,11 @@ impl LanguageServer for Backend {
                 return Err(error(line!(), "Module failed to load"));
             }
         );
-        let end_of_imports = head.2.last().map(|x| x.start.lo()).unwrap_or_else(|| head.4.next_line().lo());
+        let end_of_imports = head
+            .2
+            .last()
+            .map(|x| x.start.lo())
+            .unwrap_or_else(|| head.4.next_line().lo());
 
         let fixables = or_!(self.fixables.try_get(&fi).try_unwrap(), {
             return Err(error(line!(), "Module failed to load"));
@@ -909,8 +913,12 @@ impl LanguageServer for Backend {
                             }) {
                                 let imported_as = self.name_(&m);
                                 let invalid_name = self.name_(&n);
-                                if similarity_score(&imported_as.to_lowercase(), &invalid_name.to_lowercase()) < 0.4 {
-                                    continue; 
+                                if similarity_score(
+                                    &imported_as.to_lowercase(),
+                                    &invalid_name.to_lowercase(),
+                                ) < 0.4
+                                {
+                                    continue;
                                 }
                                 out.push(CodeAction {
                                     title: format!(
@@ -1146,8 +1154,12 @@ impl LanguageServer for Backend {
                             }) {
                                 let module_name = self.name_(&m);
                                 let namespace_name = self.name_(&n);
-                                if similarity_score(&module_name.to_lowercase(), &namespace_name.to_lowercase()) < 0.4 {
-                                    continue; 
+                                if similarity_score(
+                                    &module_name.to_lowercase(),
+                                    &namespace_name.to_lowercase(),
+                                ) < 0.4
+                                {
+                                    continue;
                                 }
                                 out.push(CodeAction {
                                     title: format!(
@@ -1435,15 +1447,20 @@ fn similarity_score(ax: &str, bx: &str) -> f32 {
         return ax.len() as f32;
     }
     let mut distances: Vec<Vec<usize>> = Vec::new();
-    for _ in bx.iter().chain([' '].iter()) { distances.push(vec![0; 1 + ax.len()]); }
+    for _ in bx.iter().chain([' '].iter()) {
+        distances.push(vec![0; 1 + ax.len()]);
+    }
 
-    for i in 1..=ax.len() { distances[0][i] = i; }
-    for j in 1..=bx.len() { distances[j][0] = j; }
+    for i in 1..=ax.len() {
+        distances[0][i] = i;
+    }
+    for j in 1..=bx.len() {
+        distances[j][0] = j;
+    }
 
     for (i, a) in ax.iter().enumerate() {
         for (j, b) in bx.iter().enumerate() {
-            distances[j + 1][i + 1] =
-                (distances[j][i] + (if a != b { 0 } else { 1 }))
+            distances[j + 1][i + 1] = (distances[j][i] + (if a != b { 0 } else { 1 }))
                 .min(distances[j][i + 1] + 1)
                 .min(distances[j + 1][i] + 1);
         }

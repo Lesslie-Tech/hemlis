@@ -19,7 +19,8 @@ goldentests = "1.1"
 [[bin]]
 name = "hemlis"
 path = "src/main.rs"
+test = false
 
 [lib]
 name = "hemlis_lib"
-path = "src/main.rs"
+path = "src/lib.rs"
