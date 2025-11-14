@@ -49,14 +49,6 @@ fn lex_block_comment<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> Option<&'t st
     None
 }
 
-fn lex_line_comment<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> Option<&'t str> {
-    if let Some(at) = lex.remainder().find("\n") {
-        lex.bump(at);
-        return Some(lex.slice());
-    }
-    None
-}
-
 fn lex_indent<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> usize {
     let at = lex.slice().rfind("\n").unwrap_or(0);
     lex.span()
@@ -205,7 +197,7 @@ pub enum Token<'t> {
     #[regex("[A-ZÅÄÖ][[:alnum:]'åäöÅÄÖ_]*", priority = 20)]
     Upper(&'t str),
 
-    #[regex(r"([!|#|$|%|&|*|+|.|\||\\|/|<|=|>|?|@|^|~|:|;|¤][!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤]+|[!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤][!|#|$|%|&|*|+|.|\||\\|/|<|=|>|?|@|^|~|:|;|¤][!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤]+)")]
+    #[regex(r"[!|#|$|%|&|*|+|.|\-|\||\\|/|<|=|>|?|@|^|~|:|;|¤]+")]
     Op(&'t str),
 
     #[token("(", |lex| lex_symbol(lex))]
@@ -232,8 +224,7 @@ pub enum Token<'t> {
     #[regex("\"\"\"", |lex| lex_raw_string(lex))]
     RawString(&'t str),
 
-    #[token("--", lex_line_comment, priority=100)]
-    #[token("--|", lex_line_comment, priority=100)]
+    #[regex(r"--[^\n]*", priority = 100)]
     LineComment(&'t str),
 
     #[token("{-", |lex| lex_block_comment(lex))]
@@ -1118,6 +1109,7 @@ a = 1
     fn weird_comments() {
         assert_snapshot!(p(r#"
             -- comment
+            --+ comment
             --| comment
             --# comment
             --@@@@ comment
