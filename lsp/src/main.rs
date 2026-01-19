@@ -934,7 +934,7 @@ impl LanguageServer for Backend {
             }
             match f {
                 Fixable::GuessImports(s, ns, n, at) => {
-                    // Assume `n` is spelt correctly
+                    // Assume `n` is spelled correctly
 
                     // 1. Find all possible imports with `n`
                     // 1a. Figure out what edits need to be done
@@ -1095,10 +1095,7 @@ impl LanguageServer for Backend {
                                         ns_name
                                     ),
                                     kind: Some(CodeActionKind::QUICKFIX),
-                                    is_preferred: Some(
-                                        ns_name.contains(&name_name)
-                                            || name_name.contains(&ns_name),
-                                    ),
+                                    is_preferred: Some(ns_name == name_name),
                                     edit: Some(WorkspaceEdit::new(
                                         [(
                                             uri.clone(),
