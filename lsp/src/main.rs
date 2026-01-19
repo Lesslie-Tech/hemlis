@@ -159,10 +159,11 @@ impl Backend {
                 .span()
                 .merge(def_at.name)
                 .merge(def_at.sig.unwrap_or(def_at.name));
+
             if whole_thing.line_range() < 8
                 || (name.scope() != Scope::Module && name.name().is_proper())
             {
-                // This is an artifact of the parser not kknowing where comments bellong - here it
+                // This is an artifact of the parser not knowing where comments belong - here it
                 // thinks the comments are part of the tail of the def - not the head of the
                 // next def.
                 if let Some(x) = try_find_lines(
@@ -192,7 +193,8 @@ impl Backend {
                     writeln!(target, "```").unwrap();
                 }
             } else {
-                if let Some(x) = try_find_lines(&source, def_at.name.lo().0, def_at.name.hi().0) {
+                let the_thing = def_at.name.merge(def_at.sig.unwrap_or(def_at.name));
+                if let Some(x) = try_find_lines(&source, the_thing.lo().0, the_thing.hi().0) {
                     writeln!(target, "```purescript").unwrap();
                     x.split("\n").for_each(|x| {
                         writeln!(target, "{}", x.trim_end()).unwrap();
@@ -200,6 +202,7 @@ impl Backend {
                     writeln!(target, "```").unwrap();
                 }
             }
+
             if let Some(x) =
                 try_find_comments_before(&source, def_at.sig.unwrap_or(def_at.name).lo().0)
             {
@@ -215,6 +218,7 @@ impl Backend {
                     .unwrap();
                 })
             }
+
             Some(())
         })();
 
