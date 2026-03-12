@@ -921,7 +921,7 @@ impl LanguageServer for Backend {
             out.push(CodeAction {
                 title: format!("BurnAllUnusedImport"),
                 kind: Some(CodeActionKind::SOURCE_FIX_ALL),
-                is_preferred: Some(false),
+                is_preferred: None,
                 edit: Some(WorkspaceEdit::new(
                     [(
                         uri.clone(),
@@ -1117,7 +1117,9 @@ impl LanguageServer for Backend {
                                     Export::ConstructorsSome(parent, constructors)
                                     | Export::ConstructorsAll(parent, constructors) => {
                                         if parent.name() == name_ud && parent.scope() == *s {
-                                            (*parent, *parent, false)
+                                            // The type itself matched — import with (..) so
+                                            // constructors are available too.
+                                            (*parent, *parent, true)
                                         } else if let Some(c) = constructors.iter().find(|c| {
                                             c.name() == name_ud
                                                 && c.scope() == *s
@@ -1151,6 +1153,30 @@ impl LanguageServer for Backend {
                                 let already_unqualified =
                                     unqualified_modules.contains(&module_ud);
 
+                                // Check if this module is *directly* imported in the current file
+                                // (as opposed to being accessible only via a re-export from another
+                                // module that is imported here). Re-export references live in the
+                                // exporting module's file, not the current file.
+                                let directly_imported = self
+                                    .references
+                                    .try_get(&module_ud)
+                                    .try_unwrap()
+                                    .and_then(|refs| {
+                                        refs.get(&Name(
+                                            Scope::Module,
+                                            module_ud,
+                                            module_ud,
+                                            Visibility::Public,
+                                        ))
+                                        .map(|spans| {
+                                            spans.iter().any(|(span, _)| span.fi() == Some(fi))
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                // A module is directly unqualified only when it's directly imported
+                                // AND not qualified (a qualified import is never in the None key).
+                                let directly_unqualified = directly_imported && !already_qualified;
+
                                 // How similar is this module's name to what the user typed?
                                 // When a namespace qualifier was typed (e.g. `Foo.bar`), use the
                                 // structured alias-match scoring (exact > ends-with > contains >
@@ -1171,10 +1197,8 @@ impl LanguageServer for Backend {
                                     if already_qualified || already_unqualified { 0.5 } else { 0.0 };
 
                                 // Suggestion A: Add name to an existing unqualified import.
-                                // Skip if the module is also imported qualified — the module_ud in
-                                // unqualified_modules may come from re-exports (e.g. Prelude re-exporting
-                                // List.head), not a direct unqualified import of this module.
-                                if already_unqualified && !already_qualified && ns.is_none() {
+                                // Only when the module is directly and solely imported unqualified.
+                                if directly_unqualified && ns.is_none() {
                                     (|| -> Option<()> {
                                         let (l, c) = self
                                             .references
@@ -1217,8 +1241,8 @@ impl LanguageServer for Backend {
                                 }
 
                                 // Suggestion B: New unqualified import line.
-                                // Only offered for bare-name references (no qualifier in source).
-                                if ns.is_none() {
+                                // Only offered for bare-name references not already directly imported unqualified.
+                                if ns.is_none() && !directly_unqualified {
                                     scored.push((
                                         0.3 + module_sim * 0.5 + import_bonus,
                                         CodeAction {
@@ -1242,6 +1266,8 @@ impl LanguageServer for Backend {
 
                                 // Suggestion C: Qualified import (not for operators or type operators).
                                 // Preferred over unqualified (higher base score).
+                                // When ns=None, skip if already_qualified — the "use existing alias"
+                                // suggestion (score 2.0) already covers this module.
                                 if !operator {
                                     if let Some(ns_alias) = ns {
                                         // User typed `Alias.name` — suggest importing the module as that alias.
@@ -1268,7 +1294,7 @@ impl LanguageServer for Backend {
                                                 ..CodeAction::default()
                                             },
                                         ));
-                                    } else {
+                                    } else if !already_qualified {
                                         // User typed a bare name — suggest a qualified import using
                                         // a dotless alias (e.g. Data.Map -> DataMap) and rewrite usage.
                                         // Alias format:
