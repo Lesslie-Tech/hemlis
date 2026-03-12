@@ -874,26 +874,37 @@ impl LanguageServer for Backend {
             return Err(error(line!(), "File failed to load"));
         });
 
-        let qq = self.modules.try_get(&me).try_unwrap();
-        let head = or_!(
-            &or_!(&qq, {
-                return Err(error(line!(), "Module failed to load"));
-            })
-            .value()
-            .0,
-            {
-                return Err(error(line!(), "Module failed to load"));
-            }
-        );
-        let end_of_imports = head
-            .2
-            .last()
-            .map(|x| x.start.lo())
-            .unwrap_or_else(|| head.4.next_line().lo());
+        // Extract end_of_imports and immediately drop the modules guard so background
+        // loading is not blocked while we do the (potentially slow) fixable processing.
+        let end_of_imports = {
+            let qq = self.modules.try_get(&me).try_unwrap();
+            let head = or_!(
+                &or_!(&qq, {
+                    return Err(error(line!(), "Module failed to load"));
+                })
+                .value()
+                .0,
+                {
+                    return Err(error(line!(), "Module failed to load"));
+                }
+            );
+            head.2
+                .last()
+                .map(|x| x.start.lo())
+                .unwrap_or_else(|| head.4.next_line().lo())
+            // qq (modules guard) dropped here
+        };
 
-        let fixables = or_!(self.fixables.try_get(&fi).try_unwrap(), {
-            return Err(error(line!(), "Module failed to load"));
-        });
+        // Clone fixables and drop the guard immediately. Background loading writes fixables
+        // first, then resolved/defines. Holding this guard blocks goto_definition from seeing
+        // freshly resolved names.
+        let fixables = {
+            let guard = or_!(self.fixables.try_get(&fi).try_unwrap(), {
+                return Err(error(line!(), "Module failed to load"));
+            });
+            guard.value().clone()
+            // guard (fixables read lock) dropped here
+        };
 
         let mut out = Vec::new();
 
@@ -934,392 +945,383 @@ impl LanguageServer for Backend {
             }
             match f {
                 Fixable::GuessImports(s, ns, n, at) => {
-                    // Assume `n` is spelled correctly
-
-                    // 1. Find all possible imports with `n`
-                    // 1a. Figure out what edits need to be done
-                    // TODO: Filter by first letter
-                    // TODO: Search with some kind of hemming distance, like everything
-                    // TODO: Drop the assumptions about `n` being spelt correctly
-                    // TODO: Score each of these and limit the number of responses
-                    // TODO: Remove unused imports
-                    // TODO: Import ska funka på namespace för do-block
-                    //
-                    // TODO: Add `_` to unused variables
-                    //
-                    // TODO: Qualified imports to unqualified imports
-                    // TODO: Handle unqualified imports
-                    //
-                    // TODO: Parse operators with operators table
-                    // TODO: Report on unnessecary parens, and then fix them? :o
-                    //
-                    // Fun stuff:
-                    // TODO: # <-> $
-                    // TODO: <#> <-> <$>
-                    // TODO: (...) <-> $
-                    // TODO: >>> <-> \x -> x
-
                     let imported = or_!(self.imports.try_get(&me).try_unwrap(), { continue })
                         .value()
                         .clone();
-                    let seen: BTreeSet<nr::Name> = imported
-                        .values()
-                        .flat_map(|x| x.iter().flat_map(|x| x.to_names()))
-                        .collect();
 
-                    let handle_quse = |ns: Option<ast::Ud>, name: &nr::Name, out: &mut Vec<_>| {
-                        out.push(CodeAction {
-                            title: format!(
-                                "[QUSE {:?}] Qualified use {} ({})",
-                                name.scope(),
-                                format_name(ns, name.name(), &self.names),
-                                self.name_(&name.module()),
-                            ),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            is_preferred: Some(true),
-                            edit: Some(WorkspaceEdit::new(
-                                [(
-                                    uri.clone(),
-                                    vec![TextEdit::new(
-                                        range(at.lo(), at.hi()),
-                                        format_name(ns, name.name(), &self.names),
-                                    )],
-                                )]
-                                .into(),
-                            )),
-                            ..CodeAction::default()
-                        });
+                    // Detect operators: names that start with a non-alphanumeric, non-underscore char.
+                    // Operators should never be suggested as qualified imports (e.g. `Mod.(+)`).
+                    let is_operator = |name_ud: ast::Ud| -> bool {
+                        self.names
+                            .try_get(&name_ud)
+                            .try_unwrap()
+                            .map(|s| {
+                                let first = s.chars().next().unwrap_or('_');
+                                !char::is_ascii_alphanumeric(&first) && first != '_'
+                            })
+                            .unwrap_or(false)
                     };
 
-                    let imported_unqualified_names: BTreeSet<_> = imported
+                    // Collect qualified import aliases for each module in this file:
+                    // module_ud -> [alias_ud, ...]
+                    let mut qualified_aliases: BTreeMap<ast::Ud, Vec<ast::Ud>> = BTreeMap::new();
+                    for (alias_opt, exports) in imported.iter() {
+                        let Some(alias) = alias_opt else { continue };
+                        for export in exports.iter() {
+                            for nm in export.to_names() {
+                                let entry = qualified_aliases.entry(nm.module()).or_default();
+                                if !entry.contains(alias) {
+                                    entry.push(*alias);
+                                }
+                            }
+                        }
+                    }
+
+                    // Modules imported unqualified in this file
+                    let unqualified_modules: BTreeSet<ast::Ud> = imported
                         .iter()
-                        .flat_map(|(m, xs)| match m {
-                            Some(_) => [].into(),
-                            None => xs
+                        .flat_map(|(alias_opt, exports)| {
+                            if alias_opt.is_some() {
+                                return vec![];
+                            }
+                            exports
                                 .iter()
-                                .flat_map(|x| x.to_names())
-                                .map(|x| x.module())
-                                .collect::<BTreeSet<_>>(),
+                                .flat_map(|e| e.to_names())
+                                .map(|n| n.module())
+                                .collect::<Vec<_>>()
                         })
                         .collect();
-                    for (m, xs) in imported.iter() {
-                        if *s == Scope::Namespace {
-                            let m = if let Some(m) = m { m } else { continue };
-                            // NOTE: Maybe this heuristic can be better
-                            // NOTE: This will give poor suggestions on most usages
-                            let apply = ast::Ud::new("apply");
-                            let bind = ast::Ud::new("bind");
-                            let pure = ast::Ud::new("pure");
-                            if xs.iter().any(|export| match export {
-                                Export::ConstructorsSome(_, _) | Export::ConstructorsAll(_, _) => {
-                                    false
-                                }
-                                Export::Just(name) => {
-                                    name.name() == apply
-                                        || name.name() == bind
-                                        || name.name() == pure
-                                }
-                            }) {
-                                let imported_as = self.name_(&m);
-                                let invalid_name = self.name_(&n);
-                                if similarity_score(
-                                    &imported_as.to_lowercase(),
-                                    &invalid_name.to_lowercase(),
-                                ) < 0.4
-                                {
-                                    continue;
-                                }
-                                out.push(CodeAction {
-                                    title: format!(
-                                        "[QUSE {:?}] Qualified use {} ({})",
-                                        *s, imported_as, invalid_name,
-                                    ),
-                                    kind: Some(CodeActionKind::QUICKFIX),
-                                    is_preferred: Some(true),
-                                    edit: Some(WorkspaceEdit::new(
-                                        [(
-                                            uri.clone(),
-                                            vec![TextEdit::new(
-                                                range(at.lo(), at.hi()),
-                                                imported_as,
-                                            )],
-                                        )]
-                                        .into(),
-                                    )),
-                                    ..CodeAction::default()
-                                });
+
+                    let all_exports: BTreeMap<ast::Ud, Vec<nr::Export>> = self
+                        .exports
+                        .iter()
+                        .map(|x| (*x.key(), x.value().clone()))
+                        .collect();
+
+                    // Scored suggestions: (score, CodeAction).
+                    // Higher score = more relevant. is_preferred mirrors score >= 1.5.
+                    let mut scored: Vec<(f32, CodeAction)> = Vec::new();
+
+                    if *s == Scope::Namespace {
+                        // The user referenced an unknown namespace qualifier.
+                        // Suggest: rename to an existing alias, or add a new qualified import.
+                        let namespace_str = self.name_(n);
+                        let target_alias =
+                            ns.map(|a| self.name_(&a)).unwrap_or_else(|| namespace_str.clone());
+
+                        // Already-imported qualified aliases that are similar to the typed name
+                        for (alias_opt, _) in imported.iter() {
+                            let Some(alias) = alias_opt else { continue };
+                            let alias_str = self.name_(alias);
+                            let sim = similarity_score(
+                                &alias_str.to_lowercase(),
+                                &namespace_str.to_lowercase(),
+                            );
+                            if sim < 0.4 {
+                                continue;
                             }
-                        } else {
-                            for export in xs.iter() {
-                                match export {
-                                    Export::ConstructorsSome(name, constructors)
-                                    | Export::ConstructorsAll(name, constructors) => {
-                                        if name.name() == *n && name.scope() == *s {
-                                            handle_quse(*m, name, &mut out);
+                            scored.push((sim + 1.0, CodeAction {
+                                title: format!("Use `{}` (already imported)", alias_str),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                is_preferred: Some(true),
+                                edit: Some(WorkspaceEdit::new(
+                                    [(uri.clone(), vec![TextEdit::new(
+                                        range(at.lo(), at.hi()),
+                                        alias_str,
+                                    )])]
+                                    .into(),
+                                )),
+                                ..CodeAction::default()
+                            }));
+                        }
+
+                        // Suggest importing any module with a name similar to the typed namespace
+                        for (m, _xs) in all_exports.iter() {
+                            if *m == me {
+                                continue;
+                            }
+                            let module_str = self.name_(m);
+                            let sim = alias_match_score(&module_str, &namespace_str);
+                            if sim <= 0.0 {
+                                continue;
+                            }
+                            let already_imported = qualified_aliases.contains_key(m);
+                            let score = sim + if already_imported { 0.5 } else { 0.0 };
+                            scored.push((score, CodeAction {
+                                title: format!("Import `{}` as `{}`", module_str, target_alias),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                is_preferred: Some(module_str == namespace_str),
+                                edit: Some(WorkspaceEdit::new(
+                                    [(uri.clone(), vec![TextEdit::new(
+                                        range(end_of_imports, end_of_imports),
+                                        format!("import {} as {}\n", module_str, target_alias),
+                                    )])]
+                                    .into(),
+                                )),
+                                ..CodeAction::default()
+                            }));
+                        }
+                    } else {
+                        // The user referenced an unknown name `n` with scope `s`.
+                        let name_ud = *n;
+                        let operator = is_operator(name_ud);
+
+                        // When the user typed a bare name (no namespace qualifier) and it's not
+                        // an operator, suggest using an already-imported qualified alias.
+                        if ns.is_none() && !operator {
+                            for (alias_opt, exports) in imported.iter() {
+                                let Some(alias) = alias_opt else { continue };
+                                for export in exports.iter() {
+                                    for nm in export.to_names() {
+                                        if nm.name() != name_ud || nm.scope() != *s {
+                                            continue;
                                         }
-                                        for c in constructors.iter() {
-                                            if c.name() == *n
+                                        let alias_str = self.name_(alias);
+                                        let name_str = self.name_(&nm.name());
+                                        let module_str = self.name_(&nm.module());
+                                        let usage = format!("{}.{}", alias_str, name_str);
+                                        scored.push((2.0, CodeAction {
+                                            title: format!(
+                                                "Use `{}` from `{}` (already imported as `{}`)",
+                                                usage, module_str, alias_str,
+                                            ),
+                                            kind: Some(CodeActionKind::QUICKFIX),
+                                            is_preferred: Some(true),
+                                            edit: Some(WorkspaceEdit::new(
+                                                [(uri.clone(), vec![TextEdit::new(
+                                                    range(at.lo(), at.hi()),
+                                                    usage,
+                                                )])]
+                                                .into(),
+                                            )),
+                                            ..CodeAction::default()
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+
+                        for (m, xs) in all_exports.iter() {
+                            if *m == me {
+                                continue;
+                            }
+                            for export in xs.iter() {
+                                // usage_name: the name as it appears at the call site
+                                // import_name: the name/type used for the import statement
+                                // is_ctor: whether import_name is a type containing a constructor
+                                let (usage_name, import_name, is_ctor): (
+                                    nr::Name,
+                                    nr::Name,
+                                    bool,
+                                ) = match export {
+                                    Export::ConstructorsSome(parent, constructors)
+                                    | Export::ConstructorsAll(parent, constructors) => {
+                                        if parent.name() == name_ud && parent.scope() == *s {
+                                            (*parent, *parent, false)
+                                        } else if let Some(c) = constructors.iter().find(|c| {
+                                            c.name() == name_ud
                                                 && c.scope() == *s
-                                                && c.scope() == nr::Scope::Term
-                                            {
-                                                handle_quse(*m, c, &mut out);
-                                            }
+                                                && c.scope() == Scope::Term
+                                        }) {
+                                            (*c, *parent, true)
+                                        } else {
+                                            continue;
                                         }
                                     }
                                     Export::Just(name) => {
-                                        if name.name() == *n && name.scope() == *s {
-                                            handle_quse(*m, name, &mut out);
+                                        if name.name() == name_ud && name.scope() == *s {
+                                            (*name, *name, false)
+                                        } else {
+                                            continue;
                                         }
+                                    }
+                                };
+
+                                let module_ud = usage_name.module();
+                                let module_str = self.name_(&module_ud);
+                                let usage_str = self.name_(&usage_name.name());
+                                let import_item = as_import(
+                                    import_name.scope(),
+                                    is_ctor,
+                                    import_name.name(),
+                                    &self.names,
+                                );
+
+                                let already_qualified = qualified_aliases.contains_key(&module_ud);
+                                let already_unqualified =
+                                    unqualified_modules.contains(&module_ud);
+
+                                // How similar is this module's name to what the user typed?
+                                // When a namespace qualifier was typed (e.g. `Foo.bar`), use the
+                                // structured alias-match scoring (exact > ends-with > contains >
+                                // PascalCase letter overlap) so that e.g. `Kanon.Table` ranks above
+                                // `Ganon` for qualifier `Kanon`.
+                                // When a bare name was typed (e.g. `bar`), use edit-distance similarity
+                                // against the export name as a weaker hint (e.g. `Map` for `map`).
+                                let module_sim = if let Some(ns_alias) = ns {
+                                    let alias_str = self.name_(ns_alias);
+                                    alias_match_score(&module_str, &alias_str)
+                                } else {
+                                    similarity_score(
+                                        &module_str.to_lowercase(),
+                                        &usage_str.to_lowercase(),
+                                    )
+                                };
+                                let import_bonus =
+                                    if already_qualified || already_unqualified { 0.5 } else { 0.0 };
+
+                                // Suggestion A: Add name to an existing unqualified import.
+                                // Skip if the module is also imported qualified — the module_ud in
+                                // unqualified_modules may come from re-exports (e.g. Prelude re-exporting
+                                // List.head), not a direct unqualified import of this module.
+                                if already_unqualified && !already_qualified && ns.is_none() {
+                                    (|| -> Option<()> {
+                                        let (l, c) = self
+                                            .references
+                                            .try_get(&module_ud)
+                                            .try_unwrap()?
+                                            .get(&Name(
+                                                Scope::Module,
+                                                module_ud,
+                                                module_ud,
+                                                Visibility::Public,
+                                            ))?
+                                            .iter()
+                                            .find_map(|(span, _): &(ast::Span, nr::Sort)| {
+                                                if span.fi() == Some(fi) {
+                                                    Some(*span)
+                                                } else {
+                                                    None
+                                                }
+                                            })?
+                                            .hi();
+                                        let c = c + 2;
+                                        scored.push((1.5 + module_sim * 0.5, CodeAction {
+                                            title: format!(
+                                                "Add `{}` to import of `{}`",
+                                                import_item, module_str,
+                                            ),
+                                            kind: Some(CodeActionKind::QUICKFIX),
+                                            is_preferred: Some(true),
+                                            edit: Some(WorkspaceEdit::new(
+                                                [(uri.clone(), vec![TextEdit::new(
+                                                    range((l, c), (l, c)),
+                                                    format!("{}, ", import_item),
+                                                )])]
+                                                .into(),
+                                            )),
+                                            ..CodeAction::default()
+                                        }));
+                                        None
+                                    })();
+                                }
+
+                                // Suggestion B: New unqualified import line.
+                                // Only offered for bare-name references (no qualifier in source).
+                                if ns.is_none() {
+                                    scored.push((
+                                        0.3 + module_sim * 0.5 + import_bonus,
+                                        CodeAction {
+                                            title: format!(
+                                                "Import `{}` from `{}`",
+                                                import_item, module_str,
+                                            ),
+                                            kind: Some(CodeActionKind::QUICKFIX),
+                                            is_preferred: Some(false),
+                                            edit: Some(WorkspaceEdit::new(
+                                                [(uri.clone(), vec![TextEdit::new(
+                                                    range(end_of_imports, end_of_imports),
+                                                    format!("import {} ({})\n", module_str, import_item),
+                                                )])]
+                                                .into(),
+                                            )),
+                                            ..CodeAction::default()
+                                        },
+                                    ));
+                                }
+
+                                // Suggestion C: Qualified import (not for operators or type operators).
+                                // Preferred over unqualified (higher base score).
+                                if !operator {
+                                    if let Some(ns_alias) = ns {
+                                        // User typed `Alias.name` — suggest importing the module as that alias.
+                                        let ns_str = self.name_(ns_alias);
+                                        scored.push((
+                                            module_sim + import_bonus,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Import `{}` as `{}`",
+                                                    module_str, ns_str,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(ns_str == module_str),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(uri.clone(), vec![TextEdit::new(
+                                                        range(end_of_imports, end_of_imports),
+                                                        format!(
+                                                            "import {} as {}\n",
+                                                            module_str, ns_str
+                                                        ),
+                                                    )])]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
+                                    } else {
+                                        // User typed a bare name — suggest a qualified import using
+                                        // a dotless alias (e.g. Data.Map -> DataMap) and rewrite usage.
+                                        // Alias format:
+                                        // - One dot (two segments) e.g. `Ctx.User` → `UserCtx`
+                                        // - Multiple dots e.g. `Data.Map.Strict` → `DataMapStrict`
+                                        let alias = {
+                                            let parts: Vec<&str> = module_str.split('.').collect();
+                                            if parts.len() == 2 {
+                                                format!("{}{}", parts[1], parts[0])
+                                            } else {
+                                                module_str.replace('.', "")
+                                            }
+                                        };
+                                        let qualified_usage = format!("{}.{}", alias, usage_str);
+                                        scored.push((
+                                            0.5 + module_sim * 0.5 + import_bonus,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Import `{}` and use as `{}`",
+                                                    module_str, qualified_usage,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(already_qualified),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(uri.clone(), vec![
+                                                        TextEdit::new(
+                                                            range(end_of_imports, end_of_imports),
+                                                            format!("import {} as {}\n", module_str, alias),
+                                                        ),
+                                                        TextEdit::new(
+                                                            range(at.lo(), at.hi()),
+                                                            qualified_usage,
+                                                        ),
+                                                    ])]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
                                     }
                                 }
                             }
                         }
                     }
 
-                    let exports: BTreeMap<ast::Ud, Vec<nr::Export>> = self
-                        .exports
-                        .iter()
-                        .map(|x| (*x.key(), x.value().clone()))
-                        .collect();
-
-                    let handle_qimport =
-                        |name: &nr::Name, constructor: &Option<nr::Name>, out: &mut Vec<_>| {
-                            if let Some(ns) = ns {
-                                let ns_name = self.name_(ns);
-                                let name_name = self.name_(&name.module());
-                                out.push(CodeAction {
-                                    title: format!(
-                                        "[QIMPORT {:?}] Qualified from {} as {}",
-                                        name.scope(),
-                                        name_name,
-                                        ns_name
-                                    ),
-                                    kind: Some(CodeActionKind::QUICKFIX),
-                                    is_preferred: Some(ns_name == name_name),
-                                    edit: Some(WorkspaceEdit::new(
-                                        [(
-                                            uri.clone(),
-                                            vec![TextEdit::new(
-                                                range(end_of_imports, end_of_imports),
-                                                format!(
-                                                    "import {} as {}\n",
-                                                    self.name_(&name.module()),
-                                                    self.name_(ns)
-                                                ),
-                                            )],
-                                        )]
-                                        .into(),
-                                    )),
-                                    ..CodeAction::default()
-                                });
-                                return;
-                            }
-                            out.push(CodeAction {
-                                title: format!(
-                                    "[QIMPORT {:?}] Qualified from {}",
-                                    name.scope(),
-                                    self.name_(&name.module())
-                                ),
-                                kind: Some(CodeActionKind::QUICKFIX),
-                                edit: Some(WorkspaceEdit::new(
-                                    [(
-                                        uri.clone(),
-                                        vec![
-                                            TextEdit::new(
-                                                range(end_of_imports, end_of_imports),
-                                                format!(
-                                                    "import {} as {}\n",
-                                                    self.name_(&name.module()),
-                                                    self.name_(&name.module())
-                                                ),
-                                            ),
-                                            TextEdit::new(
-                                                range(at.lo(), at.hi()),
-                                                format!(
-                                                    "{}.{}",
-                                                    self.name_(&name.module()),
-                                                    self.name_(
-                                                        &constructor.unwrap_or(*name).name()
-                                                    )
-                                                ),
-                                            ),
-                                        ],
-                                    )]
-                                    .into(),
-                                )),
-                                ..CodeAction::default()
-                            });
-                            // TODO: This needs to also find imports if they exist and add it
-                            // to them.
-                            if imported_unqualified_names.contains(&name.module()) {
-                                (|| -> Option<()> {
-                                    // TODO: This won't work with re-exports
-                                    let (l, c) =
-                                        self.references
-                                            .try_get(&name.module())
-                                            .try_unwrap()?
-                                            .get(&nr::Name(
-                                                nr::Scope::Module,
-                                                name.module(),
-                                                name.module(),
-                                                nr::Visibility::Public,
-                                            ))?
-                                            .iter()
-                                            .find_map(|(s, _): &(ast::Span, nr::Sort)| {
-                                                if s.fi() == Some(fi) {
-                                                    Some(*s)
-                                                } else {
-                                                    None
-                                                }
-                                            })?
-                                            .hi();
-                                    let c = c + 2;
-                                    out.push(CodeAction {
-                                        title: format!(
-                                            "[SUSE {:?}] Unqualified use {} ({})",
-                                            name.scope(),
-                                            format_name(None, name.name(), &self.names),
-                                            self.name_(&name.module()),
-                                        ),
-                                        kind: Some(CodeActionKind::QUICKFIX),
-                                        is_preferred: Some(true),
-                                        edit: Some(WorkspaceEdit::new(
-                                            [(
-                                                uri.clone(),
-                                                vec![TextEdit::new(
-                                                    range((l, c), (l, c)),
-                                                    format!(
-                                                        "{}, ",
-                                                        as_import(
-                                                            name.scope(),
-                                                            constructor.is_some(),
-                                                            name.name(),
-                                                            &self.names
-                                                        )
-                                                    ),
-                                                )],
-                                            )]
-                                            .into(),
-                                        )),
-                                        ..CodeAction::default()
-                                    });
-                                    None
-                                })();
-                            } else {
-                                out.push(CodeAction {
-                                    title: format!(
-                                        "[SIMPORT {:?}] import {} ({})",
-                                        name.scope(),
-                                        self.name_(&name.module()),
-                                        self.name_(&name.name())
-                                    ),
-                                    kind: Some(CodeActionKind::QUICKFIX),
-                                    edit: Some(WorkspaceEdit::new(
-                                        [(
-                                            uri.clone(),
-                                            vec![TextEdit::new(
-                                                range(end_of_imports, end_of_imports),
-                                                format!(
-                                                    "import {} ({})\n",
-                                                    self.name_(&name.module()),
-                                                    as_import(
-                                                        name.scope(),
-                                                        constructor.is_some(),
-                                                        name.name(),
-                                                        &self.names
-                                                    )
-                                                ),
-                                            )],
-                                        )]
-                                        .into(),
-                                    )),
-                                    ..CodeAction::default()
-                                });
-                            }
-                        };
-
-                    for (m, xs) in exports.iter() {
-                        if *m == me {
-                            continue;
-                        }
-                        if *s == Scope::Namespace {
-                            // NOTE: Maybe this heuristic can be better
-                            // NOTE: This will give poor suggestions on most usages
-                            let apply = ast::Ud::new("apply");
-                            let bind = ast::Ud::new("bind");
-                            let pure = ast::Ud::new("pure");
-                            if xs.iter().any(|export| match export {
-                                Export::ConstructorsSome(_, _) | Export::ConstructorsAll(_, _) => {
-                                    false
-                                }
-                                Export::Just(name) => {
-                                    name.name() == apply
-                                        || name.name() == bind
-                                        || name.name() == pure
-                                }
-                            }) {
-                                let module_name = self.name_(&m);
-                                let namespace_name = self.name_(&n);
-                                if similarity_score(
-                                    &module_name.to_lowercase(),
-                                    &namespace_name.to_lowercase(),
-                                ) < 0.4
-                                {
-                                    continue;
-                                }
-                                out.push(CodeAction {
-                                    title: format!(
-                                        "[QIMPORT {:?}] Qualified import {} as {}",
-                                        Scope::Namespace,
-                                        module_name,
-                                        namespace_name
-                                    ),
-                                    kind: Some(CodeActionKind::QUICKFIX),
-                                    is_preferred: Some(false),
-                                    edit: Some(WorkspaceEdit::new(
-                                        [(
-                                            uri.clone(),
-                                            vec![TextEdit::new(
-                                                range(end_of_imports, end_of_imports),
-                                                format!(
-                                                    "import {} as {}\n",
-                                                    module_name, namespace_name
-                                                ),
-                                            )],
-                                        )]
-                                        .into(),
-                                    )),
-                                    ..CodeAction::default()
-                                });
-                            }
-                        } else {
-                            for export in xs.iter() {
-                                match export {
-                                    Export::ConstructorsSome(name, constructors)
-                                    | Export::ConstructorsAll(name, constructors) => {
-                                        if name.name() == *n && name.scope() == *s {
-                                            handle_qimport(name, &None, &mut out);
-                                        }
-                                        for c in constructors.iter() {
-                                            if c.name() == *n
-                                                && c.scope() == *s
-                                                && c.scope() == nr::Scope::Term
-                                            {
-                                                handle_qimport(name, &Some(*c), &mut out);
-                                            }
-                                        }
-                                    }
-                                    Export::Just(name) => {
-                                        if name.name() == *n
-                                            && name.scope() == *s
-                                            && !seen.contains(name)
-                                        {
-                                            handle_qimport(name, &None, &mut out);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    // Sort by score descending so the most relevant suggestions appear first,
+                    // then cap to avoid overwhelming the editor with too many choices.
+                    scored.sort_by(|(a, _), (b, _)| {
+                        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    scored.truncate(25);
+                    for (_, action) in scored {
+                        out.push(action);
                     }
                 }
                 Fixable::RenameWithUnderscore(at) => out.push(CodeAction {
@@ -1372,10 +1374,11 @@ impl LanguageServer for Backend {
                 }),
             }
         }
-        // Place the best matches at the top of the list
-        out.sort_by_key(|x| (x.is_preferred, x.title.clone()));
-        out.dedup_by_key(|x| x.title.clone());
-        out.reverse();
+        // Dedup by title while preserving insertion order (which encodes relevance score),
+        // then stable-sort preferred items to the front without disturbing within-group order.
+        let mut seen_titles = std::collections::HashSet::new();
+        out.retain(|x| seen_titles.insert(x.title.clone()));
+        out.sort_by(|a, b| b.is_preferred.cmp(&a.is_preferred));
         Ok(Some(out.into_iter().map(|x| x.into()).collect()))
     }
 
@@ -1447,6 +1450,35 @@ impl LanguageServer for Backend {
             range: None,
         }))
     }
+}
+
+/// Score how well `qual` (the alias the user typed) matches `module_str` as an import alias.
+/// Returns a float in (0.0, 1.0] where **higher is better**. Used for ranking qualified suggestions.
+///
+/// Algorithm (adapted from PureScript client-side ranking):
+///   1. Exact match                                         → 1.0
+///   2. Module ends with qual                              → ~0.9999
+///   3. Module contains qual                               → ~0.9998
+///   4. Count PascalCase-initial letters of qual that      → small positive (more = better)
+///      appear anywhere in module name
+fn alias_match_score(module_str: &str, qual_str: &str) -> f32 {
+    if module_str == qual_str {
+        return 1.0;
+    }
+    if module_str.ends_with(qual_str) {
+        return 1.0 - 1e-4;
+    }
+    if module_str.contains(qual_str) {
+        return 1.0 - 2e-4;
+    }
+    // Split qual into PascalCase segments (regex [A-Z][a-z]*) and take the first
+    // character of each. Count how many of those characters appear in the module name.
+    let count = qual_str
+        .chars()
+        .filter(|c| c.is_uppercase())
+        .filter(|c| module_str.contains(*c))
+        .count();
+    count as f32 * 0.01
 }
 
 fn similarity_score(ax: &str, bx: &str) -> f32 {
@@ -1974,7 +2006,15 @@ impl Backend {
                         .filter(|(m, _, _, _)| !done.contains(m))
                         .collect();
                     if !left.is_empty() {
-                        tracing::error!("Dependency cycle detected: {}", left.len());
+                        tracing::warn!(
+                            "{} modules have unresolvable dependencies (external packages not in lib/); resolving with partial information",
+                            left.len()
+                        );
+                        // Resolve them anyway so that goto-definition works for names
+                        // defined in these modules, even if some of their imports are unknown.
+                        left.par_iter().for_each(|(_, fi, _, m)| {
+                            self.resolve_module(m, *fi, None);
+                        });
                     }
                     break;
                 }
