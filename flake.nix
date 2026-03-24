@@ -12,6 +12,10 @@
       pkgs = import nixpkgs {
         system = "x86_64-linux";
         overlays = [(import rust-overlay)];
+        config.allowUnfreePredicate = pkg:
+          builtins.elem (nixpkgs.lib.getName pkg) [
+            "github-copilot-cli"
+          ];
       };
       toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchains.toml;
       craneLib = crane.mkLib pkgs;
@@ -29,6 +33,9 @@
           rust-analyzer
           rustfmt
           nil
+          bash
+          github-copilot-cli
+          nodejs
         ];
       };
     };
