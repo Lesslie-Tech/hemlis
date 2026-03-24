@@ -176,28 +176,17 @@ impl Backend {
                     },
                 ) {
                     writeln!(target, "```purescript").unwrap();
-                    x.split("\n")
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .skip_while(|x| {
-                            let xx = x.trim();
-                            xx.starts_with("--") || xx.is_empty()
-                        })
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .for_each(|x| {
-                            writeln!(target, "{}", x.trim_end()).unwrap();
-                        });
+                    format_hover_snippet(x, true).split('\n').for_each(|x| {
+                        writeln!(target, "{}", x).unwrap();
+                    });
                     writeln!(target, "```").unwrap();
                 }
             } else {
                 let the_thing = def_at.name.merge(def_at.sig.unwrap_or(def_at.name));
                 if let Some(x) = try_find_lines(&source, the_thing.lo().0, the_thing.hi().0) {
                     writeln!(target, "```purescript").unwrap();
-                    x.split("\n").for_each(|x| {
-                        writeln!(target, "{}", x.trim_end()).unwrap();
+                    format_hover_snippet(x, false).split('\n').for_each(|x| {
+                        writeln!(target, "{}", x).unwrap();
                     });
                     writeln!(target, "```").unwrap();
                 }
@@ -208,20 +197,16 @@ impl Backend {
             {
                 writeln!(target).unwrap();
                 x.split("\n").for_each(|x| {
-                    writeln!(
-                        target,
-                        "{}",
-                        x.trim_start_matches("--")
-                            .trim_start_matches("|")
-                            .trim_start_matches(" |")
-                    )
-                    .unwrap();
+                    writeln!(target, "{}", strip_hover_comment_prefix(x)).unwrap();
                 })
             }
 
             Some(())
         })();
 
+        if !target.is_empty() {
+            writeln!(target).unwrap();
+        }
         write!(target, "{:?} {}", name.scope(), self.name_(&name.name())).unwrap();
         if let Some(module_name) = self.name(&name.module()) {
             write!(target, ", in {}", module_name).unwrap();
@@ -248,6 +233,59 @@ fn try_find_lines(source: &str, lo: usize, hi: usize) -> Option<&str> {
     Some(&source[line_start + 1..line_end])
 }
 
+fn dedent(s: &str) -> String {
+    let min_indent = s
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    s.split('\n')
+        .map(|line| {
+            if line.len() >= min_indent {
+                &line[min_indent..]
+            } else {
+                line.trim_start()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_hover_snippet(source: &str, trim_trailing_comments: bool) -> String {
+    let source = if trim_trailing_comments {
+        source
+            .split('\n')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .skip_while(|line| {
+                let line = line.trim();
+                line.starts_with("--") || line.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        source.to_string()
+    };
+    dedent(&source)
+        .split('\n')
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_hover_comment_prefix(line: &str) -> &str {
+    line.trim_start()
+        .trim_start_matches("--")
+        .trim_start()
+        .trim_start_matches("|")
+        .trim_start()
+}
+
 fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
     let mut it = source.match_indices("\n");
     let (at, _) = it.nth(line)?;
@@ -272,6 +310,33 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
         None
     } else {
         Some(&source[first + 1..last])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_hover_snippet, strip_hover_comment_prefix};
+
+    #[test]
+    fn hover_snippet_dedents_short_definitions() {
+        let source = "        lookupSinkSatisfied :: Map StepId (Tuple StarBuck StarBuck) -> StarBuck\n        lookupSinkSatisfied amounts =\n\n          -- trailing comment";
+
+        assert_eq!(
+            format_hover_snippet(source, true),
+            "lookupSinkSatisfied :: Map StepId (Tuple StarBuck StarBuck) -> StarBuck\nlookupSinkSatisfied amounts ="
+        );
+    }
+
+    #[test]
+    fn hover_doc_comments_strip_indented_haddock_prefixes() {
+        assert_eq!(
+            strip_hover_comment_prefix("        -- | The sum of the buy amounts"),
+            "The sum of the buy amounts"
+        );
+        assert_eq!(
+            strip_hover_comment_prefix("        -- NOTE[sg]: leave non-haddock text alone"),
+            "NOTE[sg]: leave non-haddock text alone"
+        );
     }
 }
 
@@ -1006,8 +1071,9 @@ impl LanguageServer for Backend {
                         // The user referenced an unknown namespace qualifier.
                         // Suggest: rename to an existing alias, or add a new qualified import.
                         let namespace_str = self.name_(n);
-                        let target_alias =
-                            ns.map(|a| self.name_(&a)).unwrap_or_else(|| namespace_str.clone());
+                        let target_alias = ns
+                            .map(|a| self.name_(&a))
+                            .unwrap_or_else(|| namespace_str.clone());
 
                         // Already-imported qualified aliases that are similar to the typed name
                         for (alias_opt, _) in imported.iter() {
@@ -1020,19 +1086,22 @@ impl LanguageServer for Backend {
                             if sim < 0.4 {
                                 continue;
                             }
-                            scored.push((sim + 1.0, CodeAction {
-                                title: format!("Use `{}` (already imported)", alias_str),
-                                kind: Some(CodeActionKind::QUICKFIX),
-                                is_preferred: Some(true),
-                                edit: Some(WorkspaceEdit::new(
-                                    [(uri.clone(), vec![TextEdit::new(
-                                        range(at.lo(), at.hi()),
-                                        alias_str,
-                                    )])]
-                                    .into(),
-                                )),
-                                ..CodeAction::default()
-                            }));
+                            scored.push((
+                                sim + 1.0,
+                                CodeAction {
+                                    title: format!("Use `{}` (already imported)", alias_str),
+                                    kind: Some(CodeActionKind::QUICKFIX),
+                                    is_preferred: Some(true),
+                                    edit: Some(WorkspaceEdit::new(
+                                        [(
+                                            uri.clone(),
+                                            vec![TextEdit::new(range(at.lo(), at.hi()), alias_str)],
+                                        )]
+                                        .into(),
+                                    )),
+                                    ..CodeAction::default()
+                                },
+                            ));
                         }
 
                         // Suggest importing any module with a name similar to the typed namespace
@@ -1047,19 +1116,28 @@ impl LanguageServer for Backend {
                             }
                             let already_imported = qualified_aliases.contains_key(m);
                             let score = sim + if already_imported { 0.5 } else { 0.0 };
-                            scored.push((score, CodeAction {
-                                title: format!("Import `{}` as `{}`", module_str, target_alias),
-                                kind: Some(CodeActionKind::QUICKFIX),
-                                is_preferred: Some(module_str == namespace_str),
-                                edit: Some(WorkspaceEdit::new(
-                                    [(uri.clone(), vec![TextEdit::new(
-                                        range(end_of_imports, end_of_imports),
-                                        format!("import {} as {}\n", module_str, target_alias),
-                                    )])]
-                                    .into(),
-                                )),
-                                ..CodeAction::default()
-                            }));
+                            scored.push((
+                                score,
+                                CodeAction {
+                                    title: format!("Import `{}` as `{}`", module_str, target_alias),
+                                    kind: Some(CodeActionKind::QUICKFIX),
+                                    is_preferred: Some(module_str == namespace_str),
+                                    edit: Some(WorkspaceEdit::new(
+                                        [(
+                                            uri.clone(),
+                                            vec![TextEdit::new(
+                                                range(end_of_imports, end_of_imports),
+                                                format!(
+                                                    "import {} as {}\n",
+                                                    module_str, target_alias
+                                                ),
+                                            )],
+                                        )]
+                                        .into(),
+                                    )),
+                                    ..CodeAction::default()
+                                },
+                            ));
                         }
                     } else {
                         // The user referenced an unknown name `n` with scope `s`.
@@ -1080,22 +1158,28 @@ impl LanguageServer for Backend {
                                         let name_str = self.name_(&nm.name());
                                         let module_str = self.name_(&nm.module());
                                         let usage = format!("{}.{}", alias_str, name_str);
-                                        scored.push((2.0, CodeAction {
-                                            title: format!(
-                                                "Use `{}` from `{}` (already imported as `{}`)",
-                                                usage, module_str, alias_str,
-                                            ),
-                                            kind: Some(CodeActionKind::QUICKFIX),
-                                            is_preferred: Some(true),
-                                            edit: Some(WorkspaceEdit::new(
-                                                [(uri.clone(), vec![TextEdit::new(
-                                                    range(at.lo(), at.hi()),
-                                                    usage,
-                                                )])]
-                                                .into(),
-                                            )),
-                                            ..CodeAction::default()
-                                        }));
+                                        scored.push((
+                                            2.0,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Use `{}` from `{}` (already imported as `{}`)",
+                                                    usage, module_str, alias_str,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(true),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![TextEdit::new(
+                                                            range(at.lo(), at.hi()),
+                                                            usage,
+                                                        )],
+                                                    )]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
                                     }
                                 }
                             }
@@ -1109,35 +1193,32 @@ impl LanguageServer for Backend {
                                 // usage_name: the name as it appears at the call site
                                 // import_name: the name/type used for the import statement
                                 // is_ctor: whether import_name is a type containing a constructor
-                                let (usage_name, import_name, is_ctor): (
-                                    nr::Name,
-                                    nr::Name,
-                                    bool,
-                                ) = match export {
-                                    Export::ConstructorsSome(parent, constructors)
-                                    | Export::ConstructorsAll(parent, constructors) => {
-                                        if parent.name() == name_ud && parent.scope() == *s {
-                                            // The type itself matched — import with (..) so
-                                            // constructors are available too.
-                                            (*parent, *parent, true)
-                                        } else if let Some(c) = constructors.iter().find(|c| {
-                                            c.name() == name_ud
-                                                && c.scope() == *s
-                                                && c.scope() == Scope::Term
-                                        }) {
-                                            (*c, *parent, true)
-                                        } else {
-                                            continue;
+                                let (usage_name, import_name, is_ctor): (nr::Name, nr::Name, bool) =
+                                    match export {
+                                        Export::ConstructorsSome(parent, constructors)
+                                        | Export::ConstructorsAll(parent, constructors) => {
+                                            if parent.name() == name_ud && parent.scope() == *s {
+                                                // The type itself matched — import with (..) so
+                                                // constructors are available too.
+                                                (*parent, *parent, true)
+                                            } else if let Some(c) = constructors.iter().find(|c| {
+                                                c.name() == name_ud
+                                                    && c.scope() == *s
+                                                    && c.scope() == Scope::Term
+                                            }) {
+                                                (*c, *parent, true)
+                                            } else {
+                                                continue;
+                                            }
                                         }
-                                    }
-                                    Export::Just(name) => {
-                                        if name.name() == name_ud && name.scope() == *s {
-                                            (*name, *name, false)
-                                        } else {
-                                            continue;
+                                        Export::Just(name) => {
+                                            if name.name() == name_ud && name.scope() == *s {
+                                                (*name, *name, false)
+                                            } else {
+                                                continue;
+                                            }
                                         }
-                                    }
-                                };
+                                    };
 
                                 let module_ud = usage_name.module();
                                 let module_str = self.name_(&module_ud);
@@ -1150,8 +1231,7 @@ impl LanguageServer for Backend {
                                 );
 
                                 let already_qualified = qualified_aliases.contains_key(&module_ud);
-                                let already_unqualified =
-                                    unqualified_modules.contains(&module_ud);
+                                let already_unqualified = unqualified_modules.contains(&module_ud);
 
                                 // Check if this module is *directly* imported in the current file
                                 // (as opposed to being accessible only via a re-export from another
@@ -1193,8 +1273,11 @@ impl LanguageServer for Backend {
                                         &usage_str.to_lowercase(),
                                     )
                                 };
-                                let import_bonus =
-                                    if already_qualified || already_unqualified { 0.5 } else { 0.0 };
+                                let import_bonus = if already_qualified || already_unqualified {
+                                    0.5
+                                } else {
+                                    0.0
+                                };
 
                                 // Suggestion A: Add name to an existing unqualified import.
                                 // Only when the module is directly and solely imported unqualified.
@@ -1220,22 +1303,28 @@ impl LanguageServer for Backend {
                                             })?
                                             .hi();
                                         let c = c + 2;
-                                        scored.push((1.5 + module_sim * 0.5, CodeAction {
-                                            title: format!(
-                                                "Add `{}` to import of `{}`",
-                                                import_item, module_str,
-                                            ),
-                                            kind: Some(CodeActionKind::QUICKFIX),
-                                            is_preferred: Some(true),
-                                            edit: Some(WorkspaceEdit::new(
-                                                [(uri.clone(), vec![TextEdit::new(
-                                                    range((l, c), (l, c)),
-                                                    format!("{}, ", import_item),
-                                                )])]
-                                                .into(),
-                                            )),
-                                            ..CodeAction::default()
-                                        }));
+                                        scored.push((
+                                            1.5 + module_sim * 0.5,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Add `{}` to import of `{}`",
+                                                    import_item, module_str,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(true),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![TextEdit::new(
+                                                            range((l, c), (l, c)),
+                                                            format!("{}, ", import_item),
+                                                        )],
+                                                    )]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
                                         None
                                     })();
                                 }
@@ -1253,10 +1342,16 @@ impl LanguageServer for Backend {
                                             kind: Some(CodeActionKind::QUICKFIX),
                                             is_preferred: Some(false),
                                             edit: Some(WorkspaceEdit::new(
-                                                [(uri.clone(), vec![TextEdit::new(
-                                                    range(end_of_imports, end_of_imports),
-                                                    format!("import {} ({})\n", module_str, import_item),
-                                                )])]
+                                                [(
+                                                    uri.clone(),
+                                                    vec![TextEdit::new(
+                                                        range(end_of_imports, end_of_imports),
+                                                        format!(
+                                                            "import {} ({})\n",
+                                                            module_str, import_item
+                                                        ),
+                                                    )],
+                                                )]
                                                 .into(),
                                             )),
                                             ..CodeAction::default()
@@ -1282,13 +1377,16 @@ impl LanguageServer for Backend {
                                                 kind: Some(CodeActionKind::QUICKFIX),
                                                 is_preferred: Some(ns_str == module_str),
                                                 edit: Some(WorkspaceEdit::new(
-                                                    [(uri.clone(), vec![TextEdit::new(
-                                                        range(end_of_imports, end_of_imports),
-                                                        format!(
-                                                            "import {} as {}\n",
-                                                            module_str, ns_str
-                                                        ),
-                                                    )])]
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![TextEdit::new(
+                                                            range(end_of_imports, end_of_imports),
+                                                            format!(
+                                                                "import {} as {}\n",
+                                                                module_str, ns_str
+                                                            ),
+                                                        )],
+                                                    )]
                                                     .into(),
                                                 )),
                                                 ..CodeAction::default()
@@ -1319,16 +1417,25 @@ impl LanguageServer for Backend {
                                                 kind: Some(CodeActionKind::QUICKFIX),
                                                 is_preferred: Some(already_qualified),
                                                 edit: Some(WorkspaceEdit::new(
-                                                    [(uri.clone(), vec![
-                                                        TextEdit::new(
-                                                            range(end_of_imports, end_of_imports),
-                                                            format!("import {} as {}\n", module_str, alias),
-                                                        ),
-                                                        TextEdit::new(
-                                                            range(at.lo(), at.hi()),
-                                                            qualified_usage,
-                                                        ),
-                                                    ])]
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![
+                                                            TextEdit::new(
+                                                                range(
+                                                                    end_of_imports,
+                                                                    end_of_imports,
+                                                                ),
+                                                                format!(
+                                                                    "import {} as {}\n",
+                                                                    module_str, alias
+                                                                ),
+                                                            ),
+                                                            TextEdit::new(
+                                                                range(at.lo(), at.hi()),
+                                                                qualified_usage,
+                                                            ),
+                                                        ],
+                                                    )]
                                                     .into(),
                                                 )),
                                                 ..CodeAction::default()
@@ -1916,6 +2023,7 @@ pub fn nrerror_turn_into_diagnostic(
     }
 }
 
+#[allow(unused)]
 #[derive(Debug, Deserialize, Serialize)]
 struct InlayHintParams {
     path: String,
