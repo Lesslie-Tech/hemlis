@@ -1396,12 +1396,17 @@ impl LanguageServer for Backend {
                                         // User typed a bare name — suggest a qualified import using
                                         // a dotless alias (e.g. Data.Map -> DataMap) and rewrite usage.
                                         // Alias format:
-                                        // - One dot (two segments) e.g. `Ctx.User` → `UserCtx`
+                                        // - One dot (two segments) e.g. `Visma.Api` → `VismaApi`
+                                        // - One dot with "Ctx" first e.g. `Ctx.Time` → `TimeCtx`
                                         // - Multiple dots e.g. `Data.Map.Strict` → `DataMapStrict`
                                         let alias = {
                                             let parts: Vec<&str> = module_str.split('.').collect();
                                             if parts.len() == 2 {
-                                                format!("{}{}", parts[1], parts[0])
+                                                if parts.get(0) == Some(&"Ctx") {
+                                                    format!("{}{}", parts[1], parts[0])
+                                                } else {
+                                                    format!("{}{}", parts[0], parts[1])
+                                                }
                                             } else {
                                                 module_str.replace('.', "")
                                             }
