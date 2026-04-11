@@ -13,7 +13,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0.78", features = [] }
 sungod = { version = "0.3.1", features = ["default_is_random"] }
 tokio = { version = "1.17.0", features = ["full"] }
-tower-lsp = { version = "0.20.0", features = ["proposed"]}
+tower-lsp-server = { version = "0.23.0", features = ["proposed"]}
 futures = "0.3.31"
 tracing = "0.1.41"
 json-subscriber = "0.2.4"

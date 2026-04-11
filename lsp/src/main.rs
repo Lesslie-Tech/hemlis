@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Bound;
+use std::str::FromStr;
 use std::sync::RwLock;
 use std::thread::sleep;
 use std::time::Duration;
@@ -18,10 +19,10 @@ use nr::{Export, NRerrors, Name, Scope, Visibility};
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tower_lsp::jsonrpc::{Error, ErrorCode, Result};
-use tower_lsp::lsp_types::notification::Notification;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
+use tower_lsp_server::ls_types::notification::Notification;
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::instrument;
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::{layer::SubscriberExt, prelude::*, util::SubscriberInitExt};
@@ -71,10 +72,10 @@ struct Backend {
     has_started: RwLock<bool>,
     names: DashMap<ast::Ud, String>,
 
-    fi_to_url: DashMap<ast::Fi, Url>,
+    fi_to_uri: DashMap<ast::Fi, Uri>,
     fi_to_ud: DashMap<ast::Fi, ast::Ud>,
     fi_to_source: DashMap<ast::Fi, String>,
-    url_to_fi: DashMap<Url, ast::Fi>,
+    uri_to_fi: DashMap<Uri, ast::Fi>,
     fi_to_version: DashMap<ast::Fi, Option<i32>>,
     ud_to_fi: DashMap<ast::Ud, ast::Fi>,
 
@@ -101,16 +102,16 @@ struct Backend {
     // can also like not do that.
     references: DashMap<ast::Ud, BTreeMap<Name, BTreeSet<(ast::Span, nr::Sort)>>>,
 
-    syntax_errors: DashMap<ast::Fi, Vec<tower_lsp::lsp_types::Diagnostic>>,
-    name_resolution_errors: DashMap<ast::Fi, Vec<tower_lsp::lsp_types::Diagnostic>>,
+    syntax_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
+    name_resolution_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
     fixables: DashMap<ast::Fi, Vec<(ast::Span, Fixable)>>,
 }
 
 impl Backend {
-    fn resolve_name(&self, url: &Url, pos: Position) -> Option<Name> {
+    fn resolve_name(&self, uri: &Uri, pos: Position) -> Option<Name> {
         let m = self
             .fi_to_ud
-            .try_get(&*self.url_to_fi.try_get(url).try_unwrap()?)
+            .try_get(&*self.uri_to_fi.try_get(uri).try_unwrap()?)
             .try_unwrap()?;
         let pos = (pos.line as usize, pos.character as usize + 1);
         let lut = self.resolved.try_get(&m).try_unwrap()?;
@@ -122,10 +123,10 @@ impl Backend {
         Some(*name)
     }
 
-    fn resolve_name_and_range(&self, url: &Url, pos: Position) -> Option<(Name, Range)> {
+    fn resolve_name_and_range(&self, uri: &Uri, pos: Position) -> Option<(Name, Range)> {
         let m = self
             .fi_to_ud
-            .try_get(&*self.url_to_fi.try_get(url).try_unwrap()?)
+            .try_get(&*self.uri_to_fi.try_get(uri).try_unwrap()?)
             .try_unwrap()?;
         let pos = (pos.line as usize, pos.character as usize + 1);
         let lut = self.resolved.try_get(&m).try_unwrap()?;
@@ -340,7 +341,6 @@ mod tests {
     }
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     #[instrument(skip(self))]
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
@@ -423,7 +423,7 @@ impl LanguageServer for Backend {
             self.load_workspace(folders);
             tracing::info!("Done scanning");
             let mut futures = Vec::new();
-            for i in self.fi_to_url.iter() {
+            for i in self.fi_to_uri.iter() {
                 futures.push(self.show_errors(*i.key(), None));
             }
             join_all(futures).await;
@@ -502,7 +502,7 @@ impl LanguageServer for Backend {
             ) {
                 let def_at = self.defines.try_get(&name).try_unwrap()?.value().clone();
                 let uri = self
-                    .fi_to_url
+                    .fi_to_uri
                     .try_get(&def_at.name.fi()?)
                     .try_unwrap()?
                     .clone();
@@ -512,7 +512,7 @@ impl LanguageServer for Backend {
                 }))
             } else {
                 let fi = *self
-                    .url_to_fi
+                    .uri_to_fi
                     .try_get(&params.text_document_position_params.text_document.uri)
                     .try_unwrap()?;
                 let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
@@ -526,11 +526,10 @@ impl LanguageServer for Backend {
                     .text_document_position_params
                     .text_document
                     .uri
-                    .to_file_path()
-                    .ok()?;
-                uri.set_extension("erl");
+                    .to_file_path()?;
+                uri.to_mut().set_extension("erl");
                 Some(GotoDefinitionResponse::Scalar(Location {
-                    uri: Url::from_file_path(uri).ok()?,
+                    uri: Uri::from_file_path(uri)?,
                     range: range((0, 0), (0, 0)),
                 }))
             }
@@ -555,10 +554,10 @@ impl LanguageServer for Backend {
                         if !sort.is_def_or_ref() {
                             return None;
                         }
-                        let url = self.fi_to_url.try_get(&s.fi()?).try_unwrap()?;
+                        let uri = self.fi_to_uri.try_get(&s.fi()?).try_unwrap()?;
                         let range = span_to_range(s);
 
-                        Some(Location::new(url.clone(), range))
+                        Some(Location::new(uri.clone(), range))
                     })
                     .collect::<Vec<_>>(),
             )
@@ -570,7 +569,7 @@ impl LanguageServer for Backend {
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
-    ) -> Result<Option<Vec<SymbolInformation>>> {
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
         let mut symbols = Vec::new();
         for i in self.previouse_defines.iter() {
             let fi = i.key();
@@ -614,9 +613,9 @@ impl LanguageServer for Backend {
                     deprecated: None,
 
                     location: {
-                        let url = self.fi_to_url.try_get(fi).unwrap().clone();
+                        let uri = self.fi_to_uri.try_get(fi).unwrap().clone();
                         let range = span_to_range(&at.name);
-                        Location::new(url, range)
+                        Location::new(uri, range)
                     },
 
                     container_name: None,
@@ -624,7 +623,7 @@ impl LanguageServer for Backend {
                 symbols.push(out);
             }
         }
-        Ok(Some(symbols))
+        Ok(Some(symbols.into()))
     }
 
     #[instrument(skip(self))]
@@ -634,7 +633,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let mut symbols = Vec::new();
         let fi_inner = if let Some(fi) = self
-            .url_to_fi
+            .uri_to_fi
             .try_get(&params.text_document.uri)
             .try_unwrap()
         {
@@ -675,9 +674,9 @@ impl LanguageServer for Backend {
                     deprecated: None,
 
                     location: {
-                        let url = self.fi_to_url.try_get(&fi).unwrap().clone();
+                        let uri = self.fi_to_uri.try_get(&fi).unwrap().clone();
                         let range = span_to_range(&at);
-                        Location::new(url, range)
+                        Location::new(uri, range)
                     },
 
                     container_name: None,
@@ -694,7 +693,7 @@ impl LanguageServer for Backend {
         let position = params.text_document_position.position;
         tracing::info!("completion..");
         let completions = || -> Option<Vec<CompletionItem>> {
-            let fi = *self.url_to_fi.try_get(&uri).try_unwrap()?;
+            let fi = *self.uri_to_fi.try_get(&uri).try_unwrap()?;
             let me = *self.fi_to_ud.try_get(&fi).try_unwrap()?;
             let line = position.line as usize;
             let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
@@ -879,14 +878,14 @@ impl LanguageServer for Backend {
             .collect::<BTreeSet<_>>()
             .into_iter()
         {
-            let url = self
-                .fi_to_url
+            let uri = self
+                .fi_to_uri
                 .try_get(&if let Some(fi) = at.fi() { fi } else { continue })
                 .try_unwrap()
                 .ok_or_else(|| error(line!(), "Unknown file - how did we get here?"))?
                 .clone();
             let range = span_to_range(&at);
-            edits.entry(url).or_insert(Vec::new()).push(TextEdit {
+            edits.entry(uri).or_insert(Vec::new()).push(TextEdit {
                 range,
                 new_text: new_text.clone(),
             });
@@ -932,7 +931,7 @@ impl LanguageServer for Backend {
     #[instrument(skip(self))]
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri.clone();
-        let fi = *or_!(self.url_to_fi.try_get(&uri).try_unwrap(), {
+        let fi = *or_!(self.uri_to_fi.try_get(&uri).try_unwrap(), {
             return Err(error(line!(), "File not loaded"));
         });
         let me = *or_!(self.fi_to_ud.try_get(&fi).try_unwrap(), {
@@ -1669,7 +1668,7 @@ fn create_error(
     code: String,
     message: String,
     related: Vec<(String, Location)>,
-) -> tower_lsp::lsp_types::Diagnostic {
+) -> tower_lsp_server::ls_types::Diagnostic {
     let range = Range::new(pos_from_tup(span.lo()), pos_from_tup(span.hi()));
     Diagnostic::new(
         range,
@@ -1697,7 +1696,7 @@ fn create_warning(
     code: String,
     message: String,
     related: Vec<(String, Location)>,
-) -> tower_lsp::lsp_types::Diagnostic {
+) -> tower_lsp_server::ls_types::Diagnostic {
     let range = Range::new(pos_from_tup(span.lo()), pos_from_tup(span.hi()));
     Diagnostic::new(
         range,
@@ -1826,7 +1825,7 @@ fn as_import(
 pub fn nrerror_turn_into_diagnostic(
     error: NRerrors,
     names: &DashMap<ast::Ud, String>,
-) -> tower_lsp::lsp_types::Diagnostic {
+) -> tower_lsp_server::ls_types::Diagnostic {
     match error {
         NRerrors::Unknown(scope, ns, n, s) => create_error(
             s,
@@ -2043,7 +2042,7 @@ impl Notification for CustomNotification {
 
 #[derive(Debug)]
 struct TextDocumentItem<'a> {
-    uri: Url,
+    uri: Uri,
     text: &'a str,
     version: Option<i32>,
 }
@@ -2074,7 +2073,7 @@ impl Backend {
                 let path = path.as_ref().ok()?;
                 let x = (|| {
                     let source = std::fs::read_to_string(path.clone()).ok()?;
-                    let uri = Url::parse(&format!(
+                    let uri = Uri::from_str(&format!(
                         "file://{}",
                         &path.clone().into_os_string().into_string().ok()?
                     ))
@@ -2086,7 +2085,7 @@ impl Backend {
                         tracing::error!("FAILED TO GENERATE FI");
                     };
                     self.fi_to_source.insert(fi, source.to_string());
-                    self.fi_to_url.insert(fi, uri.clone());
+                    self.fi_to_uri.insert(fi, uri.clone());
                     self.fi_to_version.insert(fi, None);
                     let (m, fi) = self.parse(fi, &source);
                     let m = m?;
@@ -2405,8 +2404,8 @@ impl Backend {
         if self.got_refresh(fi, version) {
             return;
         }
-        let url = if let Some(url) = self.fi_to_url.try_get(&fi).try_unwrap() {
-            url.value().clone()
+        let uri = if let Some(uri) = self.fi_to_uri.try_get(&fi).try_unwrap() {
+            uri.value().clone()
         } else {
             return;
         };
@@ -2426,9 +2425,9 @@ impl Backend {
         } else {
             None
         };
-        // tracing::info!("PRESENTING DIAGNOSTICS {:?}", url.to_string());
+        // tracing::info!("PRESENTING DIAGNOSTICS {:?}", uri.to_string());
         self.client
-            .publish_diagnostics(url.clone(), [se, re].concat(), v)
+            .publish_diagnostics(uri.clone(), [se, re].concat(), v)
             .await
     }
 
@@ -2463,8 +2462,8 @@ impl Backend {
     }
 
     #[instrument(skip(self))]
-    fn find_fi(&self, uri: Url) -> Option<ast::Fi> {
-        match self.url_to_fi.try_entry(uri.clone()) {
+    fn find_fi(&self, uri: Uri) -> Option<ast::Fi> {
+        match self.uri_to_fi.try_entry(uri.clone()) {
             Some(dashmap::Entry::Occupied(v)) => Some(*v.get()),
             Some(dashmap::Entry::Vacant(v)) => {
                 let fi = ast::Fi(sungod::Ra::ggen::<usize>());
@@ -2524,7 +2523,7 @@ impl Backend {
         // I have to copy it! :(
         self.fi_to_source.insert(fi, source.to_string());
         tracing::info!("!! {:?} A {:?}", version, uri.to_string());
-        self.fi_to_url.insert(fi, uri.clone());
+        self.fi_to_uri.insert(fi, uri.clone());
         tracing::info!("!! {:?} B {:?}", version, uri.to_string());
         let (m, fi) = self.parse(fi, source);
 
@@ -2608,7 +2607,7 @@ async fn main() {
             .with_level(true)
             .with_writer(log_file)
             .with_filter(tracing::level_filters::LevelFilter::TRACE)
-            .with_filter(FilterFn::new(|x| x.target() != "tower_lsp::codec"));
+            .with_filter(FilterFn::new(|x| x.target() != "tower_lsp_server::codec"));
 
         std::panic::set_hook(Box::new(|panic| {
             if let Some(location) = panic.location() {
@@ -2640,11 +2639,11 @@ async fn main() {
         prim,
         names,
 
-        fi_to_url: DashMap::new(),
+        fi_to_uri: DashMap::new(),
         fi_to_ud: DashMap::new(),
         fi_to_source: DashMap::new(),
         ud_to_fi: DashMap::new(),
-        url_to_fi: DashMap::new(),
+        uri_to_fi: DashMap::new(),
         fi_to_version: DashMap::new(),
 
         importers: DashMap::new(),
