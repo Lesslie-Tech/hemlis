@@ -105,6 +105,10 @@ struct Backend {
     syntax_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
     name_resolution_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
     fixables: DashMap<ast::Fi, Vec<(ast::Span, Fixable)>>,
+
+    /// Whether the client supports dynamic registration of workspace/didChangeWatchedFiles.
+    /// If false, the server sets up its own native file watcher.
+    client_watch_dynamic_registration: std::sync::OnceLock<bool>,
 }
 
 impl Backend {
@@ -343,7 +347,15 @@ mod tests {
 
 impl LanguageServer for Backend {
     #[instrument(skip(self))]
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let dynamic_watch = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false);
+        let _ = self.client_watch_dynamic_registration.set(dynamic_watch);
         Ok(InitializeResult {
             server_info: None,
             offset_encoding: None,
@@ -410,7 +422,7 @@ impl LanguageServer for Backend {
 
     #[instrument(skip(self))]
     async fn initialized(&self, _: InitializedParams) {
-        {
+        let folders = {
             tracing::info!("version {}", hemlis_lib::version());
             tracing::info!("Scanning...");
             let folders = self
@@ -420,17 +432,133 @@ impl LanguageServer for Backend {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            self.load_workspace(folders);
+            self.load_workspace(folders.clone());
             tracing::info!("Done scanning");
             let mut futures = Vec::new();
             for i in self.fi_to_uri.iter() {
                 futures.push(self.show_errors(*i.key(), None));
             }
             join_all(futures).await;
-        }
+            folders
+        };
         {
             let mut write = self.has_started.write().unwrap();
             *write = true;
+        }
+        {
+            let registration = Registration {
+                id: "workspace/didChangeWatchedFiles".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: Some(serde_json::json!({
+                    "watchers": [
+                        {
+                            "globPattern": "**/*.purs"
+                        }
+                    ]
+                })),
+            };
+
+            self.client
+                .register_capability(vec![registration])
+                .await
+                .unwrap();
+        }
+
+        // Fall back to a native file watcher when the client doesn't support dynamic
+        // registration of workspace/didChangeWatchedFiles (e.g. neovim on Linux).
+        let use_native_watcher = !self
+            .client_watch_dynamic_registration
+            .get()
+            .copied()
+            .unwrap_or(false);
+
+        if use_native_watcher {
+            let watch_dirs: Vec<std::path::PathBuf> = folders
+                .iter()
+                .filter_map(|f| {
+                    let s = f.uri.to_string();
+                    Some(std::path::PathBuf::from(s.strip_prefix("file://")?))
+                })
+                .collect();
+
+            if !watch_dirs.is_empty() {
+                // Build a Weak<Backend> from &self. tower-lsp-server wraps the backend in
+                // Arc<S> inside its Router and dispatches by calling &*arc, so self is
+                // always the interior of a live Arc<Backend>.
+                let weak_self: std::sync::Weak<Backend> = unsafe {
+                    std::sync::Arc::increment_strong_count(self as *const Backend);
+                    let arc = std::sync::Arc::from_raw(self as *const Backend);
+                    let weak = std::sync::Arc::downgrade(&arc);
+                    // arc's drop restores the original refcount
+                    weak
+                };
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+
+                std::thread::spawn(move || {
+                    use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+                    let result = RecommendedWatcher::new(
+                        move |result: notify::Result<notify::Event>| {
+                            if let Ok(event) = result {
+                                match event.kind {
+                                    EventKind::Create(_) | EventKind::Modify(_) => {
+                                        for path in event.paths {
+                                            if path.extension().map_or(false, |e| e == "purs") {
+                                                let _ = tx.send(path);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        },
+                        Config::default(),
+                    );
+                    match result {
+                        Ok(mut watcher) => {
+                            for dir in &watch_dirs {
+                                if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
+                                    tracing::error!("Failed to watch {:?}: {}", dir, e);
+                                }
+                            }
+                            tracing::info!("Native file watcher active for {:?}", watch_dirs);
+                            loop {
+                                std::thread::sleep(Duration::from_secs(3600));
+                            }
+                        }
+                        Err(e) => tracing::error!("Failed to create file watcher: {}", e),
+                    }
+                });
+
+                tokio::spawn(async move {
+                    while let Some(path) = rx.recv().await {
+                        let backend = match weak_self.upgrade() {
+                            Some(b) => b,
+                            None => break,
+                        };
+                        let uri = match Uri::from_file_path(&path) {
+                            Some(uri) => uri,
+                            None => continue,
+                        };
+                        let source = match std::fs::read_to_string(&path) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        if let Some((fi, version, to_notify)) =
+                            backend.on_change(TextDocumentItem {
+                                text: &source,
+                                uri,
+                                version: None,
+                            })
+                        {
+                            backend.show_errors(fi, version).await;
+                            for (fi, v) in to_notify.iter() {
+                                backend.show_errors(*fi, *v).await;
+                            }
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -1525,14 +1653,37 @@ impl LanguageServer for Backend {
     #[instrument(skip(self))]
     async fn did_change_workspace_folders(&self, _: DidChangeWorkspaceFoldersParams) {}
 
-    #[instrument(skip(self))]
-    async fn did_change_watched_files(&self, _: DidChangeWatchedFilesParams) {
-        self.client
-            .log_message(
-                MessageType::INFO,
-                "Does not handle changed watched files".to_string(),
-            )
-            .await;
+    #[instrument(skip(self, params))]
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        for event in params.changes {
+            match event.typ {
+                FileChangeType::CREATED | FileChangeType::CHANGED => {
+                    let uri = event.uri;
+                    let path = match uri.to_file_path() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let source = match std::fs::read_to_string(&path) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if let Some((fi, version, to_notify)) = self.on_change(TextDocumentItem {
+                        text: &source,
+                        uri,
+                        version: None,
+                    }) {
+                        self.show_errors(fi, version).await;
+                        for (fi, v) in to_notify.iter() {
+                            self.show_errors(*fi, *v).await;
+                        }
+                        if !to_notify.is_empty() {
+                            let _ = self.client.workspace_diagnostic_refresh().await;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     #[instrument(skip(self))]
@@ -1867,7 +2018,7 @@ pub fn nrerror_turn_into_diagnostic(
             Vec::new(),
         ),
         NRerrors::NotAConstructor(d, m) => create_error(
-            m.0 .1,
+            m.0.1,
             "NotAConstructor".into(),
             format!(
                 "{} does not have a constructors {}",
@@ -1877,7 +2028,7 @@ pub fn nrerror_turn_into_diagnostic(
                     .map(|x| x.clone())
                     .unwrap_or_else(|| "?".into()),
                 names
-                    .try_get(&m.0 .0)
+                    .try_get(&m.0.0)
                     .try_unwrap()
                     .map(|x| x.clone())
                     .unwrap_or_else(|| "?".into())
@@ -2091,14 +2242,10 @@ impl Backend {
                     let m = m?;
                     let (me, imports) = {
                         let header = m.0.clone()?;
-                        let me = header.0 .0 .0;
+                        let me = header.0.0.0;
                         (
                             me,
-                            header
-                                .2
-                                .iter()
-                                .map(|x| x.from.0 .0)
-                                .collect::<BTreeSet<_>>(),
+                            header.2.iter().map(|x| x.from.0.0).collect::<BTreeSet<_>>(),
                         )
                     };
                     self.modules.insert(me, m.clone());
@@ -2173,7 +2320,7 @@ impl Backend {
         fi: ast::Fi,
         version: Option<i32>,
     ) -> Option<(bool, ast::Ud)> {
-        let me = m.0.as_ref()?.0 .0 .0;
+        let me = m.0.as_ref()?.0.0.0;
         let mut n = nr::N::new(me, &self.exports);
         nr::resolve_names(&mut n, self.prim, m);
 
@@ -2663,6 +2810,8 @@ async fn main() {
         syntax_errors: DashMap::new(),
         name_resolution_errors: DashMap::new(),
         fixables: DashMap::new(),
+
+        client_watch_dynamic_registration: std::sync::OnceLock::new(),
     })
     .finish();
 
