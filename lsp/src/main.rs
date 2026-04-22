@@ -1109,6 +1109,22 @@ impl LanguageServer for Backend {
                 _ => (),
             }
         }
+        // Sort by start position, then merge overlapping/adjacent ranges so the
+        // workspace-edit never contains invalid overlapping TextEdits.
+        delete_all.sort_by_key(|r| (r.start.line, r.start.character));
+        let mut merged: Vec<Range> = Vec::new();
+        for r in delete_all {
+            if let Some(last) = merged.last_mut() {
+                if (r.start.line, r.start.character) <= (last.end.line, last.end.character) {
+                    if (r.end.line, r.end.character) > (last.end.line, last.end.character) {
+                        last.end = r.end;
+                    }
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+        let delete_all = merged;
         if !delete_all.is_empty() {
             out.push(CodeAction {
                 title: format!("BurnAllUnusedImport"),
