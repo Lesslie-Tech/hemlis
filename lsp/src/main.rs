@@ -2696,6 +2696,20 @@ impl Backend {
         let to_notify = if let Some(m) = m {
             tracing::info!("!! {:?} PRE RESOLVE {:?}", version, uri.to_string());
             if let Some((exports_changed, me)) = self.resolve_module(&m, fi, version) {
+                // If the module name changed (e.g. user is typing a new name),
+                // clean up stale entries keyed by the old Ud.
+                if let Some(old_me) = self.fi_to_ud.get(&fi) {
+                    let old_me = *old_me;
+                    if old_me != me {
+                        self.modules.remove(&old_me);
+                        self.ud_to_fi.remove(&old_me);
+                        self.exports.remove(&old_me);
+                        self.resolved.remove(&old_me);
+                        self.imports.remove(&old_me);
+                        self.importers.remove(&old_me);
+                        self.references.remove(&old_me);
+                    }
+                }
                 self.modules.insert(me, m);
                 tracing::info!("!! {:?} H {:?}", version, uri.to_string());
                 self.fi_to_ud.insert(fi, me);
