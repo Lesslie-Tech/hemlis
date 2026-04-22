@@ -46,22 +46,6 @@ fn range(lo: ast::Pos, hi: ast::Pos) -> Range {
     }
 }
 
-// fn range_to_span(fi: ast::Fi, s: Range) -> ast::Span {
-//     let Position {
-//         line: lo_l,
-//         character: lo_c,
-//     } = s.start;
-//     let Position {
-//         line: hi_l,
-//         character: hi_c,
-//     } = s.end;
-//     ast::Span::Known(
-//         fi,
-//         (lo_l as usize, lo_c as usize),
-//         (hi_l as usize, hi_c as usize),
-//     )
-// }
-
 #[derive(Debug)]
 struct Backend {
     client: Client,
@@ -321,6 +305,8 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{format_hover_snippet, strip_hover_comment_prefix};
+    use std::str::FromStr;
+    use tower_lsp_server::ls_types::{CodeActionOrCommand, TextEdit, Uri};
 
     #[test]
     fn hover_snippet_dedents_short_definitions() {
@@ -342,6 +328,250 @@ mod tests {
             strip_hover_comment_prefix("        -- NOTE[sg]: leave non-haddock text alone"),
             "NOTE[sg]: leave non-haddock text alone"
         );
+    }
+
+    /// Helper: apply a set of LSP TextEdits to a source string.
+    /// Edits are applied in reverse order so that earlier edits don't
+    /// shift the positions of later ones.
+    fn apply_edits(source: &str, edits: &mut Vec<TextEdit>) -> String {
+        // Convert (line, col) to byte offset
+        let to_offset = |source: &str, line: u32, col: u32| -> usize {
+            let mut offset = 0;
+            for (i, l) in source.lines().enumerate() {
+                if i == line as usize {
+                    return offset + col as usize;
+                }
+                offset += l.len() + 1; // +1 for \n
+            }
+            offset
+        };
+
+        // Sort edits by start position in reverse so we can apply from end to start
+        edits.sort_by(|a, b| {
+            let a_start = (a.range.start.line, a.range.start.character);
+            let b_start = (b.range.start.line, b.range.start.character);
+            b_start.cmp(&a_start)
+        });
+
+        let mut result = source.to_string();
+        for edit in edits.iter() {
+            let start = to_offset(&result, edit.range.start.line, edit.range.start.character);
+            let end = to_offset(&result, edit.range.end.line, edit.range.end.character);
+            result.replace_range(start..end, &edit.new_text);
+        }
+        result
+    }
+
+    /// Send a JSON-RPC request through the LspService and return the response.
+    async fn lsp_request(
+        service: &mut super::LspService<super::Backend>,
+        id: i64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Option<tower_lsp_server::jsonrpc::Response> {
+        use tower_service::Service;
+        let req = tower_lsp_server::jsonrpc::Request::build(method.to_string())
+            .params(params)
+            .id(id)
+            .finish();
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .unwrap();
+        service.call(req).await.unwrap()
+    }
+
+    /// Send a JSON-RPC notification (no id, no response expected).
+    async fn lsp_notify(
+        service: &mut super::LspService<super::Backend>,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        use tower_service::Service;
+        let req = tower_lsp_server::jsonrpc::Request::build(method.to_string())
+            .params(params)
+            .finish();
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .unwrap();
+        let _ = service.call(req).await;
+    }
+
+    /// Build a Backend wrapped in an LspService, with an auto-responder
+    /// for server→client requests (workspace_folders, registerCapability, etc.).
+    fn build_test_service() -> super::LspService<super::Backend> {
+        let (exports, prim, names) = hemlis_lib::build_builtins();
+        let (service, socket) = super::LspService::build(|client| super::Backend {
+            client,
+            prim,
+            names,
+            locked: ().into(),
+            has_started: false.into(),
+            fi_to_uri: Default::default(),
+            fi_to_ud: Default::default(),
+            fi_to_source: Default::default(),
+            ud_to_fi: Default::default(),
+            uri_to_fi: Default::default(),
+            fi_to_version: Default::default(),
+            importers: Default::default(),
+            imports: Default::default(),
+            available_locals: Default::default(),
+            previouse_defines: Default::default(),
+            previouse_global_usages: Default::default(),
+            exports,
+            modules: Default::default(),
+            resolved: Default::default(),
+            defines: Default::default(),
+            references: Default::default(),
+            syntax_errors: Default::default(),
+            name_resolution_errors: Default::default(),
+            fixables: Default::default(),
+            client_watch_dynamic_registration: std::sync::OnceLock::new(),
+        })
+        .finish();
+
+        // Spawn a task to auto-respond to server→client requests.
+        use futures::StreamExt as _;
+        let (mut req_stream, mut resp_sink) = socket.split();
+        tokio::spawn(async move {
+            use futures::SinkExt as _;
+            while let Some(req) = req_stream.next().await {
+                if let Some(id) = req.id().cloned() {
+                    // workspace/workspaceFolders → respond with []
+                    // client/registerCapability → respond with null
+                    // anything else → respond with null
+                    let result = if req.method() == "workspace/workspaceFolders" {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!(null)
+                    };
+                    let response =
+                        tower_lsp_server::jsonrpc::Response::from_ok(id, result);
+                    let _ = resp_sink.send(response).await;
+                }
+            }
+        });
+
+        service
+    }
+
+    /// Run a code action test: parse source, trigger code actions at a position,
+    /// find the action with the given title, apply its edits, and compare.
+    async fn assert_code_action(
+        source: &str,
+        line: u32,
+        character: u32,
+        action_title: &str,
+        expected: &str,
+    ) {
+        let uri = "file:///test.purs";
+        let mut service = build_test_service();
+
+        // Initialize
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+
+        // Initialized (triggers has_started = true)
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+
+        // Give the server a moment to finish initialized handler
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Open document
+        lsp_notify(
+            &mut service,
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "purescript",
+                    "version": 1,
+                    "text": source
+                }
+            }),
+        )
+        .await;
+
+        // Give on_change time to parse + resolve
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Request code actions at the given position
+        let resp = lsp_request(
+            &mut service,
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": line, "character": character },
+                    "end": { "line": line, "character": character }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        )
+        .await
+        .expect("Expected a response from codeAction");
+
+        let (_, body) = resp.into_parts();
+        let result = body.expect("codeAction should succeed");
+
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(result).expect("Failed to parse code actions");
+
+        let action = actions
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) if ca.title == action_title => Some(ca),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                let titles: Vec<_> = actions
+                    .iter()
+                    .map(|a| match a {
+                        CodeActionOrCommand::CodeAction(ca) => ca.title.as_str(),
+                        CodeActionOrCommand::Command(c) => c.title.as_str(),
+                    })
+                    .collect();
+                panic!(
+                    "Code action {:?} not found. Available: {:?}",
+                    action_title, titles
+                );
+            });
+
+        let workspace_edit = action.edit.as_ref().expect("Code action should have edits");
+        let changes = workspace_edit.changes.as_ref().expect("Should have changes");
+        let file_edits = changes
+            .get(&Uri::from_str(uri).unwrap())
+            .expect("Should have edits for test file");
+
+        let actual = apply_edits(source, &mut file_edits.clone());
+        assert_eq!(actual, expected, "Code action {:?} produced wrong result", action_title);
+    }
+
+    #[tokio::test]
+    async fn delete_unused_parameter() {
+        let source = "\
+module Test where
+
+foo :: String -> Int -> Boolean
+foo x y = y
+";
+        let expected = "\
+module Test where
+
+foo :: Int -> Boolean
+foo y = y
+";
+        // Position on `x` (line 3, col 4)
+        assert_code_action(source, 3, 4, "Delete unused parameter", expected).await;
     }
 }
 

@@ -384,6 +384,7 @@ dependencies = [
  "sungod",
  "tokio",
  "tower-lsp-server",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]
