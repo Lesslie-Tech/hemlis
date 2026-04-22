@@ -23,4 +23,5 @@ rayon = "1.10.0"
 notify = "8"
 
 [dev-dependencies]
+indoc = "2.0.7"
 tower-service = "0.3"

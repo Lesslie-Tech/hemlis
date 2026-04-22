@@ -305,6 +305,7 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{format_hover_snippet, strip_hover_comment_prefix};
+    use indoc::indoc;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{CodeActionOrCommand, TextEdit, Uri};
 
@@ -456,13 +457,42 @@ mod tests {
 
     /// Run a code action test: parse source, trigger code actions at a position,
     /// find the action with the given title, apply its edits, and compare.
-    async fn assert_code_action(
-        source: &str,
-        line: u32,
-        character: u32,
-        action_title: &str,
-        expected: &str,
-    ) {
+    /// Parse a source string containing a `^ Action title` marker line.
+    /// Returns (source_without_marker, line, column, action_title).
+    fn parse_marker(source: &str) -> (String, u32, u32, String) {
+        let lines: Vec<&str> = source.lines().collect();
+        let (marker_idx, marker_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with('^') && trimmed.len() > 1
+            })
+            .expect("Source must contain a `^ Action title` marker line");
+
+        let caret_col = marker_line.find('^').unwrap() as u32;
+        let action_title = marker_line[marker_line.find('^').unwrap() + 1..]
+            .trim()
+            .to_string();
+        let target_line = (marker_idx - 1) as u32;
+
+        let cleaned: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != marker_idx)
+            .map(|(_, l)| *l)
+            .collect();
+        let mut source = cleaned.join("\n");
+        // Preserve trailing newline if original had one
+        if source.len() > 0 {
+            source.push('\n');
+        }
+
+        (source, target_line, caret_col, action_title)
+    }
+
+    async fn assert_code_action(source_with_marker: &str, expected: &str) {
+        let (source, line, character, action_title) = parse_marker(source_with_marker);
         let uri = "file:///test.purs";
         let mut service = build_test_service();
 
@@ -552,26 +582,188 @@ mod tests {
             .get(&Uri::from_str(uri).unwrap())
             .expect("Should have edits for test file");
 
-        let actual = apply_edits(source, &mut file_edits.clone());
+        let actual = apply_edits(&source, &mut file_edits.clone());
         assert_eq!(actual, expected, "Code action {:?} produced wrong result", action_title);
     }
 
     #[tokio::test]
-    async fn delete_unused_parameter() {
-        let source = "\
-module Test where
+    async fn delete_unused_first_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
 
-foo :: String -> Int -> Boolean
-foo x y = y
-";
-        let expected = "\
-module Test where
+                foo :: String -> Int -> Boolean
+                foo x y = y
+                    ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
 
-foo :: Int -> Boolean
-foo y = y
-";
-        // Position on `x` (line 3, col 4)
-        assert_code_action(source, 3, 4, "Delete unused parameter", expected).await;
+                foo :: Int -> Boolean
+                foo y = y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_last_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> Int -> Boolean
+                foo x y = x
+                      ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: String -> Boolean
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_middle_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> Int -> Boolean -> String
+                foo a b c = a
+                      ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: String -> Boolean -> String
+                foo a c = a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_record_field() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String, baz :: Int } -> String
+                foo { bar, baz } = bar
+                           ^ Delete unused record field
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String } -> String
+                foo { bar } = bar
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_first_record_field() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String, baz :: Int } -> String
+                foo { bar, baz } = baz
+                      ^ Delete unused record field
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: { baz :: Int } -> String
+                foo { baz } = baz
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_last_record_field_removes_entire_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String } -> Int
+                foo { bar } = 42
+                      ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: Int
+                foo = 42
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_param_with_record_neighbor() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> { bar :: Int } -> Boolean
+                foo x { bar } = bar
+                    ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: Int } -> Boolean
+                foo { bar } = bar
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_record_between_params() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> { bar :: Boolean } -> Int -> String
+                foo hello { bar } num = hello
+                            ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: String -> Int -> String
+                foo hello num = hello
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_record_field_preserves_surrounding_arrows() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                run :: String -> { foo :: Boolean } -> Int -> String
+                run hello { foo } bar = hello
+                            ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                run :: String -> Int -> String
+                run hello bar = hello
+            "},
+        )
+        .await;
     }
 }
 
