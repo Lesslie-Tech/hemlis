@@ -1616,7 +1616,7 @@ impl LanguageServer for Backend {
                         )]
                         .into(),
                     )),
-                    is_preferred: Some(true),
+                    is_preferred: None,
                     ..CodeAction::default()
                 }),
                 Fixable::Delete(at) => out.push(CodeAction {
@@ -1653,6 +1653,225 @@ impl LanguageServer for Backend {
                     is_preferred: Some(true),
                     ..CodeAction::default()
                 }),
+            }
+        }
+        // Offer "Delete unused parameter" for unused function parameters
+        // and "Delete unused record field" for unused record binder fields.
+        if let Some(module_guard) = self.modules.try_get(&me).try_unwrap() {
+            let module = module_guard.value();
+            for (s, f) in fixables.iter() {
+                if !s.contains((
+                    params.range.start.line as usize,
+                    params.range.start.character as usize,
+                )) {
+                    continue;
+                }
+                if let Fixable::RenameWithUnderscore(at) = f {
+                    // Check if this is a simple function parameter.
+                    let param_info = module.1.iter().find_map(|decl| {
+                        if let ast::Decl::Def(name, binders, _) = decl {
+                            binders.iter().enumerate().find_map(|(idx, binder)| {
+                                if binder_is_simple_var(binder)
+                                    && binder.span().contains(at.lo())
+                                {
+                                    Some((name.0 .0, idx))
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some((func_ud, param_idx)) = param_info {
+                        let mut edits = Vec::new();
+
+                        for decl in module.1.iter() {
+                            match decl {
+                                ast::Decl::Def(name, binders, _)
+                                    if name.0 .0 == func_ud && binders.len() > param_idx =>
+                                {
+                                    let source = self.fi_to_source.try_get(&fi).try_unwrap();
+                                    let binder_spans: Vec<_> = binders.iter().map(|b| {
+                                        match &source {
+                                            Some(s) => correct_binder_span(b, s.value(), fi),
+                                            None => b.span(),
+                                        }
+                                    }).collect();
+                                    edits.push(TextEdit::new(
+                                        remove_nth_range(&binder_spans, param_idx, true),
+                                        "".into(),
+                                    ));
+                                }
+                                ast::Decl::Sig(name, typ) if name.0 .0 == func_ud => {
+                                    let types = flatten_arr_chain(typ);
+                                    if param_idx < types.len().saturating_sub(1) {
+                                    let type_spans: Vec<_> = types.iter().map(|t| t.span()).collect();
+                                        edits.push(TextEdit::new(
+                                            remove_nth_range(&type_spans, param_idx, false),
+                                            "".into(),
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !edits.is_empty() {
+                            out.push(CodeAction {
+                                title: "Delete unused parameter".into(),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: None,
+                                edit: Some(WorkspaceEdit::new(
+                                    [(uri.clone(), edits)].into(),
+                                )),
+                                is_preferred: Some(true),
+                                ..CodeAction::default()
+                            });
+                        }
+                        continue;
+                    }
+
+                    // Check if this is an unused field inside a record binder.
+                    let record_info = module.1.iter().find_map(|decl| {
+                        if let ast::Decl::Def(name, binders, _) = decl {
+                            binders.iter().enumerate().find_map(|(param_idx, binder)| {
+                                let record_fields = match binder {
+                                    ast::Binder::Record(fields) => fields,
+                                    ast::Binder::Typed(inner, _) => match inner.as_ref() {
+                                        ast::Binder::Record(fields) => fields,
+                                        _ => return None,
+                                    },
+                                    _ => return None,
+                                };
+                                record_fields.iter().find_map(|field| {
+                                    let field_ud = match field {
+                                        ast::RecordLabelBinder::Pun(n) => {
+                                            if n.span().contains(at.lo()) {
+                                                Some(n.0 .0)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    };
+                                    field_ud.map(|ud| (name.0 .0, param_idx, ud))
+                                })
+                            })
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some((func_ud, param_idx, field_ud)) = record_info {
+                        // Check if this is the last field in the record. If so,
+                        // remove the entire parameter and its type arrow instead.
+                        let is_last_field = module.1.iter().any(|decl| {
+                            if let ast::Decl::Def(name, binders, _) = decl {
+                                if name.0 .0 != func_ud || binders.len() <= param_idx {
+                                    return false;
+                                }
+                                let fields = match &binders[param_idx] {
+                                    ast::Binder::Record(f) => f,
+                                    ast::Binder::Typed(inner, _) => match inner.as_ref() {
+                                        ast::Binder::Record(f) => f,
+                                        _ => return false,
+                                    },
+                                    _ => return false,
+                                };
+                                fields.len() == 1
+                            } else {
+                                false
+                            }
+                        });
+
+                        let mut edits = Vec::new();
+
+                        for decl in module.1.iter() {
+                            match decl {
+                                ast::Decl::Def(name, binders, _)
+                                    if name.0 .0 == func_ud && binders.len() > param_idx =>
+                                {
+                                    if is_last_field {
+                                        let source = self.fi_to_source.try_get(&fi).try_unwrap();
+                                        let binder_spans: Vec<_> = binders.iter().map(|b| {
+                                            match &source {
+                                                Some(s) => correct_binder_span(b, s.value(), fi),
+                                                None => b.span(),
+                                            }
+                                        }).collect();
+                                        edits.push(TextEdit::new(
+                                            remove_nth_range(&binder_spans, param_idx, true),
+                                            "".into(),
+                                        ));
+                                    } else {
+                                        let record_fields = match &binders[param_idx] {
+                                            ast::Binder::Record(fields) => Some(fields),
+                                            ast::Binder::Typed(inner, _) => match inner.as_ref() {
+                                                ast::Binder::Record(fields) => Some(fields),
+                                                _ => None,
+                                            },
+                                            _ => None,
+                                        };
+                                        if let Some(fields) = record_fields {
+                                            if let Some(idx) = fields.iter().position(|f| {
+                                                matches!(f, ast::RecordLabelBinder::Pun(n) if n.0 .0 == field_ud)
+                                                    || matches!(f, ast::RecordLabelBinder::Field(l, _) if l.0 .0 == field_ud)
+                                            }) {
+                                                let field_spans: Vec<_> = fields.iter().map(|f| f.span()).collect();
+                                                edits.push(TextEdit::new(
+                                                    remove_nth_range(&field_spans, idx, false),
+                                                    "".into(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                ast::Decl::Sig(name, typ) if name.0 .0 == func_ud => {
+                                    let types = flatten_arr_chain(typ);
+                                    if param_idx < types.len().saturating_sub(1) {
+                                        if is_last_field {
+                                            let type_spans: Vec<_> = types.iter().map(|t| t.span()).collect();
+                                            edits.push(TextEdit::new(
+                                                remove_nth_range(&type_spans, param_idx, false),
+                                                "".into(),
+                                            ));
+                                        } else if let ast::Typ::Record(s_row) = types[param_idx] {
+                                            let row = &s_row.0;
+                                            if let Some(idx) = row.0.iter().position(|(l, _)| l.0 .0 == field_ud) {
+                                                let row_spans: Vec<_> = row.0.iter().map(|f| f.span()).collect();
+                                                edits.push(TextEdit::new(
+                                                    remove_nth_range(&row_spans, idx, false),
+                                                    "".into(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !edits.is_empty() {
+                            let title = if is_last_field {
+                                "Delete unused parameter"
+                            } else {
+                                "Delete unused record field"
+                            };
+                            out.push(CodeAction {
+                                title: title.into(),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: None,
+                                edit: Some(WorkspaceEdit::new(
+                                    [(uri.clone(), edits)].into(),
+                                )),
+                                is_preferred: Some(true),
+                                ..CodeAction::default()
+                            });
+                        }
+                    }
+                }
             }
         }
         // Dedup by title while preserving insertion order (which encodes relevance score),
@@ -1828,6 +2047,86 @@ enum Fixable {
     Delete(ast::Span),
     DeleteUnusedImport(ast::Span),
     RenameWithUnderscore(ast::Span),
+}
+
+/// Check if a binder is a simple variable (possibly with a type annotation).
+fn binder_is_simple_var(b: &ast::Binder) -> bool {
+    match b {
+        ast::Binder::Var(_) => true,
+        ast::Binder::Typed(inner, _) => binder_is_simple_var(inner),
+        _ => false,
+    }
+}
+
+/// Flatten a Typ::Arr chain into [param0, param1, ..., return_type].
+/// Unwraps top-level Forall, Constrained, and Paren wrappers.
+fn flatten_arr_chain(typ: &ast::Typ) -> Vec<&ast::Typ> {
+    let mut current = typ;
+    loop {
+        match current {
+            ast::Typ::Forall(_, inner) | ast::Typ::Constrained(_, inner) => current = inner,
+            ast::Typ::Paren(inner) => current = inner,
+            _ => break,
+        }
+    }
+    let mut result = Vec::new();
+    loop {
+        match current {
+            ast::Typ::Arr(left, right) => {
+                result.push(left.as_ref());
+                current = right;
+            }
+            _ => {
+                result.push(current);
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Correct a binder's span to include `{` and `}` for record binders,
+/// whose derived span only covers the inner fields.
+fn correct_binder_span(binder: &ast::Binder, source: &str, fi: ast::Fi) -> ast::Span {
+    let span = binder.span();
+    let is_record = matches!(binder, ast::Binder::Record(_))
+        || matches!(binder, ast::Binder::Typed(inner, _) if matches!(inner.as_ref(), ast::Binder::Record(_)));
+    if !is_record {
+        return span;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let (lo_line, lo_col) = span.lo();
+    let (hi_line, hi_col) = span.hi();
+    let brace_lo = lines
+        .get(lo_line)
+        .and_then(|line| line[..lo_col].rfind('{').map(|off| (lo_line, off)));
+    let brace_hi = lines
+        .get(hi_line)
+        .and_then(|line| line[hi_col..].find('}').map(|off| (hi_line, hi_col + off + 1)));
+    match (brace_lo, brace_hi) {
+        (Some(lo), Some(hi)) => ast::Span::Known(fi, lo, hi),
+        _ => span,
+    }
+}
+
+/// Compute the Range to delete the `idx`-th item from a spanned list,
+/// eating the separator (comma, arrow, whitespace) between neighbors.
+/// When removing the only item, `only_item_extra_char` extends by one char
+/// (for space-separated lists like binders).
+fn remove_nth_range(spans: &[ast::Span], idx: usize, only_item_extra_char: bool) -> Range {
+    if spans.len() == 1 {
+        if only_item_extra_char {
+            span_to_range(&spans[0].and_one_more_char())
+        } else {
+            span_to_range(&spans[0])
+        }
+    } else if idx < spans.len() - 1 {
+        // First or middle item: delete from its start to the next item's start (eats trailing separator).
+        range(spans[idx].lo(), spans[idx + 1].lo())
+    } else {
+        // Last item: delete from previous item's end to this item's end (eats leading separator).
+        range(spans[idx - 1].hi(), spans[idx].hi())
+    }
 }
 
 fn create_error(
