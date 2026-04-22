@@ -82,7 +82,7 @@ impl Export {
     pub fn contains(&self, name: Name) -> bool {
         match self {
             Export::ConstructorsSome(n, xs) | Export::ConstructorsAll(n, xs) => {
-                *n == name || xs.iter().any(|x| *x == name)
+                *n == name || xs.contains(&name)
             }
             Export::Just(n) => *n == name,
         }
@@ -505,14 +505,10 @@ impl<'s> N<'s> {
                     self.add_usage(name, s, Sort::Ref);
                 }
 
-                match unique_matches.len() {
-                    0 => {
-                        self.errors
-                            .push(NRerrors::Unknown(scope, Some(m.0 .0), n.0, s));
-                        return None;
-                    }
-                    // Namespace conflicts aren't a problem
-                    _ => (),
+                if unique_matches.is_empty() {
+                    self.errors
+                        .push(NRerrors::Unknown(scope, Some(m.0 .0), n.0, s));
+                    return None;
                 }
                 self.resolve(scope, Some(m.0 .0), n)
             }
@@ -736,13 +732,14 @@ impl<'s> N<'s> {
                 .push(NRerrors::CouldNotFindImport(from.0 .0, from.0 .1));
             return;
         }
-        if names.as_ref().map(|x| x.is_empty()).unwrap_or(false) && to.is_none() {
-            if from.0 .0 != ast::Ud::new("Prim") {
-                self.errors.push(NRerrors::ImportDoesNothing(
-                    from.0 .0,
-                    from.0 .1.entire_line(),
-                ));
-            }
+        if names.as_ref().map(|x| x.is_empty()).unwrap_or(false)
+            && to.is_none()
+            && from.0 .0 != ast::Ud::new("Prim")
+        {
+            self.errors.push(NRerrors::ImportDoesNothing(
+                from.0 .0,
+                from.0 .1.entire_line(),
+            ));
         }
         let exports: Vec<Export> = self
             .global_exports
