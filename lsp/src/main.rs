@@ -340,11 +340,11 @@ mod tests {
             let mut offset = 0;
             for (i, l) in source.lines().enumerate() {
                 if i == line as usize {
-                    return offset + col as usize;
+                    return offset + (col as usize).min(l.len());
                 }
                 offset += l.len() + 1; // +1 for \n
             }
-            offset
+            offset.min(source.len())
         };
 
         // Sort edits by start position in reverse so we can apply from end to start
@@ -445,8 +445,7 @@ mod tests {
                     } else {
                         serde_json::json!(null)
                     };
-                    let response =
-                        tower_lsp_server::jsonrpc::Response::from_ok(id, result);
+                    let response = tower_lsp_server::jsonrpc::Response::from_ok(id, result);
                     let _ = resp_sink.send(response).await;
                 }
             }
@@ -491,9 +490,54 @@ mod tests {
         (source, target_line, caret_col, action_title)
     }
 
-    async fn assert_code_action(source_with_marker: &str, expected: &str) {
-        let (source, line, character, action_title) = parse_marker(source_with_marker);
-        let uri = "file:///test.purs";
+    /// Split a test string into multiple modules using `=== Filename.purs ===` separators.
+    /// Returns a list of (filename, source) pairs.
+    /// If no separator is found, the entire string is treated as a single file "test.purs".
+    fn split_modules(input: &str) -> Vec<(String, String)> {
+        let mut modules = Vec::new();
+        let mut current_name: Option<String> = None;
+        let mut current_lines: Vec<&str> = Vec::new();
+
+        for line in input.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("=== ") && trimmed.ends_with(" ===") {
+                if let Some(name) = current_name.take() {
+                    let mut src = current_lines.join("\n");
+                    src.push('\n');
+                    modules.push((name, src));
+                    current_lines.clear();
+                }
+                let name = trimmed
+                    .strip_prefix("=== ")
+                    .unwrap()
+                    .strip_suffix(" ===")
+                    .unwrap()
+                    .to_string();
+                current_name = Some(name);
+            } else {
+                current_lines.push(line);
+            }
+        }
+
+        if let Some(name) = current_name {
+            let mut src = current_lines.join("\n");
+            src.push('\n');
+            modules.push((name, src));
+        } else {
+            // No separators found — single file
+            modules.push(("test.purs".into(), input.into()));
+        }
+
+        modules
+    }
+
+    async fn run_code_action_multi(
+        files: &[(&str, &str)],
+        target_file: &str,
+        line: u32,
+        character: u32,
+        action_title: &str,
+    ) -> String {
         let mut service = build_test_service();
 
         // Initialize
@@ -515,23 +559,33 @@ mod tests {
         // Give the server a moment to finish initialized handler
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Open document
-        lsp_notify(
-            &mut service,
-            "textDocument/didOpen",
-            serde_json::json!({
-                "textDocument": {
-                    "uri": uri,
-                    "languageId": "purescript",
-                    "version": 1,
-                    "text": source
-                }
-            }),
-        )
-        .await;
+        // Open all documents (non-target files first so their exports are available)
+        for (i, (name, source)) in files.iter().enumerate() {
+            let uri = format!("file:///{name}");
+            lsp_notify(
+                &mut service,
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "purescript",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            )
+            .await;
 
-        // Give on_change time to parse + resolve
+            // After each file, give on_change time to parse + resolve
+            if i < files.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        // Give on_change time to parse + resolve the last file
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let target_uri = format!("file:///{target_file}");
 
         // Request code actions at the given position
         let resp = lsp_request(
@@ -539,7 +593,7 @@ mod tests {
             2,
             "textDocument/codeAction",
             serde_json::json!({
-                "textDocument": { "uri": uri },
+                "textDocument": { "uri": target_uri },
                 "range": {
                     "start": { "line": line, "character": character },
                     "end": { "line": line, "character": character }
@@ -577,13 +631,77 @@ mod tests {
             });
 
         let workspace_edit = action.edit.as_ref().expect("Code action should have edits");
-        let changes = workspace_edit.changes.as_ref().expect("Should have changes");
-        let file_edits = changes
-            .get(&Uri::from_str(uri).unwrap())
-            .expect("Should have edits for test file");
+        let changes = workspace_edit
+            .changes
+            .as_ref()
+            .expect("Should have changes");
 
-        let actual = apply_edits(&source, &mut file_edits.clone());
-        assert_eq!(actual, expected, "Code action {:?} produced wrong result", action_title);
+        let target_source = files
+            .iter()
+            .find(|(name, _)| *name == target_file)
+            .unwrap()
+            .1;
+        let file_edits = changes
+            .get(&Uri::from_str(&target_uri).unwrap())
+            .expect("Should have edits for target file");
+
+        apply_edits(target_source, &mut file_edits.clone())
+    }
+
+    /// Test a code action using a `^ Action title` marker in the source.
+    /// Supports multi-module tests with `=== Filename.purs ===` separators.
+    /// The module containing the `^` marker is the test target.
+    async fn assert_code_action(source_with_marker: &str, expected: &str) {
+        let modules = split_modules(source_with_marker);
+
+        // Find which module has the marker
+        let (target_idx, _) = modules
+            .iter()
+            .enumerate()
+            .find(|(_, (_, src))| {
+                src.lines()
+                    .any(|l| l.trim_start().starts_with('^') && l.trim_start().len() > 1)
+            })
+            .expect("One module must contain a `^ Action title` marker line");
+
+        let (_, target_src) = &modules[target_idx];
+        let (cleaned_target, line, character, action_title) = parse_marker(target_src);
+
+        // Build the file list with the cleaned target
+        let files: Vec<(String, String)> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, (name, src))| {
+                if i == target_idx {
+                    (name.clone(), cleaned_target.clone())
+                } else {
+                    (name.clone(), src.clone())
+                }
+            })
+            .collect();
+
+        // Open dependency modules before the target module
+        let mut ordered: Vec<(&str, &str)> = Vec::new();
+        for (i, (name, src)) in files.iter().enumerate() {
+            if i != target_idx {
+                ordered.push((name.as_str(), src.as_str()));
+            }
+        }
+        ordered.push((files[target_idx].0.as_str(), files[target_idx].1.as_str()));
+
+        let actual = run_code_action_multi(
+            &ordered,
+            files[target_idx].0.as_str(),
+            line,
+            character,
+            &action_title,
+        )
+        .await;
+        assert_eq!(
+            actual, expected,
+            "Code action {:?} produced wrong result",
+            action_title
+        );
     }
 
     #[tokio::test]
@@ -761,6 +879,64 @@ mod tests {
 
                 run :: String -> Int -> String
                 run hello bar = hello
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn burn_all_unused_imports_partial_import_list() {
+        // Prim.Ordering exports: Ordering, LT, GT, EQ (all Type scope)
+        // We use Ordering and LT but not GT and EQ.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                import Prim.Ordering (Ordering, LT, GT, EQ)
+                ^ BurnAllUnusedImport
+
+                foo :: Ordering -> LT
+                foo x = x
+            "},
+            indoc! {"
+                module Test where
+
+                import Prim.Ordering (Ordering, LT)
+
+                foo :: Ordering -> LT
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn burn_all_unused_imports_constructor_syntax() {
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                data MyType = Foo | Bar | Baz
+
+                hello = 0
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (MyType(..), hello)
+                ^ BurnAllUnusedImport
+
+                foo :: Int
+                foo = hello
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (hello)
+
+                foo :: Int
+                foo = hello
             "},
         )
         .await;
@@ -1490,7 +1666,7 @@ impl LanguageServer for Backend {
 
         // Extract end_of_imports and immediately drop the modules guard so background
         // loading is not blocked while we do the (potentially slow) fixable processing.
-        let end_of_imports = {
+        let (end_of_imports, import_decls) = {
             let qq = self.modules.try_get(&me).try_unwrap();
             let head = or_!(
                 &or_!(&qq, {
@@ -1502,10 +1678,13 @@ impl LanguageServer for Backend {
                     return Err(error(line!(), "Module failed to load"));
                 }
             );
-            head.2
-                .last()
-                .map(|x| x.start.lo())
-                .unwrap_or_else(|| head.4.next_line().lo())
+            (
+                head.2
+                    .last()
+                    .map(|x| x.start.lo())
+                    .unwrap_or_else(|| head.4.next_line().lo()),
+                head.2.clone(),
+            )
             // qq (modules guard) dropped here
         };
 
@@ -1523,13 +1702,38 @@ impl LanguageServer for Backend {
         let mut out = Vec::new();
 
         let mut delete_all = Vec::new();
+        // Collect per-item unused spans for grouping by import decl.
+        let mut per_item_unused: Vec<ast::Span> = Vec::new();
         for (_, f) in fixables.iter() {
             match f {
                 Fixable::DeleteUnusedImport(at) => {
-                    delete_all.push(span_to_range(&at.and_one_more_char()))
+                    let is_entire_line = matches!(at, ast::Span::Known(_, (_, 0), _));
+                    if is_entire_line {
+                        delete_all.push(span_to_range(&at.and_one_more_char()));
+                    } else {
+                        per_item_unused.push(*at);
+                    }
                 }
                 _ => (),
             }
+        }
+        // For per-item deletions, group by import decl and compute
+        // ranges using remove_indices_ranges for correct separator handling.
+        for decl in import_decls.iter() {
+            let Some(items) = decl.names.as_ref() else {
+                continue;
+            };
+            let all_spans: Vec<ast::Span> = items.iter().map(|i| i.span()).collect();
+            let unused_indices: Vec<usize> = all_spans
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| per_item_unused.contains(s))
+                .map(|(i, _)| i)
+                .collect();
+            if unused_indices.is_empty() {
+                continue;
+            }
+            delete_all.extend(remove_indices_ranges(&all_spans, &unused_indices, false));
         }
         // Sort by start position, then merge overlapping/adjacent ranges so the
         // workspace-edit never contains invalid overlapping TextEdits.
@@ -2093,9 +2297,7 @@ impl LanguageServer for Backend {
                     let param_info = module.1.iter().find_map(|decl| {
                         if let ast::Decl::Def(name, binders, _) = decl {
                             binders.iter().enumerate().find_map(|(idx, binder)| {
-                                if binder_is_simple_var(binder)
-                                    && binder.span().contains(at.lo())
-                                {
+                                if binder_is_simple_var(binder) && binder.span().contains(at.lo()) {
                                     Some((name.0 .0, idx))
                                 } else {
                                     None
@@ -2115,12 +2317,13 @@ impl LanguageServer for Backend {
                                     if name.0 .0 == func_ud && binders.len() > param_idx =>
                                 {
                                     let source = self.fi_to_source.try_get(&fi).try_unwrap();
-                                    let binder_spans: Vec<_> = binders.iter().map(|b| {
-                                        match &source {
+                                    let binder_spans: Vec<_> = binders
+                                        .iter()
+                                        .map(|b| match &source {
                                             Some(s) => correct_binder_span(b, s.value(), fi),
                                             None => b.span(),
-                                        }
-                                    }).collect();
+                                        })
+                                        .collect();
                                     edits.push(TextEdit::new(
                                         remove_nth_range(&binder_spans, param_idx, true),
                                         "".into(),
@@ -2129,7 +2332,8 @@ impl LanguageServer for Backend {
                                 ast::Decl::Sig(name, typ) if name.0 .0 == func_ud => {
                                     let types = flatten_arr_chain(typ);
                                     if param_idx < types.len().saturating_sub(1) {
-                                    let type_spans: Vec<_> = types.iter().map(|t| t.span()).collect();
+                                        let type_spans: Vec<_> =
+                                            types.iter().map(|t| t.span()).collect();
                                         edits.push(TextEdit::new(
                                             remove_nth_range(&type_spans, param_idx, false),
                                             "".into(),
@@ -2145,9 +2349,7 @@ impl LanguageServer for Backend {
                                 title: "Delete unused parameter".into(),
                                 kind: Some(CodeActionKind::QUICKFIX),
                                 diagnostics: None,
-                                edit: Some(WorkspaceEdit::new(
-                                    [(uri.clone(), edits)].into(),
-                                )),
+                                edit: Some(WorkspaceEdit::new([(uri.clone(), edits)].into())),
                                 is_preferred: Some(true),
                                 ..CodeAction::default()
                             });
@@ -2217,12 +2419,13 @@ impl LanguageServer for Backend {
                                 {
                                     if is_last_field {
                                         let source = self.fi_to_source.try_get(&fi).try_unwrap();
-                                        let binder_spans: Vec<_> = binders.iter().map(|b| {
-                                            match &source {
+                                        let binder_spans: Vec<_> = binders
+                                            .iter()
+                                            .map(|b| match &source {
                                                 Some(s) => correct_binder_span(b, s.value(), fi),
                                                 None => b.span(),
-                                            }
-                                        }).collect();
+                                            })
+                                            .collect();
                                         edits.push(TextEdit::new(
                                             remove_nth_range(&binder_spans, param_idx, true),
                                             "".into(),
@@ -2254,15 +2457,19 @@ impl LanguageServer for Backend {
                                     let types = flatten_arr_chain(typ);
                                     if param_idx < types.len().saturating_sub(1) {
                                         if is_last_field {
-                                            let type_spans: Vec<_> = types.iter().map(|t| t.span()).collect();
+                                            let type_spans: Vec<_> =
+                                                types.iter().map(|t| t.span()).collect();
                                             edits.push(TextEdit::new(
                                                 remove_nth_range(&type_spans, param_idx, false),
                                                 "".into(),
                                             ));
                                         } else if let ast::Typ::Record(s_row) = types[param_idx] {
                                             let row = &s_row.0;
-                                            if let Some(idx) = row.0.iter().position(|(l, _)| l.0 .0 == field_ud) {
-                                                let row_spans: Vec<_> = row.0.iter().map(|f| f.span()).collect();
+                                            if let Some(idx) =
+                                                row.0.iter().position(|(l, _)| l.0 .0 == field_ud)
+                                            {
+                                                let row_spans: Vec<_> =
+                                                    row.0.iter().map(|f| f.span()).collect();
                                                 edits.push(TextEdit::new(
                                                     remove_nth_range(&row_spans, idx, false),
                                                     "".into(),
@@ -2285,9 +2492,7 @@ impl LanguageServer for Backend {
                                 title: title.into(),
                                 kind: Some(CodeActionKind::QUICKFIX),
                                 diagnostics: None,
-                                edit: Some(WorkspaceEdit::new(
-                                    [(uri.clone(), edits)].into(),
-                                )),
+                                edit: Some(WorkspaceEdit::new([(uri.clone(), edits)].into())),
                                 is_preferred: Some(true),
                                 ..CodeAction::default()
                             });
@@ -2522,9 +2727,11 @@ fn correct_binder_span(binder: &ast::Binder, source: &str, fi: ast::Fi) -> ast::
     let brace_lo = lines
         .get(lo_line)
         .and_then(|line| line[..lo_col].rfind('{').map(|off| (lo_line, off)));
-    let brace_hi = lines
-        .get(hi_line)
-        .and_then(|line| line[hi_col..].find('}').map(|off| (hi_line, hi_col + off + 1)));
+    let brace_hi = lines.get(hi_line).and_then(|line| {
+        line[hi_col..]
+            .find('}')
+            .map(|off| (hi_line, hi_col + off + 1))
+    });
     match (brace_lo, brace_hi) {
         (Some(lo), Some(hi)) => ast::Span::Known(fi, lo, hi),
         _ => span,
@@ -2549,6 +2756,32 @@ fn remove_nth_range(spans: &[ast::Span], idx: usize, only_item_extra_char: bool)
         // Last item: delete from previous item's end to this item's end (eats leading separator).
         range(spans[idx - 1].hi(), spans[idx].hi())
     }
+}
+
+/// Compute deletion Ranges for removing multiple items from a spanned list.
+/// Uses the kept items as anchors so separators are handled correctly even
+/// when adjacent items are all removed.
+fn remove_indices_ranges(
+    spans: &[ast::Span],
+    remove: &[usize],
+    only_item_extra_char: bool,
+) -> Vec<Range> {
+    if remove.is_empty() {
+        return Vec::new();
+    }
+    // Kept items in their original order.
+    let kept: Vec<usize> = (0..spans.len()).filter(|i| !remove.contains(i)).collect();
+    // Remove each item one-at-a-time from a virtual list that only
+    // contains the kept items + that one item.
+    remove
+        .iter()
+        .map(|&idx| {
+            let mut virtual_list: Vec<ast::Span> = kept.iter().map(|&i| spans[i]).collect();
+            let insert_pos = kept.iter().filter(|&&k| k < idx).count();
+            virtual_list.insert(insert_pos, spans[idx]);
+            remove_nth_range(&virtual_list, insert_pos, only_item_extra_char)
+        })
+        .collect()
 }
 
 fn create_error(
@@ -2755,7 +2988,7 @@ pub fn nrerror_turn_into_diagnostic(
             Vec::new(),
         ),
         NRerrors::NotAConstructor(d, m) => create_error(
-            m.0.1,
+            m.0 .1,
             "NotAConstructor".into(),
             format!(
                 "{} does not have a constructors {}",
@@ -2765,7 +2998,7 @@ pub fn nrerror_turn_into_diagnostic(
                     .map(|x| x.clone())
                     .unwrap_or_else(|| "?".into()),
                 names
-                    .try_get(&m.0.0)
+                    .try_get(&m.0 .0)
                     .try_unwrap()
                     .map(|x| x.clone())
                     .unwrap_or_else(|| "?".into())
@@ -2979,10 +3212,14 @@ impl Backend {
                     let m = m?;
                     let (me, imports) = {
                         let header = m.0.clone()?;
-                        let me = header.0.0.0;
+                        let me = header.0 .0 .0;
                         (
                             me,
-                            header.2.iter().map(|x| x.from.0.0).collect::<BTreeSet<_>>(),
+                            header
+                                .2
+                                .iter()
+                                .map(|x| x.from.0 .0)
+                                .collect::<BTreeSet<_>>(),
                         )
                     };
                     self.modules.insert(me, m.clone());
@@ -3057,7 +3294,7 @@ impl Backend {
         fi: ast::Fi,
         version: Option<i32>,
     ) -> Option<(bool, ast::Ud)> {
-        let me = m.0.as_ref()?.0.0.0;
+        let me = m.0.as_ref()?.0 .0 .0;
         let mut n = nr::N::new(me, &self.exports);
         nr::resolve_names(&mut n, self.prim, m);
 

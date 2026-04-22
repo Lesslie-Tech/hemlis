@@ -303,7 +303,7 @@ impl<'s> N<'s> {
                             is_entire_thing_unused = false;
                         }
                     }
-                    ast::Import::TypDat(s, proper_name, data_member) => {
+                    ast::Import::TypDat(_s, proper_name, data_member) => {
                         if let Some((ty_unused, fields)) = valid.iter().find_map(|n| match n {
                             Export::ConstructorsSome(name, fields)
                             | Export::ConstructorsAll(name, fields)
@@ -314,7 +314,7 @@ impl<'s> N<'s> {
                             _ => None,
                         }) {
                             match data_member {
-                                ast::DataMember::All(s) => {
+                                ast::DataMember::All(_) => {
                                     let all_unused = fields.iter().all(|name| !self.is_used(name));
                                     // NOTE: This case cannot be handled by simple
                                     // syntactical-analysis alone. We need to know about different
@@ -331,7 +331,7 @@ impl<'s> N<'s> {
                                         self.errors.push(NRerrors::UnusedImportTypeAndConstructor(
                                             proper_name.0 .0,
                                             fields.clone(),
-                                            *s,
+                                            import.span(),
                                         ));
                                     } else {
                                         is_entire_thing_unused = false;
@@ -369,7 +369,7 @@ impl<'s> N<'s> {
                                         self.errors.push(NRerrors::UnusedImportTypeAndConstructor(
                                             proper_name.0 .0,
                                             fields.clone(),
-                                            *s,
+                                            import.span(),
                                         ));
                                     }
                                 }
