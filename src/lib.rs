@@ -9,6 +9,7 @@ pub mod ast;
 pub mod lexer;
 pub mod nr;
 pub mod parser;
+pub mod style;
 
 use crate::ast::Ast;
 

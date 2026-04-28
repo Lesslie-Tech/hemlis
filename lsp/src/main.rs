@@ -89,6 +89,8 @@ struct Backend {
     syntax_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
     name_resolution_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
     fixables: DashMap<ast::Fi, Vec<(ast::Span, Fixable)>>,
+    /// Files currently open in the editor (tracked via didOpen/didClose).
+    open_files: DashMap<ast::Fi, ()>,
 
     /// Whether the client supports dynamic registration of workspace/didChangeWatchedFiles.
     /// If false, the server sets up its own native file watcher.
@@ -426,6 +428,7 @@ mod tests {
             syntax_errors: Default::default(),
             name_resolution_errors: Default::default(),
             fixables: Default::default(),
+            open_files: Default::default(),
             client_watch_dynamic_registration: std::sync::OnceLock::new(),
         })
         .finish();
@@ -941,6 +944,164 @@ mod tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_bind_reverse() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a =<< b
+                      ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = b >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_compose_reverse() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <<< b
+                      ^ Replace `<<<` with `>>>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = b >>> a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_nested_same_precedence() {
+        // f =<< g =<< x  parses as  f =<< (g =<< x)  (infixr 1)
+        // Replacing the outer =<< must parenthesize the rhs because
+        // mixing =<< (infixr 1) and >>= (infixl 1) at the same
+        // precedence is a parse error without parens.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a =<< b =<< c
+                      ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (b =<< c) >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_nested_compose() {
+        // a <<< b <<< c  parses as  a <<< (b <<< c)  (infixr 9)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <<< b <<< c
+                      ^ Replace `<<<` with `>>>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (b <<< c) >>> a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_under_dollar() {
+        // f $ a =<< b  parses as  f $ (a =<< b)
+        // Fixing inner =<< replaces just that subexpression.
+        // Result: f $ b >>= a — correct because $ (prec 0) < >>= (prec 1).
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ a =<< b
+                          ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g $ b >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_with_higher_prec_operand() {
+        // a =<< b + c  parses as  a =<< (b + c)
+        // + is prec 6, >>= is prec 1, so (b + c) >>= a is correct.
+        // Parens are conservative but harmless.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a =<< b + c
+                      ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (b + c) >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_app_operands() {
+        // (f a) =<< (g b)  — App operands don't need parens.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a b =<< c d
+                        ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = c d >>= a b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_backtick_infix_operand() {
+        // a `foo` b =<< c  parses as  (a `foo` b) =<< c
+        // Infix operand needs parens when it becomes the rhs.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a `foo` b =<< c
+                              ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = c >>= (a `foo` b)
+            "},
+        )
+        .await;
+    }
 }
 
 impl LanguageServer for Backend {
@@ -1166,11 +1327,17 @@ impl LanguageServer for Backend {
 
     #[instrument(skip(self, params))]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        let fi = self.find_fi(uri.clone());
+        if let Some(fi) = fi {
+            self.open_files.insert(fi, ());
+        }
         if let Some((fi, version, to_notify)) = self.on_change(TextDocumentItem {
             text: &params.text_document.text,
-            uri: params.text_document.uri.clone(),
+            uri,
             version: Some(params.text_document.version),
         }) {
+            self.open_files.insert(fi, ());
             self.show_errors(fi, version).await;
             for (fi, v) in to_notify.iter() {
                 self.show_errors(*fi, *v).await;
@@ -1214,7 +1381,11 @@ impl LanguageServer for Backend {
     async fn did_save(&self, _: DidSaveTextDocumentParams) {}
 
     #[instrument(skip(self))]
-    async fn did_close(&self, _: DidCloseTextDocumentParams) {}
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        if let Some(fi) = self.uri_to_fi.try_get(&params.text_document.uri).try_unwrap() {
+            self.open_files.remove(&*fi);
+        }
+    }
 
     #[instrument(skip(self))]
     async fn goto_definition(
@@ -2279,6 +2450,22 @@ impl LanguageServer for Backend {
                     is_preferred: Some(true),
                     ..CodeAction::default()
                 }),
+                Fixable::ReplaceExpression(expr_span, title, replacement, _) => {
+                    out.push(CodeAction {
+                        title: title.clone(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit::new(
+                            [(
+                                uri.clone(),
+                                vec![TextEdit::new(span_to_range(expr_span), replacement.clone())],
+                            )]
+                            .into(),
+                        )),
+                        is_preferred: Some(true),
+                        ..CodeAction::default()
+                    })
+                }
             }
         }
         // Offer "Delete unused parameter" for unused function parameters
@@ -2674,6 +2861,8 @@ enum Fixable {
     Delete(ast::Span),
     DeleteUnusedImport(ast::Span),
     RenameWithUnderscore(ast::Span),
+    /// Replace an expression span with new text. (expr_span, title, replacement, warning_message)
+    ReplaceExpression(ast::Span, String, String, String),
 }
 
 /// Check if a binder is a simple variable (possibly with a type annotation).
@@ -3314,6 +3503,32 @@ impl Backend {
             errors
                 .iter()
                 .flat_map(nrerror_turn_into_fixables)
+                .chain(
+                    if self.open_files.contains_key(&fi) {
+                        self.fi_to_source
+                            .try_get(&fi)
+                            .try_unwrap()
+                            .map(|source| {
+                                style::check_module(m, source.value())
+                                    .into_iter()
+                                    .map(|sd| {
+                                        (
+                                            sd.cursor_span,
+                                            Fixable::ReplaceExpression(
+                                                sd.expr_span,
+                                                sd.title,
+                                                sd.replacement,
+                                                sd.message,
+                                            ),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
+                )
                 .collect::<Vec<_>>(),
         );
 
@@ -3541,6 +3756,20 @@ impl Backend {
         } else {
             Vec::new()
         };
+        let sty =
+            if let Some(x) = self.fixables.try_get(&fi).try_unwrap() {
+                x.value()
+                    .iter()
+                    .filter_map(|(_, f)| match f {
+                        Fixable::ReplaceExpression(expr_span, _, _, message) => Some(
+                            create_warning(*expr_span, "style".into(), message.clone(), vec![]),
+                        ),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let v = if let Some(v) = self.fi_to_version.try_get(&fi).try_unwrap() {
             *v
         } else {
@@ -3548,7 +3777,7 @@ impl Backend {
         };
         // tracing::info!("PRESENTING DIAGNOSTICS {:?}", uri.to_string());
         self.client
-            .publish_diagnostics(uri.clone(), [se, re].concat(), v)
+            .publish_diagnostics(uri.clone(), [se, re, sty].concat(), v)
             .await
     }
 
@@ -3798,6 +4027,7 @@ async fn main() {
         syntax_errors: DashMap::new(),
         name_resolution_errors: DashMap::new(),
         fixables: DashMap::new(),
+        open_files: DashMap::new(),
 
         client_watch_dynamic_registration: std::sync::OnceLock::new(),
     })
