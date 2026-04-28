@@ -95,6 +95,36 @@ struct Backend {
     /// Whether the client supports dynamic registration of workspace/didChangeWatchedFiles.
     /// If false, the server sets up its own native file watcher.
     client_watch_dynamic_registration: std::sync::OnceLock<bool>,
+
+    /// Controls when style diagnostics and code actions are produced.
+    style_mode: RwLock<StyleMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StyleMode {
+    /// No style diagnostics or code actions.
+    Off,
+    /// Style checks only for files open in the editor (default).
+    OpenFilesOnly,
+    /// Style checks for all files in the workspace.
+    AllFiles,
+}
+
+impl Default for StyleMode {
+    fn default() -> Self {
+        Self::OpenFilesOnly
+    }
+}
+
+impl StyleMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "openFilesOnly" => Self::OpenFilesOnly,
+            "allFiles" => Self::AllFiles,
+            _ => Self::default(),
+        }
+    }
 }
 
 impl Backend {
@@ -306,7 +336,7 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_hover_snippet, strip_hover_comment_prefix};
+    use super::{format_hover_snippet, strip_hover_comment_prefix, StyleMode};
     use indoc::indoc;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{CodeActionOrCommand, TextEdit, Uri};
@@ -430,6 +460,7 @@ mod tests {
             fixables: Default::default(),
             open_files: Default::default(),
             client_watch_dynamic_registration: std::sync::OnceLock::new(),
+            style_mode: std::sync::RwLock::new(StyleMode::default()),
         })
         .finish();
 
@@ -1459,6 +1490,14 @@ impl LanguageServer for Backend {
             .and_then(|d| d.dynamic_registration)
             .unwrap_or(false);
         let _ = self.client_watch_dynamic_registration.set(dynamic_watch);
+
+        // Read style mode from initializationOptions
+        if let Some(opts) = params.initialization_options {
+            if let Some(style) = opts.get("style").and_then(|v| v.as_str()) {
+                *self.style_mode.write().unwrap() = StyleMode::from_str(style);
+            }
+        }
+
         Ok(InitializeResult {
             server_info: None,
             offset_encoding: None,
@@ -3041,7 +3080,11 @@ impl LanguageServer for Backend {
     }
 
     #[instrument(skip(self))]
-    async fn did_change_configuration(&self, _: DidChangeConfigurationParams) {}
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if let Some(style) = params.settings.get("style").and_then(|v| v.as_str()) {
+            *self.style_mode.write().unwrap() = StyleMode::from_str(style);
+        }
+    }
 
     #[instrument(skip(self))]
     async fn did_change_workspace_folders(&self, _: DidChangeWorkspaceFoldersParams) {}
@@ -3848,29 +3891,36 @@ impl Backend {
                 .iter()
                 .flat_map(nrerror_turn_into_fixables)
                 .chain(
-                    if self.open_files.contains_key(&fi) {
-                        self.fi_to_source
-                            .try_get(&fi)
-                            .try_unwrap()
-                            .map(|source| {
-                                style::check_module(m, source.value())
-                                    .into_iter()
-                                    .map(|sd| {
-                                        (
-                                            sd.cursor_span,
-                                            Fixable::ReplaceExpression(
-                                                sd.expr_span,
-                                                sd.title,
-                                                sd.replacement,
-                                                sd.message,
-                                            ),
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        Vec::new()
+                    {
+                        let run_style = match *self.style_mode.read().unwrap() {
+                            StyleMode::Off => false,
+                            StyleMode::OpenFilesOnly => self.open_files.contains_key(&fi),
+                            StyleMode::AllFiles => true,
+                        };
+                        if run_style {
+                            self.fi_to_source
+                                .try_get(&fi)
+                                .try_unwrap()
+                                .map(|source| {
+                                    style::check_module(m, source.value())
+                                        .into_iter()
+                                        .map(|sd| {
+                                            (
+                                                sd.cursor_span,
+                                                Fixable::ReplaceExpression(
+                                                    sd.expr_span,
+                                                    sd.title,
+                                                    sd.replacement,
+                                                    sd.message,
+                                                ),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
                     },
                 )
                 .collect::<Vec<_>>(),
@@ -4381,6 +4431,7 @@ async fn main() {
         open_files: DashMap::new(),
 
         client_watch_dynamic_registration: std::sync::OnceLock::new(),
+        style_mode: RwLock::new(StyleMode::default()),
     })
     .finish();
 
