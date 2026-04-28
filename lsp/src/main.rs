@@ -1497,6 +1497,239 @@ mod tests {
         )
         .await;
     }
+
+    // --- Unnecessary parentheses (PAY-3104) ---
+
+    #[tokio::test]
+    async fn style_remove_parens_whole_rhs() {
+        // f = (bar baz) — paren is the whole RHS, not inside App/Op
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = (bar baz)
+                    ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f = bar baz
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_double() {
+        // ((x)) → (x)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g ((a))
+                      ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (a)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_atom_in_app_arg() {
+        // f (a) → f a
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g (a)
+                      ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f = g a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_app_in_app_func() {
+        // (f a) b — parens might be needed (partial application, etc.)
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = (g a) b
+                    ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_app_in_app_arg() {
+        // f (g a) — parens needed, f (g a) ≠ f g a
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = h (g a)
+                      ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_higher_prec_op_left() {
+        // (a * b) + c — different operators, keep parens
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = (a * b) + c
+                    ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_lower_prec_op_left() {
+        // (a + b) * c — parens needed
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = (a + b) * c
+                    ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_in_record_access() {
+        // (f a).field — parens needed, otherwise .field binds to `a`
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = (g a).x
+                    ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_in_record_update() {
+        // (f a) { x = 1 } — parens needed for record update target
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = (g a) { x = 1 }
+                    ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_app_in_op() {
+        // (g a) + c — app inside op, keep parens
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = (g a) + c
+                    ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_same_prec_left_assoc_left() {
+        // (a + b) + c → a + b + c (+ is left-assoc)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = (a + b) + c
+                    ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f = a + b + c
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_same_op_left_assoc_right() {
+        // a + (b + c) → a + b + c (same operator, always removable)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a + (b + c)
+                        ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f = a + b + c
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_same_prec_right_assoc_right() {
+        // a $ (b $ c) → a $ b $ c ($ is right-assoc)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a $ (b $ c)
+                        ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f = a $ b $ c
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_same_op_right_assoc_left() {
+        // (a $ b) $ c → a $ b $ c (same operator, always removable)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = (a $ b) $ c
+                    ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f = a $ b $ c
+            "},
+        )
+        .await;
+    }
 }
 
 impl LanguageServer for Backend {

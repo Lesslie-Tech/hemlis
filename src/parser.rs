@@ -644,6 +644,10 @@ impl Prec {
             Self::L(a) | Self::R(a) => *a,
         }
     }
+
+    pub fn is_left(&self) -> bool {
+        matches!(self, Self::L(_))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]

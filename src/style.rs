@@ -64,25 +64,36 @@ fn source_text<'a>(source: &'a str, span: &Span) -> Option<&'a str> {
 /// parenthesis delimiters that aren't captured by the derived span.
 fn expr_byte_range(source: &str, expr: &ast::Expr) -> Option<(usize, usize)> {
     let (lo, hi) = span_to_byte_range(source, &expr.span())?;
-    // Extend right if the expression (or its rightmost child) is a Paren
-    let hi = if has_trailing_paren(expr) {
-        match source[hi..].find(')') {
-            Some(i) => hi + i + 1,
-            None => hi,
+    // Count Paren nesting at the top level to find all opening parens
+    let mut paren_depth = 0;
+    let mut e = expr;
+    while let ast::Expr::Paren(inner) = e {
+        paren_depth += 1;
+        e = inner;
+    }
+    // Extend left past `paren_depth` opening parens (skipping whitespace)
+    let mut lo = lo;
+    for _ in 0..paren_depth {
+        lo = source[..lo].rfind('(').unwrap_or(lo);
+    }
+    // Count trailing paren depth (may come from Paren, Op rhs, App arg)
+    let trailing_depth = trailing_paren_depth(expr);
+    let mut hi = hi;
+    for _ in 0..trailing_depth {
+        if let Some(i) = source[hi..].find(')') {
+            hi = hi + i + 1;
         }
-    } else {
-        hi
-    };
+    }
     Some((lo, hi))
 }
 
-/// Check if an expression has an uncovered trailing ')'.
-fn has_trailing_paren(expr: &ast::Expr) -> bool {
+/// Count the depth of uncovered trailing `)` characters.
+fn trailing_paren_depth(expr: &ast::Expr) -> usize {
     match expr {
-        ast::Expr::Paren(_) => true,
-        ast::Expr::Op(_, _, rhs) => has_trailing_paren(rhs),
-        ast::Expr::App(_, arg) => has_trailing_paren(arg),
-        _ => false,
+        ast::Expr::Paren(inner) => 1 + trailing_paren_depth(inner),
+        ast::Expr::Op(_, _, rhs) => trailing_paren_depth(rhs),
+        ast::Expr::App(_, arg) => trailing_paren_depth(arg),
+        _ => 0,
     }
 }
 
@@ -288,7 +299,115 @@ fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnost
 }
 
 // ---------------------------------------------------------------------------
-// AST Traversal
+// Unnecessary parentheses (PAY-3104)
+// ---------------------------------------------------------------------------
+
+fn is_atom(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Ident(_)
+            | ast::Expr::Constructor(_)
+            | ast::Expr::Symbol(_)
+            | ast::Expr::Boolean(_)
+            | ast::Expr::Char(_)
+            | ast::Expr::Str(_)
+            | ast::Expr::Number(_)
+            | ast::Expr::HexInt(_)
+            | ast::Expr::Array(..)
+            | ast::Expr::Record(..)
+            | ast::Expr::Section(_)
+            | ast::Expr::Hole(_)
+            | ast::Expr::Paren(_)
+    )
+}
+
+#[allow(dead_code)]
+enum ParenContext {
+    AppFunc,
+    AppArg,
+    OpLeft(Ud),
+    OpRight(Ud),
+}
+
+#[allow(dead_code)]
+fn paren_is_unnecessary(inner: &ast::Expr, ctx: &ParenContext) -> bool {
+    match ctx {
+        ParenContext::AppFunc => is_atom(inner) || matches!(inner, ast::Expr::App(..)),
+        ParenContext::AppArg => is_atom(inner),
+        ParenContext::OpLeft(outer_ud) | ParenContext::OpRight(outer_ud) => {
+            if is_atom(inner) || matches!(inner, ast::Expr::App(..)) {
+                return true;
+            }
+            if let ast::Expr::Op(_, inner_qop, _) = inner {
+                let outer_fix = op_fixity(*outer_ud);
+                let inner_fix = op_fixity((inner_qop.1).0 .0);
+                if inner_fix.prec() > outer_fix.prec() {
+                    return true;
+                }
+                if inner_fix.prec() == outer_fix.prec() {
+                    let on_left = matches!(ctx, ParenContext::OpLeft(_));
+                    let left_assoc = inner_fix.is_left();
+                    if (on_left && left_assoc) || (!on_left && !left_assoc) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+fn emit_remove_parens(
+    child: &ast::Expr,
+    source: &str,
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    if let ast::Expr::Paren(inner) = child {
+        let inner_text = expr_text(source, inner);
+        if let Some(text) = inner_text {
+            let paren_span = expr_full_span(source, child);
+            out.push(StyleDiagnostic {
+                cursor_span: paren_span,
+                expr_span: paren_span,
+                title: "Remove unnecessary parentheses".into(),
+                replacement: text,
+                message: Some("Unnecessary parentheses".into()),
+            });
+        }
+    }
+}
+
+/// Simple heuristic for unnecessary parentheses:
+/// 1. Double parens: `((x))` → `(x)`
+/// 2. Atom in parens: `(x)` → `x` (single ident/literal/array/record)
+/// 3. Paren not inside App/Op: the parens are the whole expression in their
+///    context (definition RHS, do-bind, let-bind, case scrutinee, etc.)
+/// 4. Same operator inside as outside: `(a + b) + c` → `a + b + c`
+fn rule_unnecessary_parens(
+    expr: &ast::Expr,
+    source: &str,
+    inside_app_or_op: bool,
+    outer_op: Option<Ud>,
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    if let ast::Expr::Paren(inner) = expr {
+        let same_op = if let (Some(outer), ast::Expr::Op(_, inner_qop, _)) =
+            (outer_op, inner.as_ref())
+        {
+            (inner_qop.1).0 .0 == outer
+        } else {
+            false
+        };
+        let removable = matches!(inner.as_ref(), ast::Expr::Paren(_))
+            || is_atom(inner)
+            || !inside_app_or_op
+            || same_op;
+        if removable {
+            emit_remove_parens(expr, source, out);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 struct StyleChecker<'a> {
@@ -305,10 +424,15 @@ impl<'a> StyleChecker<'a> {
     }
 
     fn check_expr(&mut self, expr: &ast::Expr) {
+        self.check_expr_ctx(expr, false, None);
+    }
+
+    fn check_expr_ctx(&mut self, expr: &ast::Expr, inside_app_or_op: bool, outer_op: Option<Ud>) {
         // ===== RULES (add new rules here) =====
         rule_forbidden_operator(expr, self.source, &mut self.diagnostics);
         rule_operator_swap(expr, self.source, &mut self.diagnostics);
         rule_op_to_parens(expr, self.source, &mut self.diagnostics);
+        rule_unnecessary_parens(expr, self.source, inside_app_or_op, outer_op, &mut self.diagnostics);
         // =======================================
 
         self.recurse_expr(expr);
@@ -317,19 +441,20 @@ impl<'a> StyleChecker<'a> {
     fn recurse_expr(&mut self, expr: &ast::Expr) {
         match expr {
             ast::Expr::Typed(e, _) => self.check_expr(e),
-            ast::Expr::Op(a, _, b) => {
-                self.check_expr(a);
-                self.check_expr(b);
+            ast::Expr::Op(a, qop, b) => {
+                let op_ud = (qop.1).0 .0;
+                self.check_expr_ctx(a, true, Some(op_ud));
+                self.check_expr_ctx(b, true, Some(op_ud));
             }
             ast::Expr::Infix(a, o, b) => {
-                self.check_expr(a);
+                self.check_expr_ctx(a, true, None);
                 self.check_expr(o);
-                self.check_expr(b);
+                self.check_expr_ctx(b, true, None);
             }
             ast::Expr::Negate(e) => self.check_expr(e),
             ast::Expr::App(a, b) => {
-                self.check_expr(a);
-                self.check_expr(b);
+                self.check_expr_ctx(a, true, None);
+                self.check_expr_ctx(b, true, None);
             }
             ast::Expr::Vta(e, _) => self.check_expr(e),
             ast::Expr::IfThenElse(_, c, t, f) => {
@@ -375,10 +500,10 @@ impl<'a> StyleChecker<'a> {
                 }
             }
             ast::Expr::Update(e, updates) => {
-                self.check_expr(e);
+                self.check_expr_ctx(e, true, None);
                 self.check_record_updates(updates);
             }
-            ast::Expr::Access(e, _) => self.check_expr(e),
+            ast::Expr::Access(e, _) => self.check_expr_ctx(e, true, None),
             ast::Expr::Paren(e) => self.check_expr(e),
             ast::Expr::Section(_)
             | ast::Expr::Hole(_)
