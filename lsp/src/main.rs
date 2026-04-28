@@ -1192,8 +1192,7 @@ mod tests {
     #[tokio::test]
     async fn style_replace_forbidden_operator_with_higher_prec_operand() {
         // a =<< b + c  parses as  a =<< (b + c)
-        // + is prec 6, >>= is prec 1, so (b + c) >>= a is correct.
-        // Parens are conservative but harmless.
+        // + is prec 6, >>= is prec 1, so b + c >>= a is correct — no parens needed.
         assert_code_action(
             indoc! {"
                 module Test where
@@ -1204,7 +1203,7 @@ mod tests {
             indoc! {"
                 module Test where
 
-                f = (b + c) >>= a
+                f = b + c >>= a
             "},
         )
         .await;
@@ -1412,7 +1411,7 @@ mod tests {
             indoc! {"
                 module Test where
 
-                f = (d $ (a # b >>= c))
+                f = (d $ a # b >>= c)
             "},
         )
         .await;
@@ -1477,6 +1476,27 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn style_convert_fmap_to_flipped_in_do_block() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = do
+                  a <- g $ h <<< j <$> [1, 2, 3]
+                                    ^ Replace `<$>` with `<#>`
+                  k $ b 1
+            "},
+            indoc! {"
+                module Test where
+
+                f = do
+                  a <- g $ ([1, 2, 3] <#> h <<< j)
+                  k $ b 1
+            "},
+        )
+        .await;
+    }
 }
 
 impl LanguageServer for Backend {
@@ -1765,7 +1785,11 @@ impl LanguageServer for Backend {
 
     #[instrument(skip(self))]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        if let Some(fi) = self.uri_to_fi.try_get(&params.text_document.uri).try_unwrap() {
+        if let Some(fi) = self
+            .uri_to_fi
+            .try_get(&params.text_document.uri)
+            .try_unwrap()
+        {
             self.open_files.remove(&*fi);
         }
     }
@@ -3890,39 +3914,37 @@ impl Backend {
             errors
                 .iter()
                 .flat_map(nrerror_turn_into_fixables)
-                .chain(
-                    {
-                        let run_style = match *self.style_mode.read().unwrap() {
-                            StyleMode::Off => false,
-                            StyleMode::OpenFilesOnly => self.open_files.contains_key(&fi),
-                            StyleMode::AllFiles => true,
-                        };
-                        if run_style {
-                            self.fi_to_source
-                                .try_get(&fi)
-                                .try_unwrap()
-                                .map(|source| {
-                                    style::check_module(m, source.value())
-                                        .into_iter()
-                                        .map(|sd| {
-                                            (
-                                                sd.cursor_span,
-                                                Fixable::ReplaceExpression(
-                                                    sd.expr_span,
-                                                    sd.title,
-                                                    sd.replacement,
-                                                    sd.message,
-                                                ),
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
-                    },
-                )
+                .chain({
+                    let run_style = match *self.style_mode.read().unwrap() {
+                        StyleMode::Off => false,
+                        StyleMode::OpenFilesOnly => self.open_files.contains_key(&fi),
+                        StyleMode::AllFiles => true,
+                    };
+                    if run_style {
+                        self.fi_to_source
+                            .try_get(&fi)
+                            .try_unwrap()
+                            .map(|source| {
+                                style::check_module(m, source.value())
+                                    .into_iter()
+                                    .map(|sd| {
+                                        (
+                                            sd.cursor_span,
+                                            Fixable::ReplaceExpression(
+                                                sd.expr_span,
+                                                sd.title,
+                                                sd.replacement,
+                                                sd.message,
+                                            ),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                })
                 .collect::<Vec<_>>(),
         );
 
@@ -4150,27 +4172,19 @@ impl Backend {
         } else {
             Vec::new()
         };
-        let sty =
-            if let Some(x) = self.fixables.try_get(&fi).try_unwrap() {
-                x.value()
-                    .iter()
-                    .filter_map(|(_, f)| match f {
-                        Fixable::ReplaceExpression(expr_span, _, _, message) => message
-                            .as_ref()
-                            .map(|msg| {
-                                create_warning(
-                                    *expr_span,
-                                    "style".into(),
-                                    msg.clone(),
-                                    vec![],
-                                )
-                            }),
-                        _ => None,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let sty = if let Some(x) = self.fixables.try_get(&fi).try_unwrap() {
+            x.value()
+                .iter()
+                .filter_map(|(_, f)| match f {
+                    Fixable::ReplaceExpression(expr_span, _, _, message) => message
+                        .as_ref()
+                        .map(|msg| create_warning(*expr_span, "style".into(), msg.clone(), vec![])),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let v = if let Some(v) = self.fi_to_version.try_get(&fi).try_unwrap() {
             *v
         } else {

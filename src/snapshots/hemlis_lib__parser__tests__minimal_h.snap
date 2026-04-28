@@ -31,7 +31,7 @@ Module
        RecordLabelExpr::Pun
         Name
          (3, 19)->(3, 27)
-      (5, 0)->(5, 1)
+      (3, 28)->(3, 29)
   Decl::Def
    Name
     (5, 0)->(5, 1)

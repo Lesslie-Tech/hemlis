@@ -582,8 +582,8 @@ fn typ_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Typ> {
             let start = p.span();
             kw_lb(p)?;
             let r = row(p)?;
-            kw_rb(p)?;
             let end = p.span();
+            kw_rb(p)?;
             Some(Typ::Record(S(r, start.merge(end))))
         }
         // NOTE: ( a :: B ) is considered a row-type in this conflict
@@ -620,7 +620,7 @@ fn typ_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Typ> {
 
 // Higher binds tighter
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum Prec {
+pub(crate) enum Prec {
     L(usize),
     R(usize),
 }
@@ -639,7 +639,7 @@ impl Prec {
         }
     }
 
-    fn prec(&self) -> usize {
+    pub fn prec(&self) -> usize {
         match self {
             Self::L(a) | Self::R(a) => *a,
         }
@@ -875,7 +875,7 @@ fn expr_fop(t: &ExprOp) -> Prec {
 
 /// Well-known PureScript operator fixities.
 /// Unknown operators default to R(1) to preserve current behaviour.
-fn op_fixity(ud: Ud) -> Prec {
+pub(crate) fn op_fixity(ud: Ud) -> Prec {
     use Prec::*;
     // Precedence 0
     if ud == Ud::new("$") { return R(1) }
@@ -1078,8 +1078,8 @@ fn expr_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Expr> {
             let start = p.span();
             kw_ls(p)?;
             let inner = sep_until(p, "array expr", kw_comma, expr, next_is!(T::RightSquare));
-            kw_rs(p)?;
             let end = p.span();
+            kw_rs(p)?;
             Some(Expr::Array(start, inner, end))
         }
         (Some(T::LeftBrace), _) => {
@@ -1092,8 +1092,8 @@ fn expr_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Expr> {
                 record_label,
                 next_is!(T::RightBrace),
             );
-            kw_rb(p)?;
             let end = p.span();
+            kw_rb(p)?;
             Some(Expr::Record(start, inner, end))
         }
         (Some(T::LeftParen), _) => {
@@ -2450,5 +2450,18 @@ h = A. B. C.
     #[test]
     fn large_ints_in_type_sig() {
         assert_snapshot!(p_typ("2147483648"))
+    }
+
+    #[test]
+    fn do_block_fmap_array() {
+        assert_snapshot!(p_module(
+            r"
+module Test where
+
+f = do
+  a <- g $ h <<< j <$> [1, 2, 3]
+  k $ b 1
+"
+        ))
     }
 }

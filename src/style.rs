@@ -1,4 +1,5 @@
 use crate::ast::{self, Ast, Span, Ud};
+use crate::parser::op_fixity;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -138,23 +139,26 @@ const FORBIDDEN_OPS: &[ForbiddenOp] = &[
     },
 ];
 
-fn needs_parens(expr: &ast::Expr) -> bool {
-    matches!(
-        expr,
-        ast::Expr::Op(..)
-            | ast::Expr::Infix(..)
-            | ast::Expr::Lambda(..)
-            | ast::Expr::IfThenElse(..)
-            | ast::Expr::Let(..)
-            | ast::Expr::Case(..)
-            | ast::Expr::Do(..)
-            | ast::Expr::Ado(..)
-            | ast::Expr::Typed(..)
-    )
+fn needs_parens(expr: &ast::Expr, target_prec: usize) -> bool {
+    match expr {
+        ast::Expr::Op(_, qop, _) => {
+            let inner_prec = op_fixity((qop.1).0 .0).prec();
+            inner_prec <= target_prec
+        }
+        ast::Expr::Infix(..)
+        | ast::Expr::Lambda(..)
+        | ast::Expr::IfThenElse(..)
+        | ast::Expr::Let(..)
+        | ast::Expr::Case(..)
+        | ast::Expr::Do(..)
+        | ast::Expr::Ado(..)
+        | ast::Expr::Typed(..) => true,
+        _ => false,
+    }
 }
 
-fn maybe_paren(text: &str, expr: &ast::Expr) -> String {
-    if needs_parens(expr) {
+fn maybe_paren(text: &str, expr: &ast::Expr, target_prec: usize) -> String {
+    if needs_parens(expr, target_prec) {
         format!("({})", text)
     } else {
         text.to_string()
@@ -170,8 +174,9 @@ fn rule_forbidden_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDi
                 let lhs_text = expr_text(source, lhs).unwrap_or_else(|| "_".into());
                 let rhs_text = expr_text(source, rhs).unwrap_or_else(|| "_".into());
 
-                let new_lhs = maybe_paren(&rhs_text, rhs);
-                let new_rhs = maybe_paren(&lhs_text, lhs);
+                let target_prec = op_fixity(Ud::new(forbidden.to)).prec();
+                let new_lhs = maybe_paren(&rhs_text, rhs, target_prec);
+                let new_rhs = maybe_paren(&lhs_text, lhs, target_prec);
 
                 out.push(StyleDiagnostic {
                     cursor_span: expr_span,
@@ -217,8 +222,9 @@ fn rule_operator_swap(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnos
                 let lhs_text = expr_text(source, lhs).unwrap_or_else(|| "_".into());
                 let rhs_text = expr_text(source, rhs).unwrap_or_else(|| "_".into());
 
-                let new_lhs = maybe_paren(&rhs_text, rhs);
-                let new_rhs = maybe_paren(&lhs_text, lhs);
+                let target_prec = op_fixity(Ud::new(swap.to)).prec();
+                let new_lhs = maybe_paren(&rhs_text, rhs, target_prec);
+                let new_rhs = maybe_paren(&lhs_text, lhs, target_prec);
 
                 let replacement = if swap.wrap {
                     format!("({} {} {})", new_lhs, swap.to, new_rhs)
@@ -265,7 +271,7 @@ fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnost
         };
 
         // Func needs parens if it's a case/lambda/do/etc that would swallow the arg
-        let parened_func = if needs_parens(func) {
+        let parened_func = if needs_parens(func, usize::MAX) {
             format!("({})", func_text)
         } else {
             func_text.clone()

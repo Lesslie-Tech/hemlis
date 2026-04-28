@@ -1,0 +1,87 @@
+---
+source: src/parser.rs
+expression: "p_module(r\"\nmodule Test where\n\nf = do\n  a <- g $ h <<< j <$> [1, 2, 3]\n  k $ b 1\n\")"
+---
+30 of 30
+===
+Module
+ Header
+  MName
+   (1, 7)->(1, 11)
+  NULL
+  (1, 0)->(1, 6)
+  (1, 12)->(1, 17)
+  Decl::Def
+   Name
+    (3, 0)->(3, 1)
+   GuardedExpr::Unconditional
+    Expr::Do
+     NULL
+      DoStmt::Stmt
+       Binder::Var
+        Name
+         (4, 2)->(4, 3)
+       Expr::Op
+        Expr::Ident
+         QName
+          NULL
+          Name
+           (4, 7)->(4, 8)
+        QOp
+         NULL
+         Op
+          (4, 9)->(4, 10)
+        Expr::Op
+         Expr::Op
+          Expr::Ident
+           QName
+            NULL
+            Name
+             (4, 11)->(4, 12)
+          QOp
+           NULL
+           Op
+            (4, 13)->(4, 16)
+          Expr::Ident
+           QName
+            NULL
+            Name
+             (4, 17)->(4, 18)
+         QOp
+          NULL
+          Op
+           (4, 19)->(4, 22)
+         Expr::Array
+          (4, 23)->(4, 24)
+           Expr::Number
+            Number
+             (4, 24)->(4, 25)
+           Expr::Number
+            Number
+             (4, 27)->(4, 28)
+           Expr::Number
+            Number
+             (4, 30)->(4, 31)
+          (4, 31)->(4, 32)
+      DoStmt::Stmt
+       NULL
+       Expr::Op
+        Expr::Ident
+         QName
+          NULL
+          Name
+           (5, 2)->(5, 3)
+        QOp
+         NULL
+         Op
+          (5, 4)->(5, 5)
+        Expr::App
+         Expr::Ident
+          QName
+           NULL
+           Name
+            (5, 6)->(5, 7)
+         Expr::Number
+          Number
+           (5, 8)->(5, 9)
+===

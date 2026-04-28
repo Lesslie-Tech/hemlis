@@ -21,7 +21,7 @@ Module
         Label
          (2, 8)->(2, 9)
         Typ::Record
-         (2, 13)->(2, 17)
+         (2, 13)->(2, 15)
           Row
            NULL
        )
@@ -29,7 +29,7 @@ Module
         Label
          (2, 18)->(2, 19)
         Typ::Record
-         (2, 23)->(2, 26)
+         (2, 23)->(2, 25)
           Row
            NULL
        )
