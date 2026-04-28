@@ -65,16 +65,16 @@ Module
       (4, 2)->(4, 3)
    GuardedExpr::Unconditional
     Expr::Op
-     Expr::Ident
-      QName
-       NULL
-       Name
-        (5, 2)->(5, 3)
-     QOp
-      NULL
-      Op
-       (6, 4)->(6, 7)
      Expr::Op
+      Expr::Ident
+       QName
+        NULL
+        Name
+         (5, 2)->(5, 3)
+      QOp
+       NULL
+       Op
+        (6, 4)->(6, 7)
       Expr::App
        Expr::Ident
         QName
@@ -115,14 +115,14 @@ Module
             NULL
             Name
              (6, 29)->(6, 30)
-      QOp
-       NULL
-       Op
-        (7, 4)->(7, 5)
-      Expr::Ident
-       QName
-        Qual
-         (7, 6)->(7, 7)
-        Name
-         (7, 8)->(7, 21)
+     QOp
+      NULL
+      Op
+       (7, 4)->(7, 5)
+     Expr::Ident
+      QName
+       Qual
+        (7, 6)->(7, 7)
+       Name
+        (7, 8)->(7, 21)
 ===

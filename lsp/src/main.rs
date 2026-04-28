@@ -707,6 +707,121 @@ mod tests {
         );
     }
 
+    /// Assert that a specific code action is NOT offered at the marker position.
+    #[allow(dead_code)]
+    async fn assert_no_code_action(source_with_marker: &str) {
+        let modules = split_modules(source_with_marker);
+
+        let (target_idx, _) = modules
+            .iter()
+            .enumerate()
+            .find(|(_, (_, src))| {
+                src.lines()
+                    .any(|l| l.trim_start().starts_with('^') && l.trim_start().len() > 1)
+            })
+            .expect("One module must contain a `^ Action title` marker line");
+
+        let (_, target_src) = &modules[target_idx];
+        let (cleaned_target, line, character, action_title) = parse_marker(target_src);
+
+        let files: Vec<(String, String)> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, (name, src))| {
+                if i == target_idx {
+                    (name.clone(), cleaned_target.clone())
+                } else {
+                    (name.clone(), src.clone())
+                }
+            })
+            .collect();
+
+        let mut ordered: Vec<(&str, &str)> = Vec::new();
+        for (i, (name, src)) in files.iter().enumerate() {
+            if i != target_idx {
+                ordered.push((name.as_str(), src.as_str()));
+            }
+        }
+        ordered.push((files[target_idx].0.as_str(), files[target_idx].1.as_str()));
+
+        let mut service = build_test_service();
+
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        for (i, (name, source)) in ordered.iter().enumerate() {
+            let uri = format!("file:///{name}");
+            lsp_notify(
+                &mut service,
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "purescript",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            )
+            .await;
+            if i < ordered.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let target_uri = format!("file:///{}", files[target_idx].0);
+        let resp = lsp_request(
+            &mut service,
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": target_uri },
+                "range": {
+                    "start": { "line": line, "character": character },
+                    "end": { "line": line, "character": character }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        )
+        .await
+        .expect("Expected a response from codeAction");
+
+        let (_, body) = resp.into_parts();
+        let result = body.expect("codeAction should succeed");
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(result).expect("Failed to parse code actions");
+
+        let found = actions.iter().any(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => ca.title == action_title,
+            _ => false,
+        });
+        if found {
+            let titles: Vec<_> = actions
+                .iter()
+                .map(|a| match a {
+                    CodeActionOrCommand::CodeAction(ca) => ca.title.as_str(),
+                    CodeActionOrCommand::Command(c) => c.title.as_str(),
+                })
+                .collect();
+            panic!(
+                "Code action {:?} should NOT be offered, but was found among: {:?}",
+                action_title, titles
+            );
+        }
+    }
+
     #[tokio::test]
     async fn delete_unused_first_parameter() {
         assert_code_action(
@@ -1102,6 +1217,235 @@ mod tests {
         )
         .await;
     }
+
+    // --- PAY-3098: Operator conversion code actions ---
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_hash() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ x
+                      ^ Replace `$` with `#`
+            "},
+            indoc! {"
+                module Test where
+
+                f = x # g
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_parens() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ x
+                      ^ Replace `$` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (x)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_hash_to_dollar() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x # g
+                      ^ Replace `#` with `$`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (g $ x)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_hash_to_parens() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x # g
+                      ^ Replace `#` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (x)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_map_to_flipped_map() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g <$> x
+                        ^ Replace `<$>` with `<#>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (x <#> g)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_flipped_map_to_map() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x <#> g
+                        ^ Replace `<#>` with `<$>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g <$> x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_map_to_flipped_map_in_applicative_chain() {
+        // f <$> x <*> y  parses as  (f <$> x) <*> y
+        // Converting inner <$> to <#> must wrap in parens since <#> is prec 1
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g <$> x <*> y
+                        ^ Replace `<$>` with `<#>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (x <#> g) <*> y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_parens_complex_rhs() {
+        // f $ x + y  should become  f (x + y)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ x + y
+                      ^ Replace `$` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (x + y)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_hash_chain_last_to_dollar() {
+        // With correct fixity: a # b >>= c # d  parses as  ((a # b) >>= c) # d
+        // Cursor on last #: converting  ((a # b) >>= c) # d  to  (d $ ((a # b) >>= c))
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a # b >>= c # d
+                                ^ Replace `#` with `$`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (d $ (a # b >>= c))
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_hash_paren_operand() {
+        // f $ (a + b)  →  (a + b) # f
+        // The explicit parens in the RHS must be preserved.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ (a + b)
+                      ^ Replace `$` with `#`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (a + b) # g
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_parens_paren_operand() {
+        // f $ (a + b)  →  f (a + b)
+        // The parens are already there — just drop the $.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ (a + b)
+                      ^ Replace `$` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (a + b)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_hash_multiapp_lhs() {
+        // clamp 1 1000 $ x  →  x # clamp 1 1000
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = clamp 1 1000 $ x
+                                 ^ Replace `$` with `#`
+            "},
+            indoc! {"
+                module Test where
+
+                f = x # clamp 1 1000
+            "},
+        )
+        .await;
+    }
+
 }
 
 impl LanguageServer for Backend {
@@ -2861,8 +3205,8 @@ enum Fixable {
     Delete(ast::Span),
     DeleteUnusedImport(ast::Span),
     RenameWithUnderscore(ast::Span),
-    /// Replace an expression span with new text. (expr_span, title, replacement, warning_message)
-    ReplaceExpression(ast::Span, String, String, String),
+    /// Replace an expression span with new text. (expr_span, title, replacement, optional_warning)
+    ReplaceExpression(ast::Span, String, String, Option<String>),
 }
 
 /// Check if a binder is a simple variable (possibly with a type annotation).
@@ -3761,9 +4105,16 @@ impl Backend {
                 x.value()
                     .iter()
                     .filter_map(|(_, f)| match f {
-                        Fixable::ReplaceExpression(expr_span, _, _, message) => Some(
-                            create_warning(*expr_span, "style".into(), message.clone(), vec![]),
-                        ),
+                        Fixable::ReplaceExpression(expr_span, _, _, message) => message
+                            .as_ref()
+                            .map(|msg| {
+                                create_warning(
+                                    *expr_span,
+                                    "style".into(),
+                                    msg.clone(),
+                                    vec![],
+                                )
+                            }),
                         _ => None,
                     })
                     .collect()

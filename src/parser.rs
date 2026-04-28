@@ -867,11 +867,63 @@ fn expr_op<'t>(p: &mut P<'t>) -> Option<ExprOp> {
 fn expr_fop(t: &ExprOp) -> Prec {
     use Prec::*;
     match t {
-        // NOTE[et]: With more information we can get the correct precedences
-        ExprOp::Op(_) => R(1),
-        ExprOp::Infix(_) => L(2),
-        ExprOp::App => L(3),
+        ExprOp::Op(qop) => op_fixity((qop.1).0 .0),
+        ExprOp::Infix(_) => L(10),
+        ExprOp::App => L(11),
     }
+}
+
+/// Well-known PureScript operator fixities.
+/// Unknown operators default to R(1) to preserve current behaviour.
+fn op_fixity(ud: Ud) -> Prec {
+    use Prec::*;
+    // Precedence 0
+    if ud == Ud::new("$") { return R(1) }
+    // Precedence 1
+    if ud == Ud::new("#") { return L(2) }
+    if ud == Ud::new(">>=") { return L(2) }
+    if ud == Ud::new("=<<") { return R(2) }
+    if ud == Ud::new(">=>") { return R(2) }
+    if ud == Ud::new("<#>") { return L(2) }
+    // Precedence 2
+    if ud == Ud::new("||") { return R(3) }
+    // Precedence 3
+    if ud == Ud::new("&&") { return R(4) }
+    if ud == Ud::new("<|>") { return L(4) }
+    if ud == Ud::new("<?>") { return L(4) }
+    if ud == Ud::new("<??>") { return L(4) }
+    // Precedence 4
+    if ud == Ud::new("==") { return L(5) }
+    if ud == Ud::new("/=") { return L(5) }
+    if ud == Ud::new("<") { return L(5) }
+    if ud == Ud::new(">") { return L(5) }
+    if ud == Ud::new("<=") { return L(5) }
+    if ud == Ud::new(">=") { return L(5) }
+    if ud == Ud::new("<$>") { return L(5) }
+    if ud == Ud::new("<*>") { return L(5) }
+    if ud == Ud::new("<*") { return L(5) }
+    if ud == Ud::new("*>") { return L(5) }
+    if ud == Ud::new("<@>") { return L(5) }
+    if ud == Ud::new("<$") { return L(5) }
+    if ud == Ud::new("$>") { return L(5) }
+    // Precedence 5
+    if ud == Ud::new("<>") { return R(6) }
+    if ud == Ud::new(":|") { return R(6) }
+    // Precedence 6
+    if ud == Ud::new("+") { return L(7) }
+    if ud == Ud::new("-") { return L(7) }
+    if ud == Ud::new(":") { return R(7) }
+    // Precedence 7
+    if ud == Ud::new("*") { return L(8) }
+    if ud == Ud::new("/") { return L(8) }
+    if ud == Ud::new("%") { return L(8) }
+    // Precedence 8
+    if ud == Ud::new("!!") { return L(9) }
+    // Precedence 9
+    if ud == Ud::new("<<<") { return R(10) }
+    if ud == Ud::new(">>>") { return R(10) }
+    // Unknown operator
+    R(1)
 }
 
 fn expr_mrg(op: ExprOp, lhs: Expr, rhs: Expr) -> Expr {
