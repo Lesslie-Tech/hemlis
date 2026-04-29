@@ -1501,6 +1501,30 @@ mod tests {
     // --- Unnecessary parentheses (PAY-3104) ---
 
     #[tokio::test]
+    async fn style_remove_parens_multiline_lambda() {
+        // Outer parens around a multiline lambda — the closing ) is on its own line
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f =
+                  ( \\x ->
+                  ^ Remove unnecessary parentheses
+                      Just (pure unit)
+                  )
+            "},
+            indoc! {"
+                module Test where
+
+                f =
+                  \\x ->
+                      Just (pure unit)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn style_remove_parens_whole_rhs() {
         // f = (bar baz) — paren is the whole RHS, not inside App/Op
         assert_code_action(
@@ -3539,7 +3563,7 @@ fn flatten_arr_chain(typ: &ast::Typ) -> Vec<&ast::Typ> {
     loop {
         match current {
             ast::Typ::Forall(_, inner) | ast::Typ::Constrained(_, inner) => current = inner,
-            ast::Typ::Paren(inner) => current = inner,
+            ast::Typ::Paren(_, inner, _) => current = inner,
             _ => break,
         }
     }

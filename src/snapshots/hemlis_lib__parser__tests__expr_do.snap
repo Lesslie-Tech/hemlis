@@ -77,6 +77,7 @@ Module
           Name
            (9, 12)->(9, 16)
         Expr::Paren
+         (9, 17)->(9, 18)
          Expr::Op
           Expr::Ident
            QName
@@ -92,4 +93,5 @@ Module
             NULL
             Name
              (9, 22)->(9, 23)
+         (9, 23)->(9, 24)
 ===

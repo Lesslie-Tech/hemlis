@@ -45,86 +45,9 @@ fn span_to_byte_range(source: &str, span: &Span) -> Option<(usize, usize)> {
     }
 }
 
-fn byte_to_line_col(source: &str, byte_pos: usize) -> (usize, usize) {
-    let starts = line_starts(source);
-    for (i, &start) in starts.iter().enumerate().rev() {
-        if start <= byte_pos {
-            return (i, byte_pos - start);
-        }
-    }
-    (0, byte_pos)
-}
-
 fn source_text<'a>(source: &'a str, span: &Span) -> Option<&'a str> {
     let (lo, hi) = span_to_byte_range(source, span)?;
     source.get(lo..hi)
-}
-
-/// Compute the full byte range of an expression, extending to cover
-/// parenthesis delimiters that aren't captured by the derived span.
-fn expr_byte_range(source: &str, expr: &ast::Expr) -> Option<(usize, usize)> {
-    let (lo, hi) = span_to_byte_range(source, &expr.span())?;
-    // Count Paren nesting at the top level to find all opening parens
-    let mut paren_depth = 0;
-    let mut e = expr;
-    while let ast::Expr::Paren(inner) = e {
-        paren_depth += 1;
-        e = inner;
-    }
-    // Extend left past `paren_depth` opening parens (skipping whitespace)
-    let mut lo = lo;
-    for _ in 0..paren_depth {
-        lo = source[..lo].rfind('(').unwrap_or(lo);
-    }
-    // Count trailing paren depth (may come from Paren, Op rhs, App arg)
-    let trailing_depth = trailing_paren_depth(expr);
-    let mut hi = hi;
-    for _ in 0..trailing_depth {
-        if let Some(i) = source[hi..].find(')') {
-            hi = hi + i + 1;
-        }
-    }
-    Some((lo, hi))
-}
-
-/// Count the depth of uncovered trailing `)` characters.
-fn trailing_paren_depth(expr: &ast::Expr) -> usize {
-    match expr {
-        ast::Expr::Paren(inner) => 1 + trailing_paren_depth(inner),
-        ast::Expr::Op(_, _, rhs) => trailing_paren_depth(rhs),
-        ast::Expr::App(_, arg) => trailing_paren_depth(arg),
-        _ => 0,
-    }
-}
-
-/// Extract source text for an expression, correctly including parentheses
-/// for `Paren` nodes (whose derived span only covers the inner expression).
-fn expr_text(source: &str, expr: &ast::Expr) -> Option<String> {
-    if let ast::Expr::Paren(_) = expr {
-        let (lo, hi) = span_to_byte_range(source, &expr.span())?;
-        let open = source[..lo].rfind('(')?;
-        let close = hi + source[hi..].find(')')?;
-        Some(source[open..=close].to_string())
-    } else {
-        source_text(source, &expr.span()).map(|s| s.to_string())
-    }
-}
-
-/// Compute the full Span for an expression, extending for trailing parens.
-fn expr_full_span(source: &str, expr: &ast::Expr) -> Span {
-    let base = expr.span();
-    let fi = match base {
-        Span::Known(fi, _, _) => fi,
-        _ => return base,
-    };
-    match expr_byte_range(source, expr) {
-        Some((lo, hi)) => {
-            let lo_lc = byte_to_line_col(source, lo);
-            let hi_lc = byte_to_line_col(source, hi);
-            Span::Known(fi, lo_lc, hi_lc)
-        }
-        None => base,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -181,13 +104,13 @@ fn rule_forbidden_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDi
         let op_ud = (qop.1).0 .0;
         for forbidden in FORBIDDEN_OPS {
             if op_ud == Ud::new(forbidden.from) {
-                let expr_span = expr_full_span(source, expr);
-                let lhs_text = expr_text(source, lhs).unwrap_or_else(|| "_".into());
-                let rhs_text = expr_text(source, rhs).unwrap_or_else(|| "_".into());
+                let expr_span = expr.span();
+                let lhs_text = source_text(source, &lhs.span()).unwrap_or("_");
+                let rhs_text = source_text(source, &rhs.span()).unwrap_or("_");
 
                 let target_prec = op_fixity(Ud::new(forbidden.to)).prec();
-                let new_lhs = maybe_paren(&rhs_text, rhs, target_prec);
-                let new_rhs = maybe_paren(&lhs_text, lhs, target_prec);
+                let new_lhs = maybe_paren(rhs_text, rhs, target_prec);
+                let new_rhs = maybe_paren(lhs_text, lhs, target_prec);
 
                 out.push(StyleDiagnostic {
                     cursor_span: expr_span,
@@ -229,13 +152,13 @@ fn rule_operator_swap(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnos
         for swap in SWAP_OPS {
             if op_ud == Ud::new(swap.from) {
                 let op_span = (qop.1).0 .1;
-                let expr_span = expr_full_span(source, expr);
-                let lhs_text = expr_text(source, lhs).unwrap_or_else(|| "_".into());
-                let rhs_text = expr_text(source, rhs).unwrap_or_else(|| "_".into());
+                let expr_span = expr.span();
+                let lhs_text = source_text(source, &lhs.span()).unwrap_or("_");
+                let rhs_text = source_text(source, &rhs.span()).unwrap_or("_");
 
                 let target_prec = op_fixity(Ud::new(swap.to)).prec();
-                let new_lhs = maybe_paren(&rhs_text, rhs, target_prec);
-                let new_rhs = maybe_paren(&lhs_text, lhs, target_prec);
+                let new_lhs = maybe_paren(rhs_text, rhs, target_prec);
+                let new_rhs = maybe_paren(lhs_text, lhs, target_prec);
 
                 let replacement = if swap.wrap {
                     format!("({} {} {})", new_lhs, swap.to, new_rhs)
@@ -270,13 +193,13 @@ fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnost
         let op_name = if op_ud == Ud::new("$") { "$" } else { "#" };
         let op_span = (qop.1).0 .1;
 
-        let expr_span = expr_full_span(source, expr);
-        let func_text = expr_text(source, func).unwrap_or_else(|| "_".into());
-        let arg_text = expr_text(source, arg).unwrap_or_else(|| "_".into());
+        let expr_span = expr.span();
+        let func_text = source_text(source, &func.span()).unwrap_or("_");
+        let arg_text = source_text(source, &arg.span()).unwrap_or("_");
 
         // If arg is already parenthesized, use it as-is; otherwise wrap in parens
-        let parened_arg = if matches!(arg.as_ref(), ast::Expr::Paren(_)) {
-            arg_text.clone()
+        let parened_arg = if matches!(arg.as_ref(), ast::Expr::Paren(..)) {
+            arg_text.to_string()
         } else {
             format!("({})", arg_text)
         };
@@ -285,7 +208,7 @@ fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnost
         let parened_func = if needs_parens(func, usize::MAX) {
             format!("({})", func_text)
         } else {
-            func_text.clone()
+            func_text.to_string()
         };
 
         out.push(StyleDiagnostic {
@@ -317,7 +240,7 @@ fn is_atom(expr: &ast::Expr) -> bool {
             | ast::Expr::Record(..)
             | ast::Expr::Section(_)
             | ast::Expr::Hole(_)
-            | ast::Expr::Paren(_)
+            | ast::Expr::Paren(..)
     )
 }
 
@@ -362,15 +285,15 @@ fn emit_remove_parens(
     source: &str,
     out: &mut Vec<StyleDiagnostic>,
 ) {
-    if let ast::Expr::Paren(inner) = child {
-        let inner_text = expr_text(source, inner);
+    if let ast::Expr::Paren(_, inner, _) = child {
+        let inner_text = source_text(source, &inner.span());
         if let Some(text) = inner_text {
-            let paren_span = expr_full_span(source, child);
+            let paren_span = child.span();
             out.push(StyleDiagnostic {
                 cursor_span: paren_span,
                 expr_span: paren_span,
                 title: "Remove unnecessary parentheses".into(),
-                replacement: text,
+                replacement: text.to_string(),
                 message: Some("Unnecessary parentheses".into()),
             });
         }
@@ -390,7 +313,7 @@ fn rule_unnecessary_parens(
     outer_op: Option<Ud>,
     out: &mut Vec<StyleDiagnostic>,
 ) {
-    if let ast::Expr::Paren(inner) = expr {
+    if let ast::Expr::Paren(_, inner, _) = expr {
         let same_op = if let (Some(outer), ast::Expr::Op(_, inner_qop, _)) =
             (outer_op, inner.as_ref())
         {
@@ -398,7 +321,7 @@ fn rule_unnecessary_parens(
         } else {
             false
         };
-        let removable = matches!(inner.as_ref(), ast::Expr::Paren(_))
+        let removable = matches!(inner.as_ref(), ast::Expr::Paren(..))
             || is_atom(inner)
             || !inside_app_or_op
             || same_op;
@@ -504,7 +427,7 @@ impl<'a> StyleChecker<'a> {
                 self.check_record_updates(updates);
             }
             ast::Expr::Access(e, _) => self.check_expr_ctx(e, true, None),
-            ast::Expr::Paren(e) => self.check_expr(e),
+            ast::Expr::Paren(_, e, _) => self.check_expr(e),
             ast::Expr::Section(_)
             | ast::Expr::Hole(_)
             | ast::Expr::Ident(_)

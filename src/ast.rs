@@ -540,7 +540,7 @@ pub enum Typ {
     Op(Box<Typ>, QOp, Box<Typ>),
     Constrained(Constraint, Box<Typ>),
     App(Box<Typ>, Box<Typ>),
-    Paren(Box<Typ>),
+    Paren(Span, Box<Typ>, Span),
 
     Error(Span),
 }
@@ -564,7 +564,7 @@ impl Typ {
                 | Typ::Error(_)
                 | Typ::Arr(_, _) => None,
 
-                Typ::Paren(x) => inner(*x, args),
+                Typ::Paren(_, x, _) => inner(*x, args),
 
                 Typ::Constructor(n) => Some(Constraint(n, args)),
                 Typ::App(l, r) => {
@@ -601,7 +601,7 @@ pub enum Binder {
     Number(bool, Number),
     Array(Vec<Binder>),
     Record(Vec<RecordLabelBinder>),
-    Paren(Box<Binder>),
+    Paren(Span, Box<Binder>, Span),
 }
 
 impl Binder {
@@ -680,7 +680,7 @@ pub enum Expr {
     Str(Str),
     Number(Number),
     HexInt(HexInt),
-    Paren(Box<Expr>),
+    Paren(Span, Box<Expr>, Span),
 
     Error(Span),
 }

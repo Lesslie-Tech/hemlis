@@ -29,9 +29,11 @@ Module
         Name
          (3, 23)->(3, 24)
        Typ::Paren
+        (3, 25)->(3, 26)
         Typ::Int
          Int
           (3, 26)->(3, 27)
+        (3, 28)->(3, 29)
        Typ::Constructor
         QProperName
          NULL

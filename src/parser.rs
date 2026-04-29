@@ -606,8 +606,9 @@ fn typ_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Typ> {
                 },
                 |p: &mut P<'t>| {
                     let r = typ(p)?;
+                    let end = p.span();
                     kw_rp(p)?;
-                    Some(Typ::Paren(b!(r)))
+                    Some(Typ::Paren(start, b!(r), end))
                 },
             )
         }
@@ -1107,10 +1108,12 @@ fn expr_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Expr> {
             Some(Expr::Record(start, inner, end))
         }
         (Some(T::LeftParen), _) => {
+            let start = p.span();
             kw_lp(p)?;
             let inner = expr(p)?;
+            let end = p.span();
             kw_rp(p)?;
-            Some(Expr::Paren(b!(inner)))
+            Some(Expr::Paren(start, b!(inner), end))
         }
         _ => {
             // Not a valid start of an expression - but that isn't nessecarily an error
@@ -1306,10 +1309,12 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
             Some(Binder::Record(bs))
         }
         (Some(T::LeftParen), _) => {
+            let start = p.span();
             kw_lp(p)?;
             let b = b!(binder(p)?);
+            let end = p.span();
             kw_rp(p)?;
-            Some(Binder::Paren(b))
+            Some(Binder::Paren(start, b, end))
         }
         _ => {
             if let Some(err) = err {

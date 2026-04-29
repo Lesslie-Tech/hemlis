@@ -23,6 +23,7 @@ Module
        ProperName
         (3, 11)->(3, 12)
      Typ::Paren
+      (3, 13)->(3, 14)
       Typ::App
        Typ::Constructor
         QProperName
@@ -30,6 +31,7 @@ Module
          ProperName
           (3, 14)->(3, 15)
        Typ::Paren
+        (3, 16)->(3, 17)
         Typ::App
          Typ::Constructor
           QProperName
@@ -42,6 +44,8 @@ Module
            NULL
            ProperName
             (3, 21)->(3, 22)
+        (3, 22)->(3, 23)
+      (3, 23)->(3, 24)
     Typ::Constructor
      QProperName
       NULL

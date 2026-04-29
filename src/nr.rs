@@ -1324,7 +1324,7 @@ impl<'s> N<'s> {
             ast::Expr::Str(_) => (),
             ast::Expr::Number(_) => (),
             ast::Expr::HexInt(_) => (),
-            ast::Expr::Paren(e) => {
+            ast::Expr::Paren(_, e, _) => {
                 self.expr(e);
             }
             ast::Expr::Error(_) => {}
@@ -1456,7 +1456,7 @@ impl<'s> N<'s> {
                     }
                 }
             }
-            ast::Binder::Paren(b) => {
+            ast::Binder::Paren(_, b, _) => {
                 self.binder(b);
             }
         }
@@ -1524,7 +1524,7 @@ impl<'s> N<'s> {
                 self.typ_define_vars(a);
                 self.typ_define_vars(b);
             }
-            ast::Typ::Paren(a) => {
+            ast::Typ::Paren(_, a, _) => {
                 self.typ_define_vars(a);
             }
             ast::Typ::Error(_) => (),
@@ -1593,7 +1593,7 @@ impl<'s> N<'s> {
                 self.typ(a);
                 self.typ(b);
             }
-            ast::Typ::Paren(a) => {
+            ast::Typ::Paren(_, a, _) => {
                 self.typ(a);
             }
             ast::Typ::Error(_) => {}

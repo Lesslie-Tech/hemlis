@@ -143,6 +143,7 @@ Module
                        ProperName
                         (22, 29)->(22, 33)
                      Expr::Paren
+                      (22, 34)->(22, 35)
                       Expr::Op
                        Expr::Ident
                         QName
@@ -156,6 +157,7 @@ Module
                        Expr::Number
                         Number
                          (22, 42)->(22, 43)
+                      (22, 43)->(22, 44)
                RecordLabelExpr::Field
                 Label
                  (23, 16)->(23, 17)

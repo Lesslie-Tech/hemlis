@@ -54,6 +54,7 @@ Module
        ProperName
         (4, 5)->(4, 10)
        Typ::Paren
+        (4, 11)->(4, 12)
         Typ::App
          Typ::App
           Typ::Constructor
@@ -69,6 +70,7 @@ Module
            NULL
            ProperName
             (4, 18)->(4, 19)
+        (4, 19)->(4, 20)
        Typ::Var
         Name
          (4, 21)->(4, 27)
@@ -133,6 +135,7 @@ Module
             ProperName
              (9, 5)->(9, 10)
             Typ::Paren
+             (9, 11)->(9, 12)
              Typ::App
               Typ::App
                Typ::Constructor
@@ -148,6 +151,7 @@ Module
                 NULL
                 ProperName
                  (9, 18)->(9, 19)
+             (9, 19)->(9, 20)
             Typ::Var
              Name
               (9, 21)->(9, 27)
@@ -202,6 +206,7 @@ Module
                  (13, 18)->(13, 22)
               Typ::Arr
                Typ::Paren
+                (14, 5)->(14, 6)
                 Typ::Arr
                  Typ::App
                   Typ::Constructor
@@ -221,6 +226,7 @@ Module
                   Typ::Var
                    Name
                     (14, 27)->(14, 31)
+                (14, 31)->(14, 32)
                Typ::App
                 Typ::Constructor
                  QProperName
