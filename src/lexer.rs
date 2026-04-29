@@ -192,7 +192,7 @@ pub enum Token<'t> {
     HexInt(&'t str),
 
     // contains e or . => Number, otherwise => Int
-    #[regex(r"-?([\d][\d|_]*|[\d][\d|_]*\.[\d|_]*|[\d|_]*\.[\d][\d|_]*)(e(-|\+)?[\d|_]+)?")]
+    #[regex(r"([\d][\d|_]*|[\d][\d|_]*\.[\d|_]*|[\d|_]*\.[\d][\d|_]*)(e(-|\+)?[\d|_]+)?")]
     Number(&'t str),
 
     #[regex(r#"'.'|'\\x.{1,8}'|'\\[trn"\\]'"#)]

@@ -1642,6 +1642,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn style_keep_parens_negative_literal() {
+        // f (-120.0) — removing parens turns negation into subtraction
+        assert_no_code_action(
+            indoc! {"
+                module Test where
+
+                f = g (-120.0)
+                      ^ Remove unnecessary parentheses
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn style_keep_parens_app_in_op() {
         // (g a) + c — app inside op, keep parens
         assert_no_code_action(

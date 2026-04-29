@@ -1,0 +1,49 @@
+---
+source: src/parser.rs
+expression: "p_module(r\"\nmodule Test where\n\nf :: forall n. Compare n (-1) GT => P n\n\")"
+---
+20 of 20
+===
+Module
+ Header
+  MName
+   (1, 7)->(1, 11)
+  NULL
+  (1, 0)->(1, 6)
+  (1, 12)->(1, 17)
+  Decl::Sig
+   Name
+    (3, 0)->(3, 1)
+   Typ::Forall
+     TypVarBinding
+      Name
+       (3, 12)->(3, 13)
+      NULL
+    Typ::Constrained
+     Constraint
+      QProperName
+       NULL
+       ProperName
+        (3, 15)->(3, 22)
+       Typ::Var
+        Name
+         (3, 23)->(3, 24)
+       Typ::Paren
+        Typ::Int
+         Int
+          (3, 26)->(3, 27)
+       Typ::Constructor
+        QProperName
+         NULL
+         ProperName
+          (3, 30)->(3, 32)
+     Typ::App
+      Typ::Constructor
+       QProperName
+        NULL
+        ProperName
+         (3, 36)->(3, 37)
+      Typ::Var
+       Name
+        (3, 38)->(3, 39)
+===

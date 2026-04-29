@@ -571,6 +571,12 @@ fn typ_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Typ> {
         }
 
         (Some(T::String(_) | T::RawString(_)), _) => Some(Typ::Str(string(p)?)),
+        (Some(T::Op("-")), Some(T::Number(n))) if n.parse::<i64>().is_ok() => {
+            let span = p.span();
+            kw_minus(p)?;
+            number(p);
+            Some(Typ::Int(true, Int(S(n.parse::<i64>().unwrap(), span))))
+        }
         (Some(T::Number(n)), _) if n.parse::<i64>().is_ok() => {
             let span = p.span();
             number(p);
@@ -2465,6 +2471,17 @@ module Test where
 f = do
   a <- g $ h <<< j <$> [1, 2, 3]
   k $ b 1
+"
+        ))
+    }
+
+    #[test]
+    fn negative_int_in_constraint() {
+        assert_snapshot!(p_module(
+            r"
+module Test where
+
+f :: forall n. Compare n (-1) GT => P n
 "
         ))
     }
