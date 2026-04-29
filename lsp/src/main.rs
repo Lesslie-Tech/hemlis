@@ -1857,6 +1857,24 @@ mod tests {
             "})
         .await;
     }
+
+    #[tokio::test]
+    async fn style_remove_parens_around_record_update() {
+        assert_code_action(
+            indoc! {r#"
+                module Test where
+
+                f = (params { page = 1 })
+                    ^ Remove unnecessary parentheses
+            "#},
+            indoc! {r#"
+                module Test where
+
+                f = params { page = 1 }
+            "#},
+        )
+        .await;
+    }
 }
 
 impl LanguageServer for Backend {

@@ -505,7 +505,7 @@ impl<'a> StyleChecker<'a> {
                     }
                 }
             }
-            ast::Expr::Update(e, updates) => {
+            ast::Expr::Update(e, _, updates, _) => {
                 self.check_expr_ctx(e, true, None);
                 self.check_record_updates(updates);
             }

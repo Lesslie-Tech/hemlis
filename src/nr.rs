@@ -1296,7 +1296,7 @@ impl<'s> N<'s> {
                     }
                 }
             }
-            ast::Expr::Update(e, rs) => {
+            ast::Expr::Update(e, _, rs, _) => {
                 self.expr(e);
                 for r in rs.iter() {
                     self.record_update(r);

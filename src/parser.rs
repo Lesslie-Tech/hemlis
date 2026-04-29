@@ -1221,7 +1221,7 @@ fn expr_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Expr> {
     } else {
         None
     } {
-        e = Expr::Update(b!(e), x);
+        e = Expr::Update(b!(e), x.0, x.1, x.2);
     }
 
     while let Some(labels) = if matches!(p.peekt(), Some(T::At)) {
@@ -1457,7 +1457,8 @@ fn record_label<'t>(p: &mut P<'t>) -> Option<RecordLabelExpr> {
     }
 }
 
-fn record_updates<'t>(p: &mut P<'t>) -> Option<Vec<RecordUpdate>> {
+fn record_updates<'t>(p: &mut P<'t>) -> Option<(Span, Vec<RecordUpdate>, Span)> {
+    let start = p.span();
     kw_lb(p)?;
     let updates = sep_until(
         p,
@@ -1466,8 +1467,9 @@ fn record_updates<'t>(p: &mut P<'t>) -> Option<Vec<RecordUpdate>> {
         record_update,
         next_is!(T::RightBrace),
     );
+    let end = p.span();
     kw_rb(p)?;
-    Some(updates)
+    Some((start, updates, end))
 }
 
 fn record_update<'t>(p: &mut P<'t>) -> Option<RecordUpdate> {
@@ -1485,7 +1487,7 @@ fn record_update<'t>(p: &mut P<'t>) -> Option<RecordUpdate> {
             Some(RecordUpdate::Leaf(f, expr(p)?))
         },
         |p: &mut P<'t>| {
-            Some(RecordUpdate::Branch(f, record_updates(p)?))
+            Some(RecordUpdate::Branch(f, record_updates(p)?.1))
         },
     )
 }

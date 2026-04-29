@@ -667,7 +667,7 @@ pub enum Expr {
 
     Array(Span, Vec<Expr>, Span),
     Record(Span, Vec<RecordLabelExpr>, Span),
-    Update(Box<Expr>, Vec<RecordUpdate>),
+    Update(Box<Expr>, Span, Vec<RecordUpdate>, Span),
     Access(Box<Expr>, Vec<Label>),
 
     Section(Span),
