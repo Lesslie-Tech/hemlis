@@ -1875,6 +1875,18 @@ mod tests {
         )
         .await;
     }
+
+    #[tokio::test]
+    async fn style_keep_parens_in_vta() {
+        // @(Foo Bar) — type app inside VTA needs parens
+        assert_no_code_action(indoc! {r#"
+                module Test where
+
+                f = g @(Foo Bar) x
+                        ^ Remove unnecessary parentheses
+            "#})
+        .await;
+    }
 }
 
 impl LanguageServer for Backend {

@@ -461,7 +461,7 @@ impl<'a> StyleChecker<'a> {
             }
             ast::Expr::Vta(e, t) => {
                 self.check_expr(e);
-                self.check_typ(t);
+                self.check_typ_ctx(t, true, None);
             }
             ast::Expr::IfThenElse(_, c, t, f) => {
                 self.check_expr(c);
