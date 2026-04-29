@@ -503,11 +503,22 @@ mod tests {
             })
             .expect("Source must contain a `^ Action title` marker line");
 
-        let caret_col = marker_line.find('^').unwrap() as u32;
         let action_title = marker_line[marker_line.find('^').unwrap() + 1..]
             .trim()
             .to_string();
         let target_line = (marker_idx - 1) as u32;
+
+        // The `^` in the marker line is visually aligned under the target
+        // character. Since the marker line is ASCII-only, `^` byte offset ==
+        // visual column. Map that visual column to the byte offset in the
+        // content line, which may contain multibyte UTF-8 characters.
+        let visual_col = marker_line.find('^').unwrap();
+        let content_line = lines[marker_idx - 1];
+        let caret_col = content_line
+            .char_indices()
+            .nth(visual_col)
+            .map(|(byte_idx, _)| byte_idx)
+            .unwrap_or(content_line.len()) as u32;
 
         let cleaned: Vec<&str> = lines
             .iter()
@@ -516,8 +527,7 @@ mod tests {
             .map(|(_, l)| *l)
             .collect();
         let mut source = cleaned.join("\n");
-        // Preserve trailing newline if original had one
-        if source.len() > 0 {
+        if !source.is_empty() {
             source.push('\n');
         }
 
@@ -1525,6 +1535,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn style_remove_parens_after_multibyte_char() {
+        // ä is 2 bytes in UTF-8 but 1 UTF-16 code unit — the paren span must
+        // still line up with the LSP character offset.
+        assert_code_action(
+            indoc! {r#"
+                module Test where
+
+                f = g "ä" (bar)
+                          ^ Remove unnecessary parentheses
+            "#},
+            indoc! {r#"
+                module Test where
+
+                f = g "ä" bar
+            "#},
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn style_remove_parens_whole_rhs() {
         // f = (bar baz) — paren is the whole RHS, not inside App/Op
         assert_code_action(
@@ -1907,6 +1937,7 @@ impl LanguageServer for Backend {
                         resolve_provider: None,
                     },
                 )),
+                position_encoding: Some(PositionEncodingKind::UTF8),
                 ..ServerCapabilities::default()
             },
         })
