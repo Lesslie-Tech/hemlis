@@ -889,50 +889,120 @@ fn expr_fop(t: &ExprOp) -> Prec {
 pub(crate) fn op_fixity(ud: Ud) -> Prec {
     use Prec::*;
     // Precedence 0
-    if ud == Ud::new("$") { return R(1) }
+    if ud == Ud::new("$") {
+        return R(1);
+    }
     // Precedence 1
-    if ud == Ud::new("#") { return L(2) }
-    if ud == Ud::new(">>=") { return L(2) }
-    if ud == Ud::new("=<<") { return R(2) }
-    if ud == Ud::new(">=>") { return R(2) }
-    if ud == Ud::new("<#>") { return L(2) }
+    if ud == Ud::new("#") {
+        return L(2);
+    }
+    if ud == Ud::new(">>=") {
+        return L(2);
+    }
+    if ud == Ud::new("=<<") {
+        return R(2);
+    }
+    if ud == Ud::new(">=>") {
+        return R(2);
+    }
+    if ud == Ud::new("<#>") {
+        return L(2);
+    }
     // Precedence 2
-    if ud == Ud::new("||") { return R(3) }
+    if ud == Ud::new("||") {
+        return R(3);
+    }
     // Precedence 3
-    if ud == Ud::new("&&") { return R(4) }
-    if ud == Ud::new("<|>") { return L(4) }
-    if ud == Ud::new("<?>") { return L(4) }
-    if ud == Ud::new("<??>") { return L(4) }
+    if ud == Ud::new("&&") {
+        return R(4);
+    }
+    if ud == Ud::new("<|>") {
+        return L(4);
+    }
+    if ud == Ud::new("<?>") {
+        return L(4);
+    }
+    if ud == Ud::new("<??>") {
+        return L(4);
+    }
     // Precedence 4
-    if ud == Ud::new("==") { return L(5) }
-    if ud == Ud::new("/=") { return L(5) }
-    if ud == Ud::new("<") { return L(5) }
-    if ud == Ud::new(">") { return L(5) }
-    if ud == Ud::new("<=") { return L(5) }
-    if ud == Ud::new(">=") { return L(5) }
-    if ud == Ud::new("<$>") { return L(5) }
-    if ud == Ud::new("<*>") { return L(5) }
-    if ud == Ud::new("<*") { return L(5) }
-    if ud == Ud::new("*>") { return L(5) }
-    if ud == Ud::new("<@>") { return L(5) }
-    if ud == Ud::new("<$") { return L(5) }
-    if ud == Ud::new("$>") { return L(5) }
+    if ud == Ud::new("==") {
+        return L(5);
+    }
+    if ud == Ud::new("/=") {
+        return L(5);
+    }
+    if ud == Ud::new("<") {
+        return L(5);
+    }
+    if ud == Ud::new(">") {
+        return L(5);
+    }
+    if ud == Ud::new("<=") {
+        return L(5);
+    }
+    if ud == Ud::new(">=") {
+        return L(5);
+    }
+    if ud == Ud::new("<$>") {
+        return L(5);
+    }
+    if ud == Ud::new("<*>") {
+        return L(5);
+    }
+    if ud == Ud::new("<*") {
+        return L(5);
+    }
+    if ud == Ud::new("*>") {
+        return L(5);
+    }
+    if ud == Ud::new("<@>") {
+        return L(5);
+    }
+    if ud == Ud::new("<$") {
+        return L(5);
+    }
+    if ud == Ud::new("$>") {
+        return L(5);
+    }
     // Precedence 5
-    if ud == Ud::new("<>") { return R(6) }
-    if ud == Ud::new(":|") { return R(6) }
+    if ud == Ud::new("<>") {
+        return R(6);
+    }
+    if ud == Ud::new(":|") {
+        return R(6);
+    }
     // Precedence 6
-    if ud == Ud::new("+") { return L(7) }
-    if ud == Ud::new("-") { return L(7) }
-    if ud == Ud::new(":") { return R(7) }
+    if ud == Ud::new("+") {
+        return L(7);
+    }
+    if ud == Ud::new("-") {
+        return L(7);
+    }
+    if ud == Ud::new(":") {
+        return R(7);
+    }
     // Precedence 7
-    if ud == Ud::new("*") { return L(8) }
-    if ud == Ud::new("/") { return L(8) }
-    if ud == Ud::new("%") { return L(8) }
+    if ud == Ud::new("*") {
+        return L(8);
+    }
+    if ud == Ud::new("/") {
+        return L(8);
+    }
+    if ud == Ud::new("%") {
+        return L(8);
+    }
     // Precedence 8
-    if ud == Ud::new("!!") { return L(9) }
+    if ud == Ud::new("!!") {
+        return L(9);
+    }
     // Precedence 9
-    if ud == Ud::new("<<<") { return R(10) }
-    if ud == Ud::new(">>>") { return R(10) }
+    if ud == Ud::new("<<<") {
+        return R(10);
+    }
+    if ud == Ud::new(">>>") {
+        return R(10);
+    }
     // Unknown operator
     R(1)
 }

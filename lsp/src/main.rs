@@ -1584,112 +1584,96 @@ mod tests {
     #[tokio::test]
     async fn style_keep_parens_app_in_app_func() {
         // (f a) b — parens might be needed (partial application, etc.)
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = (g a) b
                     ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
     #[tokio::test]
     async fn style_keep_parens_app_in_app_arg() {
         // f (g a) — parens needed, f (g a) ≠ f g a
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = h (g a)
                       ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
     #[tokio::test]
     async fn style_keep_parens_higher_prec_op_left() {
         // (a * b) + c — different operators, keep parens
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = (a * b) + c
                     ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
     #[tokio::test]
     async fn style_keep_parens_lower_prec_op_left() {
         // (a + b) * c — parens needed
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = (a + b) * c
                     ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
     #[tokio::test]
     async fn style_keep_parens_in_record_access() {
         // (f a).field — parens needed, otherwise .field binds to `a`
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = (g a).x
                     ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
     #[tokio::test]
     async fn style_keep_parens_in_record_update() {
         // (f a) { x = 1 } — parens needed for record update target
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = (g a) { x = 1 }
                     ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
     #[tokio::test]
     async fn style_keep_parens_negative_literal() {
         // f (-120.0) — removing parens turns negation into subtraction
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = g (-120.0)
                       ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
     #[tokio::test]
     async fn style_keep_parens_app_in_op() {
         // (g a) + c — app inside op, keep parens
-        assert_no_code_action(
-            indoc! {"
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = (g a) + c
                     ^ Remove unnecessary parentheses
-            "},
-        )
+            "})
         .await;
     }
 
@@ -1766,6 +1750,81 @@ mod tests {
                 f = a $ b $ c
             "},
         )
+        .await;
+    }
+
+    // --- Unnecessary type parentheses ---
+
+    #[tokio::test]
+    async fn style_remove_type_parens_atom() {
+        // (Int) in a type signature
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f :: (Int) -> String
+                     ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f :: Int -> String
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_type_parens_whole_sig() {
+        // Parens wrapping the whole type — not inside App/Op
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f :: (Int -> String)
+                     ^ Remove unnecessary parentheses
+            "},
+            indoc! {"
+                module Test where
+
+                f :: Int -> String
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_in_app() {
+        // (a -> b) applied to c — parens are needed
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f :: (Int -> String) -> Boolean
+                     ^ Remove unnecessary parentheses
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_in_data_ctor() {
+        // Data constructor args are positional — parens around App are needed
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                data Permission = RequiresCounterSignFrom (List UserId)
+                                                          ^ Remove unnecessary parentheses
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_in_newtype() {
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                newtype BankfilesPayableId = BankfilesPayableId (Tuple EndToEndId String)
+                                                                ^ Remove unnecessary parentheses
+            "})
         .await;
     }
 }

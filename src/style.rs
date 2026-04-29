@@ -140,10 +140,26 @@ struct OpSwap {
 }
 
 const SWAP_OPS: &[OpSwap] = &[
-    OpSwap { from: "$", to: "#", wrap: false },    // prec 0 → prec 1 (higher is safe)
-    OpSwap { from: "#", to: "$", wrap: true },     // prec 1 → prec 0
-    OpSwap { from: "<$>", to: "<#>", wrap: true }, // prec 4 → prec 1
-    OpSwap { from: "<#>", to: "<$>", wrap: false }, // prec 1 → prec 4 (higher is safe)
+    OpSwap {
+        from: "$",
+        to: "#",
+        wrap: false,
+    }, // prec 0 → prec 1 (higher is safe)
+    OpSwap {
+        from: "#",
+        to: "$",
+        wrap: true,
+    }, // prec 1 → prec 0
+    OpSwap {
+        from: "<$>",
+        to: "<#>",
+        wrap: true,
+    }, // prec 4 → prec 1
+    OpSwap {
+        from: "<#>",
+        to: "<$>",
+        wrap: false,
+    }, // prec 1 → prec 4 (higher is safe)
 ];
 
 fn rule_operator_swap(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
@@ -280,11 +296,7 @@ fn paren_is_unnecessary(inner: &ast::Expr, ctx: &ParenContext) -> bool {
     }
 }
 
-fn emit_remove_parens(
-    child: &ast::Expr,
-    source: &str,
-    out: &mut Vec<StyleDiagnostic>,
-) {
+fn emit_remove_parens(child: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
     if let ast::Expr::Paren(_, inner, _) = child {
         let inner_text = source_text(source, &inner.span());
         if let Some(text) = inner_text {
@@ -314,19 +326,78 @@ fn rule_unnecessary_parens(
     out: &mut Vec<StyleDiagnostic>,
 ) {
     if let ast::Expr::Paren(_, inner, _) = expr {
-        let same_op = if let (Some(outer), ast::Expr::Op(_, inner_qop, _)) =
-            (outer_op, inner.as_ref())
-        {
-            (inner_qop.1).0 .0 == outer
-        } else {
-            false
-        };
+        let same_op =
+            if let (Some(outer), ast::Expr::Op(_, inner_qop, _)) = (outer_op, inner.as_ref()) {
+                (inner_qop.1).0 .0 == outer
+            } else {
+                false
+            };
         let removable = matches!(inner.as_ref(), ast::Expr::Paren(..))
             || is_atom(inner)
             || !inside_app_or_op
             || same_op;
         if removable {
             emit_remove_parens(expr, source, out);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unnecessary type parentheses (PAY-3104)
+// ---------------------------------------------------------------------------
+
+fn is_typ_atom(typ: &ast::Typ) -> bool {
+    matches!(
+        typ,
+        ast::Typ::Wildcard(_)
+            | ast::Typ::Var(_)
+            | ast::Typ::Constructor(_)
+            | ast::Typ::Symbol(_)
+            | ast::Typ::Str(_)
+            | ast::Typ::Int(..)
+            | ast::Typ::Hole(_)
+            | ast::Typ::Record(_)
+            | ast::Typ::Row(_)
+            | ast::Typ::Paren(..)
+    )
+}
+
+fn emit_remove_typ_parens(typ: &ast::Typ, source: &str, out: &mut Vec<StyleDiagnostic>) {
+    if let ast::Typ::Paren(_, inner, _) = typ {
+        let inner_text = source_text(source, &inner.span());
+        if let Some(text) = inner_text {
+            let paren_span = typ.span();
+            out.push(StyleDiagnostic {
+                cursor_span: paren_span,
+                expr_span: paren_span,
+                title: "Remove unnecessary parentheses".into(),
+                replacement: text.to_string(),
+                message: Some("Unnecessary parentheses".into()),
+            });
+        }
+    }
+}
+
+fn rule_unnecessary_typ_parens(
+    typ: &ast::Typ,
+    source: &str,
+    inside_app_or_op: bool,
+    outer_op: Option<Ud>,
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    if let ast::Typ::Paren(_, inner, _) = typ {
+        let same_op =
+            if let (Some(outer), ast::Typ::Op(_, inner_qop, _)) = (outer_op, inner.as_ref()) {
+                (inner_qop.1).0 .0 == outer
+            } else {
+                false
+            };
+        let removable = matches!(inner.as_ref(), ast::Typ::Paren(..))
+            || is_typ_atom(inner)
+            || !inside_app_or_op
+            || same_op;
+        if removable {
+            emit_remove_typ_parens(typ, source, out);
         }
     }
 }
@@ -355,7 +426,13 @@ impl<'a> StyleChecker<'a> {
         rule_forbidden_operator(expr, self.source, &mut self.diagnostics);
         rule_operator_swap(expr, self.source, &mut self.diagnostics);
         rule_op_to_parens(expr, self.source, &mut self.diagnostics);
-        rule_unnecessary_parens(expr, self.source, inside_app_or_op, outer_op, &mut self.diagnostics);
+        rule_unnecessary_parens(
+            expr,
+            self.source,
+            inside_app_or_op,
+            outer_op,
+            &mut self.diagnostics,
+        );
         // =======================================
 
         self.recurse_expr(expr);
@@ -363,7 +440,10 @@ impl<'a> StyleChecker<'a> {
 
     fn recurse_expr(&mut self, expr: &ast::Expr) {
         match expr {
-            ast::Expr::Typed(e, _) => self.check_expr(e),
+            ast::Expr::Typed(e, t) => {
+                self.check_expr(e);
+                self.check_typ(t);
+            }
             ast::Expr::Op(a, qop, b) => {
                 let op_ud = (qop.1).0 .0;
                 self.check_expr_ctx(a, true, Some(op_ud));
@@ -379,7 +459,10 @@ impl<'a> StyleChecker<'a> {
                 self.check_expr_ctx(a, true, None);
                 self.check_expr_ctx(b, true, None);
             }
-            ast::Expr::Vta(e, _) => self.check_expr(e),
+            ast::Expr::Vta(e, t) => {
+                self.check_expr(e);
+                self.check_typ(t);
+            }
             ast::Expr::IfThenElse(_, c, t, f) => {
                 self.check_expr(c);
                 self.check_expr(t);
@@ -454,7 +537,7 @@ impl<'a> StyleChecker<'a> {
             match b {
                 ast::LetBinding::Name(_, _, ge) => self.check_guarded_expr(ge),
                 ast::LetBinding::Pattern(_, e) => self.check_expr(e),
-                ast::LetBinding::Sig(_, _) => {}
+                ast::LetBinding::Sig(_, t) => self.check_typ(t),
             }
         }
     }
@@ -485,19 +568,136 @@ impl<'a> StyleChecker<'a> {
         }
     }
 
+    // --- Type traversal ---
+
+    fn check_typ(&mut self, typ: &ast::Typ) {
+        self.check_typ_ctx(typ, false, None);
+    }
+
+    fn check_typ_ctx(&mut self, typ: &ast::Typ, inside_app_or_op: bool, outer_op: Option<Ud>) {
+        rule_unnecessary_typ_parens(
+            typ,
+            self.source,
+            inside_app_or_op,
+            outer_op,
+            &mut self.diagnostics,
+        );
+        self.recurse_typ(typ);
+    }
+
+    fn recurse_typ(&mut self, typ: &ast::Typ) {
+        match typ {
+            ast::Typ::App(a, b) => {
+                self.check_typ_ctx(a, true, None);
+                self.check_typ_ctx(b, true, None);
+            }
+            ast::Typ::Op(a, qop, b) => {
+                let op_ud = (qop.1).0 .0;
+                self.check_typ_ctx(a, true, Some(op_ud));
+                self.check_typ_ctx(b, true, Some(op_ud));
+            }
+            ast::Typ::Arr(a, b) => {
+                self.check_typ_ctx(a, true, None);
+                self.check_typ(b);
+            }
+            ast::Typ::Kinded(a, b) => {
+                self.check_typ(a);
+                self.check_typ(b);
+            }
+            ast::Typ::Forall(bindings, inner) => {
+                for ast::TypVarBinding(_, k, _) in bindings {
+                    if let Some(t) = k {
+                        self.check_typ(t);
+                    }
+                }
+                self.check_typ(inner);
+            }
+            ast::Typ::Constrained(ast::Constraint(_, args), inner) => {
+                for a in args {
+                    self.check_typ_ctx(a, true, None);
+                }
+                self.check_typ(inner);
+            }
+            ast::Typ::Paren(_, inner, _) => self.check_typ(inner),
+            ast::Typ::Record(s) | ast::Typ::Row(s) => self.check_row(&s.0),
+            ast::Typ::Wildcard(_)
+            | ast::Typ::Var(_)
+            | ast::Typ::Constructor(_)
+            | ast::Typ::Symbol(_)
+            | ast::Typ::Str(_)
+            | ast::Typ::Int(..)
+            | ast::Typ::Hole(_)
+            | ast::Typ::Error(_) => {}
+        }
+    }
+
+    fn check_row(&mut self, row: &ast::Row) {
+        for (_, t) in &row.0 {
+            self.check_typ(t);
+        }
+        if let Some(ext) = &row.1 {
+            self.check_typ(ext);
+        }
+    }
+
+    fn check_constraint(&mut self, c: &ast::Constraint) {
+        for a in &c.1 {
+            self.check_typ_ctx(a, true, None);
+        }
+    }
+
     fn check_decl(&mut self, decl: &ast::Decl) {
         match decl {
             ast::Decl::Def(_, _, ge) => self.check_guarded_expr(ge),
-            ast::Decl::Instance(_, _, bindings) => {
+            ast::Decl::Sig(_, t) | ast::Decl::Foreign(_, t) | ast::Decl::ForeignData(_, t) => {
+                self.check_typ(t);
+            }
+            ast::Decl::Instance(_, head, bindings) => {
+                if let Some(constraints) = &head.0 {
+                    for c in constraints {
+                        self.check_constraint(c);
+                    }
+                }
+                for t in &head.2 {
+                    self.check_typ_ctx(t, true, None);
+                }
                 for b in bindings {
                     match b {
                         ast::InstBinding::Def(_, _, ge) => self.check_guarded_expr(ge),
-                        ast::InstBinding::Sig(_, _) => {}
+                        ast::InstBinding::Sig(_, t) => self.check_typ(t),
                     }
                 }
             }
+            ast::Decl::Class(constraints, _, _, _, members) => {
+                if let Some(constraints) = constraints {
+                    for c in constraints {
+                        self.check_constraint(c);
+                    }
+                }
+                for ast::ClassMember(_, t) in members {
+                    self.check_typ(t);
+                }
+            }
+            ast::Decl::Data(_, _, ctors) => {
+                for (_, args) in ctors {
+                    for t in args {
+                        self.check_typ_ctx(t, true, None);
+                    }
+                }
+            }
+            ast::Decl::Type(_, _, t)
+            | ast::Decl::DataKind(_, t)
+            | ast::Decl::TypeKind(_, t)
+            | ast::Decl::NewTypeKind(_, t)
+            | ast::Decl::ClassKind(_, t) => {
+                self.check_typ(t);
+            }
+            ast::Decl::NewType(_, _, _, t) => {
+                self.check_typ_ctx(t, true, None);
+            }
+            ast::Decl::FixityTyp(_, _, t, _) => self.check_typ(t),
             ast::Decl::Fixity(_, _, e, _) => self.check_expr(e),
-            _ => {}
+            ast::Decl::Derive(_, _) | ast::Decl::Role(_, _) => {}
         }
     }
 }
