@@ -1102,6 +1102,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_unused_class_import() {
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                class A a
+
+                b = 0
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (class A, b)
+                                  ^ DeleteUnusedImport
+
+                foo = b
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (b)
+
+                foo = b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_class_import_not_first() {
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                class A a
+
+                b = 0
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (b, class A)
+                                     ^ DeleteUnusedImport
+
+                foo = b
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (b)
+
+                foo = b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn style_replace_forbidden_operator_bind_reverse() {
         assert_code_action(
             indoc! {"
@@ -1884,6 +1944,18 @@ mod tests {
 
                 f = g @(Foo Bar) x
                         ^ Remove unnecessary parentheses
+            "#})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_typed_expr_in_app() {
+        // (\_ -> expr) :: type — lambda needs parens inside typed expression
+        assert_no_code_action(indoc! {r#"
+                module Test where
+
+                f = g ((\_ -> x) :: Int -> Int)
+                         ^ Remove unnecessary parentheses
             "#})
         .await;
     }
@@ -2688,6 +2760,9 @@ impl LanguageServer for Backend {
         }
         // For per-item deletions, group by import decl and compute
         // ranges using remove_indices_ranges for correct separator handling.
+        // Also build a map from item span to its proper deletion range
+        // for per-item code actions.
+        let mut per_item_deletion_range: Vec<(ast::Span, Range)> = Vec::new();
         for decl in import_decls.iter() {
             let Some(items) = decl.names.as_ref() else {
                 continue;
@@ -2702,7 +2777,13 @@ impl LanguageServer for Backend {
             if unused_indices.is_empty() {
                 continue;
             }
+            // For BurnAll: compute ranges assuming all unused items are removed together.
             delete_all.extend(remove_indices_ranges(&all_spans, &unused_indices, false));
+            // For per-item: compute range for each item removed individually.
+            for &idx in &unused_indices {
+                let r = remove_nth_range(&all_spans, idx, false);
+                per_item_deletion_range.push((all_spans[idx], r));
+            }
         }
         // Sort by start position, then merge overlapping/adjacent ranges so the
         // workspace-edit never contains invalid overlapping TextEdits.
@@ -3231,23 +3312,27 @@ impl LanguageServer for Backend {
                     is_preferred: Some(true),
                     ..CodeAction::default()
                 }),
-                Fixable::DeleteUnusedImport(at) => out.push(CodeAction {
-                    title: "DeleteUnusedImport".into(),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    diagnostics: None,
-                    edit: Some(WorkspaceEdit::new(
-                        [(
-                            uri.clone(),
-                            vec![TextEdit::new(
-                                span_to_range(&at.and_one_more_char()),
-                                "".into(),
-                            )],
-                        )]
-                        .into(),
-                    )),
-                    is_preferred: Some(true),
-                    ..CodeAction::default()
-                }),
+                Fixable::DeleteUnusedImport(at) => {
+                    let deletion_range = per_item_deletion_range
+                        .iter()
+                        .find(|(s, _)| s == at)
+                        .map(|(_, r)| *r)
+                        .unwrap_or_else(|| span_to_range(&at.and_one_more_char()));
+                    out.push(CodeAction {
+                        title: "DeleteUnusedImport".into(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit::new(
+                            [(
+                                uri.clone(),
+                                vec![TextEdit::new(deletion_range, "".into())],
+                            )]
+                            .into(),
+                        )),
+                        is_preferred: Some(true),
+                        ..CodeAction::default()
+                    })
+                }
                 Fixable::ReplaceExpression(expr_span, title, replacement, _) => {
                     out.push(CodeAction {
                         title: title.clone(),

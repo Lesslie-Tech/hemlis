@@ -441,7 +441,7 @@ impl<'a> StyleChecker<'a> {
     fn recurse_expr(&mut self, expr: &ast::Expr) {
         match expr {
             ast::Expr::Typed(e, t) => {
-                self.check_expr(e);
+                self.check_expr_ctx(e, true, None);
                 self.check_typ(t);
             }
             ast::Expr::Op(a, qop, b) => {

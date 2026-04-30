@@ -512,45 +512,39 @@ fn import_decl<'t>(p: &mut P<'t>) -> Option<ImportDecl> {
 }
 
 fn import<'t>(p: &mut P<'t>) -> Option<Import> {
-    // Ugly little hack to get the whole span of the item.
-    let s = match p.prev() {
-        (Some(T::Comma), s) => s,
-        _ => Span::zero(),
-    };
     alt!(
         p: Serror::Info(p.span(), "import"),
-        |p: &mut _| {
+        |p: &mut P<'t>| {
+            let type_span = p.span();
             kw_type(p)?;
             let x = symbol(p)?;
-            let s = s.merge(x.span());
+            let s = type_span.merge(x.span());
             Some(Import::TypSymbol(s, x))
         },
-        |p: &mut _| {
+        |p: &mut P<'t>| {
+            let class_span = p.span();
             kw_class(p)?;
             let x = proper(p)?;
-            let s = s.merge(x.span());
+            let s = class_span.merge(x.span());
             Some(Import::Class(s, x))
         },
         |p: &mut _| {
             let x = name(p)?;
-            let s = s.merge(x.span());
-            Some(Import::Value(s, x))
+            Some(Import::Value(x.span(), x))
         },
         |p: &mut _| {
             let x = symbol(p)?;
-            let s = s.merge(x.span());
-            Some(Import::Symbol(s, x))
+            Some(Import::Symbol(x.span(), x))
         },
         |p: &mut _| {
             let n = proper(p)?;
             let ms = data_members(p)?;
-            let s = s.merge(ms.span()).merge(n.span());
+            let s = n.span().merge(ms.span());
             Some(Import::TypDat(s, n, ms))
         },
         |p: &mut _| {
             let n = proper(p)?;
-            let s = s.merge(n.span());
-            Some(Import::Typ(s, n))
+            Some(Import::Typ(n.span(), n))
         }
     )
 }
