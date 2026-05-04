@@ -392,10 +392,14 @@ fn rule_unnecessary_typ_parens(
             } else {
                 false
             };
-        let removable = matches!(inner.as_ref(), ast::Typ::Paren(..))
-            || is_typ_atom(inner)
-            || !inside_app_or_op
-            || same_op;
+        // (Unit -> X) is a lazy-value pattern — keep parens for readability.
+        let is_unit_thunk = matches!(inner.as_ref(), ast::Typ::Arr(a, _)
+            if matches!(a.as_ref(), ast::Typ::Constructor(ast::QProperName(None, ast::ProperName(ast::S(ud, _)))) if *ud == Ud::new("Unit")));
+        let removable = !is_unit_thunk
+            && (matches!(inner.as_ref(), ast::Typ::Paren(..))
+                || is_typ_atom(inner)
+                || !inside_app_or_op
+                || same_op);
         if removable {
             emit_remove_typ_parens(typ, source, out);
         }

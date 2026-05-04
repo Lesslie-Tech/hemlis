@@ -1959,6 +1959,18 @@ mod tests {
             "#})
         .await;
     }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_unit_thunk() {
+        // (Unit -> X) is a lazy-value pattern — keep parens for readability
+        assert_no_code_action(indoc! {r#"
+                module Test where
+
+                f :: String -> (Unit -> Int)
+                                ^ Remove unnecessary parentheses
+            "#})
+        .await;
+    }
 }
 
 impl LanguageServer for Backend {
