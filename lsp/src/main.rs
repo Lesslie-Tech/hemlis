@@ -1568,7 +1568,7 @@ mod tests {
         .await;
     }
 
-    // --- Unnecessary parentheses (PAY-3104) ---
+    // --- Unnecessary parenthesis (PAY-3104) ---
 
     #[tokio::test]
     async fn style_remove_parens_multiline_lambda() {
@@ -1579,7 +1579,7 @@ mod tests {
 
                 f =
                   ( \\x ->
-                  ^ Remove unnecessary parentheses
+                  ^ Remove unnecessary parenthesis
                       Just (pure unit)
                   )
             "},
@@ -1603,7 +1603,7 @@ mod tests {
                 module Test where
 
                 f = g "ä" (bar)
-                          ^ Remove unnecessary parentheses
+                          ^ Remove unnecessary parenthesis
             "#},
             indoc! {r#"
                 module Test where
@@ -1622,7 +1622,7 @@ mod tests {
                 module Test where
 
                 f = (bar baz)
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1641,7 +1641,7 @@ mod tests {
                 module Test where
 
                 f = g ((a))
-                      ^ Remove unnecessary parentheses
+                      ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1660,7 +1660,7 @@ mod tests {
                 module Test where
 
                 f = g (a)
-                      ^ Remove unnecessary parentheses
+                      ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1678,7 +1678,7 @@ mod tests {
                 module Test where
 
                 f = (g a) b
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1690,7 +1690,7 @@ mod tests {
                 module Test where
 
                 f = h (g a)
-                      ^ Remove unnecessary parentheses
+                      ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1702,7 +1702,7 @@ mod tests {
                 module Test where
 
                 f = (a * b) + c
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1714,7 +1714,7 @@ mod tests {
                 module Test where
 
                 f = (a + b) * c
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1726,7 +1726,7 @@ mod tests {
                 module Test where
 
                 f = (g a).x
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1738,7 +1738,7 @@ mod tests {
                 module Test where
 
                 f = (g a) { x = 1 }
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1750,7 +1750,7 @@ mod tests {
                 module Test where
 
                 f = g (-120.0)
-                      ^ Remove unnecessary parentheses
+                      ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1762,7 +1762,7 @@ mod tests {
                 module Test where
 
                 f = (g a) + c
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1775,7 +1775,7 @@ mod tests {
                 module Test where
 
                 f = (a + b) + c
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1794,7 +1794,7 @@ mod tests {
                 module Test where
 
                 f = a + (b + c)
-                        ^ Remove unnecessary parentheses
+                        ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1813,7 +1813,7 @@ mod tests {
                 module Test where
 
                 f = a $ (b $ c)
-                        ^ Remove unnecessary parentheses
+                        ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1832,7 +1832,7 @@ mod tests {
                 module Test where
 
                 f = (a $ b) $ c
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1843,7 +1843,7 @@ mod tests {
         .await;
     }
 
-    // --- Unnecessary type parentheses ---
+    // --- Unnecessary type parenthesis ---
 
     #[tokio::test]
     async fn style_remove_type_parens_atom() {
@@ -1853,7 +1853,7 @@ mod tests {
                 module Test where
 
                 f :: (Int) -> String
-                     ^ Remove unnecessary parentheses
+                     ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1872,7 +1872,7 @@ mod tests {
                 module Test where
 
                 f :: (Int -> String)
-                     ^ Remove unnecessary parentheses
+                     ^ Remove unnecessary parenthesis
             "},
             indoc! {"
                 module Test where
@@ -1890,7 +1890,7 @@ mod tests {
                 module Test where
 
                 f :: (Int -> String) -> Boolean
-                     ^ Remove unnecessary parentheses
+                     ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1902,7 +1902,7 @@ mod tests {
                 module Test where
 
                 data Permission = RequiresCounterSignFrom (List UserId)
-                                                          ^ Remove unnecessary parentheses
+                                                          ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1913,7 +1913,7 @@ mod tests {
                 module Test where
 
                 newtype BankfilesPayableId = BankfilesPayableId (Tuple EndToEndId String)
-                                                                ^ Remove unnecessary parentheses
+                                                                ^ Remove unnecessary parenthesis
             "})
         .await;
     }
@@ -1925,7 +1925,7 @@ mod tests {
                 module Test where
 
                 f = (params { page = 1 })
-                    ^ Remove unnecessary parentheses
+                    ^ Remove unnecessary parenthesis
             "#},
             indoc! {r#"
                 module Test where
@@ -1943,7 +1943,7 @@ mod tests {
                 module Test where
 
                 f = g @(Foo Bar) x
-                        ^ Remove unnecessary parentheses
+                        ^ Remove unnecessary parenthesis
             "#})
         .await;
     }
@@ -1955,7 +1955,7 @@ mod tests {
                 module Test where
 
                 f = g ((\_ -> x) :: Int -> Int)
-                         ^ Remove unnecessary parentheses
+                         ^ Remove unnecessary parenthesis
             "#})
         .await;
     }
@@ -1967,7 +1967,7 @@ mod tests {
                 module Test where
 
                 f :: String -> (Unit -> Int)
-                                ^ Remove unnecessary parentheses
+                                ^ Remove unnecessary parenthesis
             "#})
         .await;
     }

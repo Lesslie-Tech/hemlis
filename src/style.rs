@@ -238,7 +238,7 @@ fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnost
 }
 
 // ---------------------------------------------------------------------------
-// Unnecessary parentheses (PAY-3104)
+// Unnecessary parenthesis (PAY-3104)
 // ---------------------------------------------------------------------------
 
 fn is_atom(expr: &ast::Expr) -> bool {
@@ -304,20 +304,21 @@ fn emit_remove_parens(child: &ast::Expr, source: &str, out: &mut Vec<StyleDiagno
             out.push(StyleDiagnostic {
                 cursor_span: paren_span,
                 expr_span: paren_span,
-                title: "Remove unnecessary parentheses".into(),
+                title: "Remove unnecessary parenthesis".into(),
                 replacement: text.to_string(),
-                message: Some("Unnecessary parentheses".into()),
+                message: Some("Unnecessary parenthesis".into()),
             });
         }
     }
 }
 
-/// Simple heuristic for unnecessary parentheses:
+/// Simple heuristic for unnecessary parenthesis:
 /// 1. Double parens: `((x))` → `(x)`
 /// 2. Atom in parens: `(x)` → `x` (single ident/literal/array/record)
 /// 3. Paren not inside App/Op: the parens are the whole expression in their
 ///    context (definition RHS, do-bind, let-bind, case scrutinee, etc.)
-/// 4. Same operator inside as outside: `(a + b) + c` → `a + b + c`
+/// 4. Same operator inside as outside: `(a + b) + c` → `a + b + c` (This isn't accurate in some
+///    cases, operator fixivity needs to be taken into account here.)
 fn rule_unnecessary_parens(
     expr: &ast::Expr,
     source: &str,
@@ -343,7 +344,7 @@ fn rule_unnecessary_parens(
 }
 
 // ---------------------------------------------------------------------------
-// Unnecessary type parentheses (PAY-3104)
+// Unnecessary type parenthesis (PAY-3104)
 // ---------------------------------------------------------------------------
 
 fn is_typ_atom(typ: &ast::Typ) -> bool {
@@ -370,9 +371,9 @@ fn emit_remove_typ_parens(typ: &ast::Typ, source: &str, out: &mut Vec<StyleDiagn
             out.push(StyleDiagnostic {
                 cursor_span: paren_span,
                 expr_span: paren_span,
-                title: "Remove unnecessary parentheses".into(),
+                title: "Remove unnecessary parenthesis".into(),
                 replacement: text.to_string(),
-                message: Some("Unnecessary parentheses".into()),
+                message: Some("Unnecessary parenthesis".into()),
             });
         }
     }
