@@ -1971,6 +1971,147 @@ mod tests {
             "#})
         .await;
     }
+
+    // ---- PAY-3099: if → case conversion ----
+
+    #[tokio::test]
+    async fn style_convert_if_to_case_simple() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = if x then 1 else 0
+                      ^ Convert to `case`
+            "},
+            indoc! {"
+                module Test where
+
+                f x = case x of
+                        true -> 1
+                        false -> 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_multiline_if_cond_then_same_line() {
+        // if cond then\n  body\nelse\n  body — most common multiline pattern
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x =
+                  if x then
+                  ^ Convert to `case`
+                    1
+                  else
+                    0
+            "},
+            indoc! {"
+                module Test where
+
+                f x =
+                  case x of
+                    true -> 1
+                    false -> 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_multiline_if_multiline_bodies() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x =
+                  if x then
+                  ^ Convert to `case`
+                    pure 1
+                  else
+                    pure 0
+            "},
+            indoc! {"
+                module Test where
+
+                f x =
+                  case x of
+                    true -> pure 1
+                    false -> pure 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_if_to_case_nested_in_do() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = Foo.do
+                  x <- bar
+                  if x then
+                  ^ Convert to `case`
+                    pure 1
+                  else
+                    pure 0
+            "},
+            indoc! {"
+                module Test where
+
+                f = Foo.do
+                  x <- bar
+                  case x of
+                    true -> pure 1
+                    false -> pure 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_if_to_case_inline_in_expr() {
+        // if used as argument inside parens
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = g (if x then 1 else 0) y
+                         ^ Convert to `case`
+            "},
+            indoc! {"
+                module Test where
+
+                f x = g (case x of
+                           true -> 1
+                           false -> 0) y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_long_single_line_if() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = if x then someVeryLongFunctionNameHere anotherVeryLongArgumentName thirdVeryLongArgument else otherVeryLongFunctionNameHere anotherArg
+                      ^ Convert to `case`
+            "},
+            indoc! {"
+                module Test where
+
+                f x = case x of
+                        true -> someVeryLongFunctionNameHere anotherVeryLongArgumentName thirdVeryLongArgument
+                        false -> otherVeryLongFunctionNameHere anotherArg
+            "},
+        )
+        .await;
+    }
 }
 
 impl LanguageServer for Backend {

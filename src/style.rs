@@ -408,6 +408,56 @@ fn rule_unnecessary_typ_parens(
 }
 
 // ---------------------------------------------------------------------------
+// PAY-3099: if → case conversion
+// ---------------------------------------------------------------------------
+
+fn rule_if_to_case(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+    let ast::Expr::IfThenElse(kw_span, cond, then_e, else_e) = expr else {
+        return;
+    };
+    let Some(cond_text) = source_text(source, &cond.span()) else {
+        return;
+    };
+    let Some(then_text) = source_text(source, &then_e.span()) else {
+        return;
+    };
+    let Some(else_text) = source_text(source, &else_e.span()) else {
+        return;
+    };
+
+    let case_col = kw_span.lo().1;
+    let branch_indent = " ".repeat(case_col + 2);
+    let cond_trimmed = cond_text.trim();
+    let then_trimmed = then_text.trim_start();
+    let else_trimmed = else_text.trim_start();
+
+    let replacement = format!(
+        "case {} of\n{}true -> {}\n{}false -> {}",
+        cond_trimmed, branch_indent, then_trimmed, branch_indent, else_trimmed
+    );
+
+    let is_multiline = expr.span().lo().0 != expr.span().hi().0;
+    let if_length = expr.span().hi().1.saturating_sub(expr.span().lo().1);
+    let is_long_if = !is_multiline && if_length > 120;
+
+    let (cursor_span, message) = if is_multiline {
+        (expr.span(), Some("Prefer `case` over multiline `if`".into()))
+    } else if is_long_if {
+        (expr.span(), Some("Line exceeds 120 chars; prefer `case` over long `if`".into()))
+    } else {
+        (*kw_span, None)
+    };
+
+    out.push(StyleDiagnostic {
+        cursor_span,
+        expr_span: expr.span(),
+        title: "Convert to `case`".into(),
+        replacement,
+        message,
+    });
+}
+
+// ---------------------------------------------------------------------------
 
 struct StyleChecker<'a> {
     source: &'a str,
@@ -438,6 +488,7 @@ impl<'a> StyleChecker<'a> {
             outer_op,
             &mut self.diagnostics,
         );
+        rule_if_to_case(expr, self.source, &mut self.diagnostics);
         // =======================================
 
         self.recurse_expr(expr);
