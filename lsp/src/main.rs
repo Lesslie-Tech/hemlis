@@ -1787,21 +1787,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn style_remove_parens_same_op_left_assoc_right() {
-        // a + (b + c) → a + b + c (same operator, always removable)
-        assert_code_action(
-            indoc! {"
+    async fn style_keep_parens_left_assoc_right_operand() {
+        // a + (b + c) — + is infixl, so a + b + c parses as (a + b) + c. Dropping the parens
+        // changes the parse tree. Even though + is algebraically associative for Int, hemlis has
+        // no types and can't assume that (Number rounding / custom Semiring instances), so we
+        // conservatively keep the parens. (PAY-3202)
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = a + (b + c)
                         ^ Remove unnecessary parenthesis
-            "},
-            indoc! {"
-                module Test where
-
-                f = a + b + c
-            "},
-        )
+            "})
         .await;
     }
 
@@ -1825,21 +1821,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn style_remove_parens_same_op_right_assoc_left() {
-        // (a $ b) $ c → a $ b $ c (same operator, always removable)
-        assert_code_action(
-            indoc! {"
+    async fn style_keep_parens_right_assoc_left_operand_dollar() {
+        // (a $ b) $ c — $ is infixr, so a $ b $ c parses as a $ (b $ c). (a $ b) $ c is a
+        // different expression, so the parens must be kept. (PAY-3202)
+        assert_no_code_action(indoc! {"
                 module Test where
 
                 f = (a $ b) $ c
                     ^ Remove unnecessary parenthesis
-            "},
-            indoc! {"
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_right_assoc_left_operand() {
+        // (x : ys) : zs — : is infixr, so the left parens are necessary:
+        // x : ys : zs parses as x : (ys : zs), a different (ill-typed) expression.
+        assert_no_code_action(indoc! {"
                 module Test where
 
-                f = a $ b $ c
-            "},
-        )
+                f = (x : ys) : zs
+                    ^ Remove unnecessary parenthesis
+            "})
         .await;
     }
 

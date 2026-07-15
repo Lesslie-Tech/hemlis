@@ -317,26 +317,31 @@ fn emit_remove_parens(child: &ast::Expr, source: &str, out: &mut Vec<StyleDiagno
 /// 2. Atom in parens: `(x)` → `x` (single ident/literal/array/record)
 /// 3. Paren not inside App/Op: the parens are the whole expression in their
 ///    context (definition RHS, do-bind, let-bind, case scrutinee, etc.)
-/// 4. Same operator inside as outside: `(a + b) + c` → `a + b + c` (This isn't accurate in some
-///    cases, operator fixivity needs to be taken into account here.)
+/// 4. Same operator inside as outside, on the side that matches the operator's fixity:
+///    a left-associative op only allows dropping parens on its left operand, a
+///    right-associative op only on its right operand. E.g. for `+` (infixl),
+///    `(a + b) + c` → `a + b + c`, but `a + (b + c)` keeps its parens; for `:` (infixr),
+///    `x : (ys : zs)` → `x : ys : zs`, but `(x : ys) : zs` keeps its parens. (PAY-3202)
 fn rule_unnecessary_parens(
     expr: &ast::Expr,
     source: &str,
     inside_app_or_op: bool,
-    outer_op: Option<Ud>,
+    outer_op: Option<(Ud, bool)>,
     out: &mut Vec<StyleDiagnostic>,
 ) {
     if let ast::Expr::Paren(_, inner, _) = expr {
-        let same_op =
-            if let (Some(outer), ast::Expr::Op(_, inner_qop, _)) = (outer_op, inner.as_ref()) {
-                (inner_qop.1).0 .0 == outer
-            } else {
-                false
-            };
+        let same_op_removable = match (outer_op, inner.as_ref()) {
+            (Some((outer, on_left)), ast::Expr::Op(_, inner_qop, _)) => {
+                let inner_ud = (inner_qop.1).0 .0;
+                // Same operator: the parens are only redundant on the associativity side.
+                inner_ud == outer && (on_left == op_fixity(inner_ud).is_left())
+            }
+            _ => false,
+        };
         let removable = matches!(inner.as_ref(), ast::Expr::Paren(..))
             || is_atom(inner)
             || !inside_app_or_op
-            || same_op;
+            || same_op_removable;
         if removable {
             emit_remove_parens(expr, source, out);
         }
@@ -476,7 +481,7 @@ impl<'a> StyleChecker<'a> {
         self.check_expr_ctx(expr, false, None);
     }
 
-    fn check_expr_ctx(&mut self, expr: &ast::Expr, inside_app_or_op: bool, outer_op: Option<Ud>) {
+    fn check_expr_ctx(&mut self, expr: &ast::Expr, inside_app_or_op: bool, outer_op: Option<(Ud, bool)>) {
         // ===== RULES (add new rules here) =====
         rule_forbidden_operator(expr, self.source, &mut self.diagnostics);
         rule_operator_swap(expr, self.source, &mut self.diagnostics);
@@ -502,8 +507,8 @@ impl<'a> StyleChecker<'a> {
             }
             ast::Expr::Op(a, qop, b) => {
                 let op_ud = (qop.1).0 .0;
-                self.check_expr_ctx(a, true, Some(op_ud));
-                self.check_expr_ctx(b, true, Some(op_ud));
+                self.check_expr_ctx(a, true, Some((op_ud, true)));
+                self.check_expr_ctx(b, true, Some((op_ud, false)));
             }
             ast::Expr::Infix(a, o, b) => {
                 self.check_expr_ctx(a, true, None);
