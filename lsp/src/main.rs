@@ -1846,6 +1846,21 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn style_keep_parens_case_in_guard() {
+        // (case ...) used as a guard: `case` is an open, right-extending expression, so removing
+        // the parens lets it swallow the trailing `= body`, changing the parse. The parens are
+        // necessary. Simplified from the PAY-3322 screenshot.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f x
+                  | (case x of _ -> true) = x
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
     // --- Unnecessary type parenthesis ---
 
     #[tokio::test]

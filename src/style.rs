@@ -260,6 +260,24 @@ fn is_atom(expr: &ast::Expr) -> bool {
     )
 }
 
+/// An "open" expression extends as far to the right as it can when parsed. Wrapping one in parens
+/// is therefore necessary whenever it sits in a non-tail position (i.e. some token follows it in
+/// the enclosing construct), because without the parens it would swallow that trailing token.
+/// Examples: a guard `(case ...) = body`, an `if (case ...) then ...`, a `case (case ...) of ...`.
+/// (PAY-3322)
+fn is_open_expr(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Case(..)
+            | ast::Expr::IfThenElse(..)
+            | ast::Expr::Lambda(..)
+            | ast::Expr::Let(..)
+            | ast::Expr::Where(..)
+            | ast::Expr::Do(..)
+            | ast::Expr::Ado(..)
+    )
+}
+
 #[allow(dead_code)]
 enum ParenContext {
     AppFunc,
@@ -316,7 +334,8 @@ fn emit_remove_parens(child: &ast::Expr, source: &str, out: &mut Vec<StyleDiagno
 /// 1. Double parens: `((x))` → `(x)`
 /// 2. Atom in parens: `(x)` → `x` (single ident/literal/array/record)
 /// 3. Paren not inside App/Op: the parens are the whole expression in their
-///    context (definition RHS, do-bind, let-bind, case scrutinee, etc.)
+///    context (definition RHS, do-bind, let-bind, case scrutinee, etc.) — but only when in tail
+///    position for "open" expressions (see `is_open_expr` / `tail_ok`).
 /// 4. Same operator inside as outside, on the side that matches the operator's fixity:
 ///    a left-associative op only allows dropping parens on its left operand, a
 ///    right-associative op only on its right operand. E.g. for `+` (infixl),
@@ -327,6 +346,7 @@ fn rule_unnecessary_parens(
     source: &str,
     inside_app_or_op: bool,
     outer_op: Option<(Ud, bool)>,
+    tail_ok: bool,
     out: &mut Vec<StyleDiagnostic>,
 ) {
     if let ast::Expr::Paren(_, inner, _) = expr {
@@ -338,9 +358,13 @@ fn rule_unnecessary_parens(
             }
             _ => false,
         };
+        // "Whole expression in its context" removal is unsafe for an open expression that isn't in
+        // tail position: it would extend right and swallow the following token. (PAY-3322)
+        let whole_expr_removable =
+            !inside_app_or_op && (tail_ok || !is_open_expr(inner));
         let removable = matches!(inner.as_ref(), ast::Expr::Paren(..))
             || is_atom(inner)
-            || !inside_app_or_op
+            || whole_expr_removable
             || same_op_removable;
         if removable {
             emit_remove_parens(expr, source, out);
@@ -478,10 +502,25 @@ impl<'a> StyleChecker<'a> {
     }
 
     fn check_expr(&mut self, expr: &ast::Expr) {
-        self.check_expr_ctx(expr, false, None);
+        // Tail position: nothing follows the expression in its enclosing construct, so parens
+        // around an open expression may be dropped.
+        self.check_expr_ctx(expr, false, None, true);
     }
 
-    fn check_expr_ctx(&mut self, expr: &ast::Expr, inside_app_or_op: bool, outer_op: Option<(Ud, bool)>) {
+    fn check_expr_nontail(&mut self, expr: &ast::Expr) {
+        // Non-tail position: a token follows the expression (a guard's `= body` / `-> body`, an
+        // `if` condition's `then`, a scrutinee's `of`, a non-final list element's `,`), so parens
+        // around an open expression must be kept. (PAY-3322)
+        self.check_expr_ctx(expr, false, None, false);
+    }
+
+    fn check_expr_ctx(
+        &mut self,
+        expr: &ast::Expr,
+        inside_app_or_op: bool,
+        outer_op: Option<(Ud, bool)>,
+        tail_ok: bool,
+    ) {
         // ===== RULES (add new rules here) =====
         rule_forbidden_operator(expr, self.source, &mut self.diagnostics);
         rule_operator_swap(expr, self.source, &mut self.diagnostics);
@@ -491,6 +530,7 @@ impl<'a> StyleChecker<'a> {
             self.source,
             inside_app_or_op,
             outer_op,
+            tail_ok,
             &mut self.diagnostics,
         );
         rule_if_to_case(expr, self.source, &mut self.diagnostics);
@@ -502,31 +542,33 @@ impl<'a> StyleChecker<'a> {
     fn recurse_expr(&mut self, expr: &ast::Expr) {
         match expr {
             ast::Expr::Typed(e, t) => {
-                self.check_expr_ctx(e, true, None);
+                self.check_expr_ctx(e, true, None, true);
                 self.check_typ(t);
             }
             ast::Expr::Op(a, qop, b) => {
                 let op_ud = (qop.1).0 .0;
-                self.check_expr_ctx(a, true, Some((op_ud, true)));
-                self.check_expr_ctx(b, true, Some((op_ud, false)));
+                self.check_expr_ctx(a, true, Some((op_ud, true)), true);
+                self.check_expr_ctx(b, true, Some((op_ud, false)), true);
             }
             ast::Expr::Infix(a, o, b) => {
-                self.check_expr_ctx(a, true, None);
+                self.check_expr_ctx(a, true, None, true);
                 self.check_expr(o);
-                self.check_expr_ctx(b, true, None);
+                self.check_expr_ctx(b, true, None, true);
             }
             ast::Expr::Negate(e) => self.check_expr(e),
             ast::Expr::App(a, b) => {
-                self.check_expr_ctx(a, true, None);
-                self.check_expr_ctx(b, true, None);
+                self.check_expr_ctx(a, true, None, true);
+                self.check_expr_ctx(b, true, None, true);
             }
             ast::Expr::Vta(e, t) => {
                 self.check_expr(e);
                 self.check_typ_ctx(t, true, None);
             }
             ast::Expr::IfThenElse(_, c, t, f) => {
-                self.check_expr(c);
-                self.check_expr(t);
+                // `if <c> then <t> else <f>`: the condition is followed by `then` and the
+                // then-branch by `else`, so both are non-tail; the else-branch is in tail position.
+                self.check_expr_nontail(c);
+                self.check_expr_nontail(t);
                 self.check_expr(f);
             }
             ast::Expr::Do(_, stmts) | ast::Expr::Ado(_, stmts, _) => {
@@ -543,34 +585,49 @@ impl<'a> StyleChecker<'a> {
                 self.check_expr(e);
             }
             ast::Expr::Where(_, e, bindings) => {
-                self.check_expr(e);
+                // `<e> where ...`: `where` follows the expression, so it is non-tail.
+                self.check_expr_nontail(e);
                 self.check_let_bindings(bindings);
             }
             ast::Expr::Case(_, scrutinees, branches) => {
                 for e in scrutinees {
-                    self.check_expr(e);
+                    // `case <e> of ...`: the scrutinee is followed by `of`, so it is non-tail.
+                    self.check_expr_nontail(e);
                 }
                 for ast::CaseBranch(_, ge) in branches {
                     self.check_guarded_expr(ge);
                 }
             }
             ast::Expr::Array(_, es, _) => {
-                for e in es {
-                    self.check_expr(e);
+                // Only the final element is in tail position (delimited by `]`); any earlier
+                // element is followed by `,`.
+                let last = es.len().saturating_sub(1);
+                for (i, e) in es.iter().enumerate() {
+                    if i == last {
+                        self.check_expr(e);
+                    } else {
+                        self.check_expr_nontail(e);
+                    }
                 }
             }
             ast::Expr::Record(_, fields, _) => {
-                for field in fields {
+                // Only a field that nothing follows is in tail position (delimited by `}`).
+                let last = fields.len().saturating_sub(1);
+                for (i, field) in fields.iter().enumerate() {
                     if let ast::RecordLabelExpr::Field(_, e) = field {
-                        self.check_expr(e);
+                        if i == last {
+                            self.check_expr(e);
+                        } else {
+                            self.check_expr_nontail(e);
+                        }
                     }
                 }
             }
             ast::Expr::Update(e, _, updates, _) => {
-                self.check_expr_ctx(e, true, None);
+                self.check_expr_ctx(e, true, None, true);
                 self.check_record_updates(updates);
             }
-            ast::Expr::Access(e, _) => self.check_expr_ctx(e, true, None),
+            ast::Expr::Access(e, _) => self.check_expr_ctx(e, true, None, true),
             ast::Expr::Paren(_, e, _) => self.check_expr(e),
             ast::Expr::Section(_)
             | ast::Expr::Hole(_)
@@ -609,9 +666,10 @@ impl<'a> StyleChecker<'a> {
             ast::GuardedExpr::Guarded(arms) => {
                 for (guards, e) in arms {
                     for g in guards {
+                        // A guard is followed by `= body` / `-> body`, so it is non-tail.
                         match g {
-                            ast::Guard::Expr(e) => self.check_expr(e),
-                            ast::Guard::Binder(_, e) => self.check_expr(e),
+                            ast::Guard::Expr(e) => self.check_expr_nontail(e),
+                            ast::Guard::Binder(_, e) => self.check_expr_nontail(e),
                         }
                     }
                     self.check_expr(e);
