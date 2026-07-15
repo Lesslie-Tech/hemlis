@@ -2782,6 +2782,11 @@ impl LanguageServer for Backend {
             )
             .ok_or_else(|| error(line!(), "Failed to resolve name"))?;
 
+        // Disallow renaming of record fields
+        if name.scope() == nr::Scope::Label {
+            return Ok(None);
+        }
+
         // NOTE: We don't validate the name here - so it is possible to end up in a state where the
         // codebase doesn't parse. I don't see this as a huge loss - since the edit can be undone.
         let new_text = params.new_name;
@@ -2838,6 +2843,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         if let Some((name, range)) =
             self.resolve_name_and_range(&params.text_document.uri, params.position)
+        && name.scope() != nr::Scope::Label
         {
             Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
                 range,
@@ -3476,11 +3482,7 @@ impl LanguageServer for Backend {
                         kind: Some(CodeActionKind::QUICKFIX),
                         diagnostics: None,
                         edit: Some(WorkspaceEdit::new(
-                            [(
-                                uri.clone(),
-                                vec![TextEdit::new(deletion_range, "".into())],
-                            )]
-                            .into(),
+                            [(uri.clone(), vec![TextEdit::new(deletion_range, "".into())])].into(),
                         )),
                         is_preferred: Some(true),
                         ..CodeAction::default()
