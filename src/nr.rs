@@ -234,18 +234,18 @@ impl<'s> N<'s> {
             end: _,
         }: &ast::ImportDecl,
     ) {
-        if from.0 .0 == ast::Ud::new("Prim") {
+        if from.0.0 == ast::Ud::new("Prim") {
             return;
         }
-        let from_name = Name(Scope::Module, from.0 .0, from.0 .0, Visibility::Public);
+        let from_name = Name(Scope::Module, from.0.0, from.0.0, Visibility::Public);
         if let Some(usages) = self.global_usages.get(&from_name) {
             if usages.iter().any(|(_, sort)| sort == &Sort::Export) {
                 return;
             }
         }
         if let Some(to) = to {
-            let n = to.0 .0;
-            let s = to.0 .1;
+            let n = to.0.0;
+            let s = to.0.1;
             let to_name = Name(Scope::Namespace, self.me, n, Visibility::Public);
             if let Some(usages) = self.references.get(&to_name) {
                 if usages.iter().any(|(_, sort)| sort == &Sort::Export) {
@@ -261,7 +261,7 @@ impl<'s> N<'s> {
         if !names.is_none() {
             let valid: Vec<Export> = self
                 .global_exports
-                .get(&from.0 .0)
+                .get(&from.0.0)
                 .map(|x| x.value().clone())
                 .unwrap_or_default();
 
@@ -307,7 +307,7 @@ impl<'s> N<'s> {
                         if let Some((ty_unused, fields)) = valid.iter().find_map(|n| match n {
                             Export::ConstructorsSome(name, fields)
                             | Export::ConstructorsAll(name, fields)
-                                if name.is(Type, proper_name.0 .0) =>
+                                if name.is(Type, proper_name.0.0) =>
                             {
                                 Some((!self.is_used(name), fields))
                             }
@@ -329,7 +329,7 @@ impl<'s> N<'s> {
                                     // } else
                                     if all_unused && ty_unused {
                                         self.errors.push(NRerrors::UnusedImportTypeAndConstructor(
-                                            proper_name.0 .0,
+                                            proper_name.0.0,
                                             fields.clone(),
                                             import.span(),
                                         ));
@@ -341,10 +341,7 @@ impl<'s> N<'s> {
                                     let fields: Vec<Name> = mem
                                         .iter()
                                         .filter_map(|m| {
-                                            fields
-                                                .iter()
-                                                .find(|name| name.name() == m.0 .0)
-                                                .copied()
+                                            fields.iter().find(|name| name.name() == m.0.0).copied()
                                         })
                                         .collect();
                                     let all_unused = fields.iter().all(|name| !self.is_used(name));
@@ -354,12 +351,12 @@ impl<'s> N<'s> {
                                     if !all_unused {
                                         for m in mem {
                                             if let Some(name) =
-                                                fields.iter().find(|name| name.name() == m.0 .0)
+                                                fields.iter().find(|name| name.name() == m.0.0)
                                             {
                                                 if !self.is_used(name) {
                                                     self.errors.push(
                                                         NRerrors::UnusedImportedConstructor(
-                                                            m.0 .0, m.0 .1,
+                                                            m.0.0, m.0.1,
                                                         ),
                                                     );
                                                 }
@@ -367,7 +364,7 @@ impl<'s> N<'s> {
                                         }
                                     } else if all_unused && ty_unused {
                                         self.errors.push(NRerrors::UnusedImportTypeAndConstructor(
-                                            proper_name.0 .0,
+                                            proper_name.0.0,
                                             fields.clone(),
                                             import.span(),
                                         ));
@@ -380,7 +377,7 @@ impl<'s> N<'s> {
             }
             if is_entire_thing_unused {
                 self.errors.push(NRerrors::UnusedImportUnqualified(
-                    from.0 .0,
+                    from.0.0,
                     names.span().merge(from.span()).entire_line(),
                 ));
             }
@@ -500,17 +497,18 @@ impl<'s> N<'s> {
         let s = n.span().merge(m.span());
         match m {
             Some(m) => {
-                let unique_matches = self.resolve_inner(Namespace, None, m.0 .0);
+                let ns_span = m.0.1;
+                let unique_matches = self.resolve_inner(Namespace, None, m.0.0);
                 for name in unique_matches.iter().copied() {
-                    self.add_usage(name, s, Sort::Ref);
+                    self.add_usage(name, ns_span, Sort::Ref);
                 }
 
                 if unique_matches.is_empty() {
                     self.errors
-                        .push(NRerrors::Unknown(scope, Some(m.0 .0), n.0, s));
+                        .push(NRerrors::Unknown(scope, Some(m.0.0), n.0, s));
                     return None;
                 }
-                self.resolve(scope, Some(m.0 .0), n)
+                self.resolve(scope, Some(m.0.0), n)
             }
             None => self.resolve(scope, None, n),
         }
@@ -570,42 +568,42 @@ impl<'s> N<'s> {
         match ex {
             ast::Export::Value(v) => {
                 if let Some(n) = self.resolve(Term, None, v.0) {
-                    self.add_usage(n, v.0 .1, Sort::Export);
+                    self.add_usage(n, v.0.1, Sort::Export);
                     self.exports.push(Just(n))
                 }
             }
             ast::Export::Symbol(v) => {
                 if let Some(n) = self.resolve(Term, None, v.0) {
-                    self.add_usage(n, v.0 .1, Sort::Export);
+                    self.add_usage(n, v.0.1, Sort::Export);
                     self.exports.push(Just(n))
                 }
             }
             ast::Export::Typ(v) => {
                 if let Some(n) = self.resolve(Type, None, v.0) {
-                    self.add_usage(n, v.0 .1, Sort::Export);
+                    self.add_usage(n, v.0.1, Sort::Export);
                     self.exports.push(Just(n))
                 }
             }
             ast::Export::TypSymbol(v) => {
                 if let Some(n) = self.resolve(Type, None, v.0) {
-                    self.add_usage(n, v.0 .1, Sort::Export);
+                    self.add_usage(n, v.0.1, Sort::Export);
                     self.exports.push(Just(n))
                 }
             }
             ast::Export::Class(v) => {
                 if let Some(n) = self.resolve(Class, None, v.0) {
-                    self.add_usage(n, v.0 .1, Sort::Export);
+                    self.add_usage(n, v.0.1, Sort::Export);
                     self.exports.push(Just(n))
                 }
             }
             ast::Export::TypDat(v, ds) => {
                 if let Some(name) = self.resolve(Type, None, v.0) {
-                    self.add_usage(name, v.0 .1, Sort::Export);
+                    self.add_usage(name, v.0.1, Sort::Export);
                 }
-                let x = Name(Type, self.me, v.0 .0, Visibility::Public);
+                let x = Name(Type, self.me, v.0.0, Visibility::Public);
                 let ms = match self.constructors.get(&x) {
                     None => {
-                        self.errors.push(NRerrors::NoConstructors(x, v.0 .1));
+                        self.errors.push(NRerrors::NoConstructors(x, v.0.1));
                         return;
                     }
                     Some(ms) => ms.clone(),
@@ -615,10 +613,10 @@ impl<'s> N<'s> {
                     ast::DataMember::Some(ns) => ConstructorsSome(
                         x,
                         ns.iter()
-                            .filter_map(|m| match ms.iter().find(|a| a.2 == m.0 .0) {
+                            .filter_map(|m| match ms.iter().find(|a| a.2 == m.0.0) {
                                 Some(a) => {
                                     if let Some(name) = self.resolve(a.0, None, m.0) {
-                                        self.add_usage(name, m.0 .1, Sort::Export);
+                                        self.add_usage(name, m.0.1, Sort::Export);
                                     }
                                     Some(*a)
                                 }
@@ -633,35 +631,35 @@ impl<'s> N<'s> {
                 self.exports.push(out);
             }
 
-            ast::Export::Module(v) if v.0 .0 == self.me => {
+            ast::Export::Module(v) if v.0.0 == self.me => {
                 self.export_self();
             }
             ast::Export::Module(v) => {
-                if let Some(ns) = self.imports.get(&Some(v.0 .0)).cloned() {
+                if let Some(ns) = self.imports.get(&Some(v.0.0)).cloned() {
                     self.add_usage(
-                        Name(Namespace, self.me, v.0 .0, Visibility::Public),
-                        v.0 .1,
+                        Name(Namespace, self.me, v.0.0, Visibility::Public),
+                        v.0.1,
                         Sort::Export,
                     );
                     self.exports
                         .append(&mut ns.values().flatten().cloned().collect());
                 } else {
-                    let name = Name(Scope::Module, v.0 .0, v.0 .0, Visibility::Public);
-                    self.add_usage(name, v.0 .1, Sort::Export);
+                    let name = Name(Scope::Module, v.0.0, v.0.0, Visibility::Public);
+                    self.add_usage(name, v.0.1, Sort::Export);
                     // Module exports export everything that's ever imported from a module -
                     // right?
                     let imports = self
                         .imports
                         .values()
                         .flatten()
-                        .filter(|(x, _)| **x == v.0 .0)
+                        .filter(|(x, _)| **x == v.0.0)
                         .collect::<Vec<_>>();
                     if imports.is_empty() {
                         self.errors.push(NRerrors::Unknown(
                             Scope::Module,
-                            Some(v.0 .0),
-                            v.0 .0,
-                            v.0 .1,
+                            Some(v.0.0),
+                            v.0.0,
+                            v.0.1,
                         ));
                     } else {
                         for (_, is) in imports.into_iter() {
@@ -712,38 +710,38 @@ impl<'s> N<'s> {
     ) {
         // NOTE: I've decided the export isn't a usage - it's annoying to see references that
         // aren't really used.
-        let name = Name(Module, from.0 .0, from.0 .0, Visibility::Public);
-        self.add_usage(name, from.0 .1, Sort::Ref);
-        let import_name = to.map(|x| x.0 .0);
+        let name = Name(Module, from.0.0, from.0.0, Visibility::Public);
+        self.add_usage(name, from.0.1, Sort::Ref);
+        let import_name = to.map(|x| x.0.0);
         self.imports
             .entry(import_name)
             .or_default()
-            .entry(from.0 .0)
+            .entry(from.0.0)
             .or_default();
         if let Some(b) = to {
-            self.def_global(Namespace, b.0 .0, b.0 .1, b.0 .1, true);
+            self.def_global(Namespace, b.0.0, b.0.1, b.0.1, true);
         }
-        if from.0 .0 == self.me {
+        if from.0.0 == self.me {
             self.errors.push(NRerrors::CannotImportSelf(import.span()));
             return;
         }
-        if !self.global_exports.contains_key(&from.0 .0) {
+        if !self.global_exports.contains_key(&from.0.0) {
             self.errors
-                .push(NRerrors::CouldNotFindImport(from.0 .0, from.0 .1));
+                .push(NRerrors::CouldNotFindImport(from.0.0, from.0.1));
             return;
         }
         if names.as_ref().map(|x| x.is_empty()).unwrap_or(false)
             && to.is_none()
-            && from.0 .0 != ast::Ud::new("Prim")
+            && from.0.0 != ast::Ud::new("Prim")
         {
             self.errors.push(NRerrors::ImportDoesNothing(
-                from.0 .0,
-                from.0 .1.entire_line(),
+                from.0.0,
+                from.0.1.entire_line(),
             ));
         }
         let exports: Vec<Export> = self
             .global_exports
-            .get(&from.0 .0)
+            .get(&from.0.0)
             .map(|x| x.value().clone())
             .unwrap_or_default();
 
@@ -777,7 +775,7 @@ impl<'s> N<'s> {
                         Some((s, u.0))
                     } else {
                         self.errors
-                            .push(NRerrors::NotExportedOrDoesNotExist(from.0 .0, s, u.0, u.1));
+                            .push(NRerrors::NotExportedOrDoesNotExist(from.0.0, s, u.0, u.1));
                         None
                     }
                 })
@@ -786,7 +784,7 @@ impl<'s> N<'s> {
                 .imports
                 .get_mut(&import_name)
                 .expect("Checked earlier")
-                .get_mut(&from.0 .0)
+                .get_mut(&from.0.0)
                 .expect("Checked earlier");
             entry.append(
                 &mut exports
@@ -802,12 +800,12 @@ impl<'s> N<'s> {
             let mut to_export = names
                 .iter()
                 .flatten()
-                .filter_map(|i| self.import_part(i, from.0 .0, &exports))
+                .filter_map(|i| self.import_part(i, from.0.0, &exports))
                 .collect();
             self.imports
                 .get_mut(&import_name)
                 .expect("Checked earlier")
-                .get_mut(&from.0 .0)
+                .get_mut(&from.0.0)
                 .expect("Checked earlier")
                 .append(&mut to_export);
         }
@@ -845,9 +843,9 @@ impl<'s> N<'s> {
                 if let Some(out) = valid.iter().find_map(|n| match n {
                     out
                     @ (Export::ConstructorsSome(name, _) | Export::ConstructorsAll(name, _))
-                        if name.is(Type, x.0 .0) =>
+                        if name.is(Type, x.0.0) =>
                     {
-                        self.add_usage(*name, x.0 .1, Sort::Import);
+                        self.add_usage(*name, x.0.1, Sort::Import);
                         Some(out)
                     }
                     _ => None,
@@ -855,7 +853,7 @@ impl<'s> N<'s> {
                     out.clone()
                 } else {
                     self.errors.push(NRerrors::NotExportedOrDoesNotExist(
-                        from, Type, x.0 .0, x.0 .1,
+                        from, Type, x.0.0, x.0.1,
                     ));
                     return None;
                 }
@@ -863,9 +861,9 @@ impl<'s> N<'s> {
             ast::Import::TypDat(_, x, ast::DataMember::Some(cs)) => {
                 if let Some((name, es)) = valid.iter().find_map(|n| match n {
                     Export::ConstructorsSome(name, cs) | Export::ConstructorsAll(name, cs)
-                        if name.is(Type, x.0 .0) =>
+                        if name.is(Type, x.0.0) =>
                     {
-                        self.add_usage(*name, x.0 .1, Sort::Import);
+                        self.add_usage(*name, x.0.1, Sort::Import);
                         Some((name, cs))
                     }
                     _ => None,
@@ -877,12 +875,12 @@ impl<'s> N<'s> {
                     let cs = cs
                         .iter()
                         .filter_map(|n| {
-                            if let Some(xx) = es.get(&n.0 .0) {
-                                self.add_usage(**xx, n.0 .1, Sort::Import);
+                            if let Some(xx) = es.get(&n.0.0) {
+                                self.add_usage(**xx, n.0.1, Sort::Import);
                                 Some(**xx)
                             } else {
                                 self.errors.push(NRerrors::NotExportedOrDoesNotExist(
-                                    from, Term, n.0 .0, n.0 .1,
+                                    from, Term, n.0.0, n.0.1,
                                 ));
                                 None
                             }
@@ -891,7 +889,7 @@ impl<'s> N<'s> {
                     Export::ConstructorsSome(*name, cs)
                 } else {
                     self.errors.push(NRerrors::NotExportedOrDoesNotExist(
-                        from, Type, x.0 .0, x.0 .1,
+                        from, Type, x.0.0, x.0.1,
                     ));
                     return None;
                 }
@@ -914,66 +912,66 @@ impl<'s> N<'s> {
         // requires more sophisticated checking. (Or just returning None if it's a catch-all?)
         match dec {
             ast::Decl::DataKind(d, _) => {
-                self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Type, d.0.0, d.0.1, dec.span(), is_redecl);
             }
             ast::Decl::Data(d, _, cs) => {
-                self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Type, d.0.0, d.0.1, dec.span(), is_redecl);
                 let mut cons = BTreeSet::new();
                 for c in cs {
-                    self.def_global(Term, c.0 .0 .0, c.0 .0 .1, c.0 .0 .1, false);
-                    cons.insert(Name(Term, self.me, c.0 .0 .0, Visibility::Public));
+                    self.def_global(Term, c.0.0.0, c.0.0.1, c.0.0.1, false);
+                    cons.insert(Name(Term, self.me, c.0.0.0, Visibility::Public));
                 }
                 self.constructors
-                    .insert(Name(Type, self.me, d.0 .0, Visibility::Public), cons);
+                    .insert(Name(Type, self.me, d.0.0, Visibility::Public), cons);
             }
             ast::Decl::TypeKind(d, _) => {
-                self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Type, d.0.0, d.0.1, dec.span(), is_redecl);
             }
             ast::Decl::Type(d, _, _) => {
-                self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Type, d.0.0, d.0.1, dec.span(), is_redecl);
                 // Bug compatible with the Purs-compiler
                 self.constructors.insert(
-                    Name(Type, self.me, d.0 .0, Visibility::Public),
+                    Name(Type, self.me, d.0.0, Visibility::Public),
                     BTreeSet::new(),
                 );
             }
             ast::Decl::NewTypeKind(d, _) => {
-                self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Type, d.0.0, d.0.1, dec.span(), is_redecl);
             }
             ast::Decl::NewType(d, _, c, _) => {
-                self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
-                self.def_global(Term, c.0 .0, c.0 .1, c.0 .1, false);
+                self.def_global(Type, d.0.0, d.0.1, dec.span(), is_redecl);
+                self.def_global(Term, c.0.0, c.0.1, c.0.1, false);
                 self.constructors.insert(
-                    Name(Type, self.me, d.0 .0, Visibility::Public),
-                    [Name(Term, self.me, c.0 .0, Visibility::Public)].into(),
+                    Name(Type, self.me, d.0.0, Visibility::Public),
+                    [Name(Term, self.me, c.0.0, Visibility::Public)].into(),
                 );
             }
             ast::Decl::ClassKind(d, _) => {
-                self.def_global(Class, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Class, d.0.0, d.0.1, dec.span(), is_redecl);
             }
             ast::Decl::Class(_, d, _, _, mem) => {
-                self.def_global(Class, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Class, d.0.0, d.0.1, dec.span(), is_redecl);
                 for mem @ ast::ClassMember(name, _) in mem.iter() {
-                    self.def_global(Term, name.0 .0, name.0 .1, mem.span(), false);
+                    self.def_global(Term, name.0.0, name.0.1, mem.span(), false);
                 }
             }
             ast::Decl::Foreign(d, _) => {
-                self.def_global(Term, d.0 .0, d.0 .1, dec.span(), false);
+                self.def_global(Term, d.0.0, d.0.1, dec.span(), false);
             }
             ast::Decl::ForeignData(d, _) => {
-                self.def_global(Type, d.0 .0, d.0 .1, dec.span(), false);
+                self.def_global(Type, d.0.0, d.0.1, dec.span(), false);
             }
             ast::Decl::Fixity(_, _, _, o) => {
-                self.def_global(Term, o.0 .0, o.0 .1, dec.span(), false);
+                self.def_global(Term, o.0.0, o.0.1, dec.span(), false);
             }
             ast::Decl::FixityTyp(_, _, _, o) => {
-                self.def_global(Type, o.0 .0, o.0 .1, dec.span(), false);
+                self.def_global(Type, o.0.0, o.0.1, dec.span(), false);
             }
             ast::Decl::Sig(d, _) => {
-                self.def_global(Term, d.0 .0, d.0 .1, dec.span(), false);
+                self.def_global(Term, d.0.0, d.0.1, dec.span(), false);
             }
             ast::Decl::Def(d, _, _) => {
-                self.def_global(Term, d.0 .0, d.0 .1, dec.span(), is_redecl);
+                self.def_global(Term, d.0.0, d.0.1, dec.span(), is_redecl);
             }
             ast::Decl::Instance(_, _, _) => (),
             ast::Decl::Derive(_, _) => (),
@@ -1108,7 +1106,7 @@ impl<'s> N<'s> {
         for c in cs.iter().flatten() {
             self.constraint(c);
         }
-        self.resolveq(Class, d.0, d.1 .0)
+        self.resolveq(Class, d.0, d.1.0)
     }
 
     #[instrument(skip(self, b))]
@@ -1130,8 +1128,8 @@ impl<'s> N<'s> {
             }
         };
         if let Some(n) = u {
-            let span = l.0 .1;
-            let name = Name(Term, n.module(), l.0 .0, Visibility::Public);
+            let span = l.0.1;
+            let name = Name(Term, n.module(), l.0.0, Visibility::Public);
             self.add_usage(name, span, Sort::Ref);
         }
     }
@@ -1172,7 +1170,7 @@ impl<'s> N<'s> {
             }
             ast::Expr::Op(a, o, b) => {
                 self.expr(a);
-                self.resolveq(Term, o.0, o.1 .0);
+                self.resolveq(Term, o.0, o.1.0);
                 self.expr(b);
             }
             ast::Expr::Infix(a, o, b) => {
@@ -1311,13 +1309,13 @@ impl<'s> N<'s> {
             ast::Expr::Section(_) => (),
             ast::Expr::Hole(_) => (),
             ast::Expr::Ident(v) => {
-                self.resolveq(Term, v.0, v.1 .0);
+                self.resolveq(Term, v.0, v.1.0);
             }
             ast::Expr::Constructor(v) => {
-                self.resolveq(Term, v.0, v.1 .0);
+                self.resolveq(Term, v.0, v.1.0);
             }
             ast::Expr::Symbol(v) => {
-                self.resolveq(Term, v.0, v.1 .0);
+                self.resolveq(Term, v.0, v.1.0);
             }
             ast::Expr::Boolean(_) => (),
             ast::Expr::Char(_) => (),
@@ -1352,11 +1350,11 @@ impl<'s> N<'s> {
             for v in vs {
                 match v {
                     ast::LetBinding::Sig(l, _) => {
-                        self.def_local(Term, l.0 .0, l.0 .1, l.0 .1);
+                        self.def_local(Term, l.0.0, l.0.1, l.0.1);
                         break;
                     }
                     ast::LetBinding::Name(l, _, _) => {
-                        self.def_local(Term, l.0 .0, l.0 .1, l.0 .1);
+                        self.def_local(Term, l.0.0, l.0.1, l.0.1);
                         break;
                     }
                     ast::LetBinding::Pattern(_, _) => {}
@@ -1419,19 +1417,19 @@ impl<'s> N<'s> {
             }
             ast::Binder::Op(a, o, b) => {
                 self.binder(a);
-                self.resolveq(Term, o.0, o.1 .0);
+                self.resolveq(Term, o.0, o.1.0);
                 self.binder(b);
             }
             ast::Binder::Wildcard(_) => (),
             ast::Binder::Var(name) => {
-                self.def_local(Term, name.0 .0, name.0 .1, name.0 .1);
+                self.def_local(Term, name.0.0, name.0.1, name.0.1);
             }
             ast::Binder::Named(name, b) => {
-                self.def_local(Term, name.0 .0, name.0 .1, name.0 .1);
+                self.def_local(Term, name.0.0, name.0.1, name.0.1);
                 self.binder(b);
             }
             ast::Binder::Constructor(c) => {
-                self.resolveq(Term, c.0, c.1 .0);
+                self.resolveq(Term, c.0, c.1.0);
             }
             ast::Binder::Boolean(_) => (),
             ast::Binder::Char(_) => (),
@@ -1447,7 +1445,7 @@ impl<'s> N<'s> {
                     match b {
                         ast::RecordLabelBinder::Pun(l) => {
                             self.label(ast::Label(l.0));
-                            self.def_local(Term, l.0 .0, l.0 .1, l.0 .1);
+                            self.def_local(Term, l.0.0, l.0.1, l.0.1);
                         }
                         ast::RecordLabelBinder::Field(l, b) => {
                             self.label(*l);
@@ -1464,7 +1462,7 @@ impl<'s> N<'s> {
 
     #[instrument(skip(self, ts))]
     fn constraint(&mut self, ast::Constraint(c, ts): &ast::Constraint) {
-        self.resolveq(Class, c.0, c.1 .0);
+        self.resolveq(Class, c.0, c.1.0);
         for t in ts.iter() {
             self.typ(t);
         }
@@ -1484,8 +1482,8 @@ impl<'s> N<'s> {
             }
 
             ast::Typ::Var(v) => {
-                if self.find_local(Type, v.0 .0).is_none() {
-                    self.def_local(Type, v.0 .0, v.0 .1, v.0 .1);
+                if self.find_local(Type, v.0.0).is_none() {
+                    self.def_local(Type, v.0.0, v.0.1, v.0.1);
                 } else {
                     self.resolve(Type, None, v.0);
                 }
@@ -1539,10 +1537,10 @@ impl<'s> N<'s> {
                 self.resolve(Type, None, v.0);
             }
             ast::Typ::Constructor(v) => {
-                self.resolveq(Type, v.0, v.1 .0);
+                self.resolveq(Type, v.0, v.1.0);
             }
             ast::Typ::Symbol(v) => {
-                self.resolveq(Type, v.0, v.1 .0);
+                self.resolveq(Type, v.0, v.1.0);
             }
             ast::Typ::Str(l) => {
                 self.label(ast::Label(l.0));
@@ -1563,7 +1561,7 @@ impl<'s> N<'s> {
                 // Has to be handled by caller
                 // let sf = self.push();
                 for x in xs.iter() {
-                    self.def_local(Type, x.0 .0 .0, x.0 .0 .1, x.0 .0 .1);
+                    self.def_local(Type, x.0.0.0, x.0.0.1, x.0.0.1);
                 }
                 self.typ(t);
                 // self.pop(sf);
@@ -1582,7 +1580,7 @@ impl<'s> N<'s> {
             }
             ast::Typ::Op(a, o, b) => {
                 self.typ(a);
-                self.resolveq(Type, o.0, o.1 .0);
+                self.resolveq(Type, o.0, o.1.0);
                 self.typ(b);
             }
             ast::Typ::Constrained(c, t) => {
@@ -1603,7 +1601,7 @@ impl<'s> N<'s> {
     #[instrument(skip(self, xs))]
     fn typ_var_bindings(&mut self, xs: &[ast::TypVarBinding]) {
         for ast::TypVarBinding(x, k, _) in xs {
-            self.def_local(Type, x.0 .0, x.0 .1, x.0 .1);
+            self.def_local(Type, x.0.0, x.0.1, x.0.1);
             if let Some(k) = k {
                 self.typ(k);
             }
@@ -1613,8 +1611,8 @@ impl<'s> N<'s> {
     #[instrument(skip(self, f))]
     fn label(&mut self, f: ast::Label) {
         self.add_usage(
-            Name(Scope::Label, ast::Ud::zero(), f.0 .0, Visibility::Public),
-            f.0 .1,
+            Name(Scope::Label, ast::Ud::zero(), f.0.0, Visibility::Public),
+            f.0.1,
             Sort::Ref,
         )
     }
@@ -1658,11 +1656,11 @@ pub fn resolve_names(n: &mut N, prim: ast::Ud, m: &ast::Module) -> Option<ast::U
     // You still get syntax errors - but without a module-header we can't verify the names in
     // the module. This is annoying and could possibly be fixed.
     if let Some(h) = m.0.as_ref() {
-        let name = h.0 .0 .0;
+        let name = h.0.0.0;
         n.me = name;
         n.exports
             .push(Export::Just(Name(Module, name, name, Visibility::Public)));
-        n.def_global(Module, h.0 .0 .0, h.0 .0 .1, h.0 .0 .1, true);
+        n.def_global(Module, h.0.0.0, h.0.0.1, h.0.0.1, true);
         // Inject the Prim import
         n.import(&ast::ImportDecl {
             start: ast::Span::Zero,
@@ -1705,7 +1703,7 @@ pub fn resolve_names(n: &mut N, prim: ast::Ud, m: &ast::Module) -> Option<ast::U
             n.check_names_for_unused();
         }
 
-        Some(h.0 .0 .0)
+        Some(h.0.0.0)
     } else {
         None
     }
