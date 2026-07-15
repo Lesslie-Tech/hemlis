@@ -1162,6 +1162,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_unused_constructors_from_import() {
+        // import Lib (MyType(..)) but only the type is used (in a signature), never a
+        // constructor → offer a code action that drops the (..). (PAY-3260)
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                data MyType = Foo | Bar
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (MyType(..))
+                            ^ RemoveUnusedConstructors
+
+                foo :: MyType -> MyType
+                foo x = x
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (MyType)
+
+                foo :: MyType -> MyType
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remove_unused_constructors_single_constructor_data() {
+        // A single-constructor `data` type (not a newtype, so not Coercible) used only as a type:
+        // dropping `(..)` is safe. Mirrors Money.StarBuck. (PAY-3260)
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                data StarBuck = StarBuck Int
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (StarBuck(..))
+                                    ^ RemoveUnusedConstructors
+
+                foo :: StarBuck -> StarBuck
+                foo x = x
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (StarBuck)
+
+                foo :: StarBuck -> StarBuck
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn keep_newtype_constructors_in_import() {
+        // A `newtype` may need its constructor imported for `Coercible`/`Data.Newtype` even when
+        // never named syntactically, so we must NOT suggest removing `(..)`. (PAY-3260)
+        assert_no_code_action(indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                newtype Wrapper = Wrapper Int
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (Wrapper(..))
+                            ^ RemoveUnusedConstructors
+
+                foo :: Wrapper -> Wrapper
+                foo x = x
+            "})
+        .await;
+    }
+
+    #[tokio::test]
     async fn style_replace_forbidden_operator_bind_reverse() {
         assert_code_action(
             indoc! {"
@@ -2932,6 +3018,10 @@ impl LanguageServer for Backend {
                         per_item_unused.push(*at);
                     }
                 }
+                // Dropping the unused `(..)` from an import is part of "burn all unused imports".
+                Fixable::RemoveUnusedConstructors(at) => {
+                    delete_all.push(span_to_range(at));
+                }
                 _ => (),
             }
         }
@@ -3191,12 +3281,15 @@ impl LanguageServer for Backend {
                                 // is_ctor: whether import_name is a type containing a constructor
                                 let (usage_name, import_name, is_ctor): (nr::Name, nr::Name, bool) =
                                     match export {
-                                        Export::ConstructorsSome(parent, constructors)
-                                        | Export::ConstructorsAll(parent, constructors) => {
+                                        Export::ConstructorsSome(parent, constructors, _)
+                                        | Export::ConstructorsAll(parent, constructors, _) => {
                                             if parent.name() == name_ud && parent.scope() == *s {
-                                                // The type itself matched — import with (..) so
-                                                // constructors are available too.
-                                                (*parent, *parent, true)
+                                                // The type itself is what's used (e.g. in a type
+                                                // signature) — import just the type, without its
+                                                // constructors. We only pull in constructors when a
+                                                // constructor is actually used (branch below).
+                                                // (PAY-3260)
+                                                (*parent, *parent, false)
                                             } else if let Some(c) = constructors.iter().find(|c| {
                                                 c.name() == name_ud
                                                     && c.scope() == *s
@@ -3515,6 +3608,22 @@ impl LanguageServer for Backend {
                             [(
                                 uri.clone(),
                                 vec![TextEdit::new(span_to_range(expr_span), replacement.clone())],
+                            )]
+                            .into(),
+                        )),
+                        is_preferred: Some(true),
+                        ..CodeAction::default()
+                    })
+                }
+                Fixable::RemoveUnusedConstructors(del_span) => {
+                    out.push(CodeAction {
+                        title: "RemoveUnusedConstructors".into(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit::new(
+                            [(
+                                uri.clone(),
+                                vec![TextEdit::new(span_to_range(del_span), "".into())],
                             )]
                             .into(),
                         )),
@@ -3923,6 +4032,8 @@ enum Fixable {
     RenameWithUnderscore(ast::Span),
     /// Replace an expression span with new text. (expr_span, title, replacement, optional_warning)
     ReplaceExpression(ast::Span, String, String, Option<String>),
+    /// Delete the `(..)`/constructor-list region of an import, keeping just the type. (PAY-3260)
+    RemoveUnusedConstructors(ast::Span),
 }
 
 /// Check if a binder is a simple variable (possibly with a type annotation).
@@ -4120,6 +4231,12 @@ fn nrerror_turn_into_fixables(error: &NRerrors) -> Vec<(ast::Span, Fixable)> {
         | NRerrors::UnusedImportedConstructor(_, s)
         | NRerrors::UnusedImportTypeAndConstructor(_, _, s) => {
             vec![(*s, Fixable::DeleteUnusedImport(*s))]
+        }
+
+        // `import M (Type(..))` where only the type is used: offer to drop the constructor list by
+        // deleting the `(..)` region. Anchored at the type name. (PAY-3260)
+        NRerrors::UnusedImportedConstructorsAll(_, name_span, del_span) => {
+            vec![(*name_span, Fixable::RemoveUnusedConstructors(*del_span))]
         }
 
         NRerrors::UnusedImportQualified(_, s) | NRerrors::UnusedImportUnqualified(_, s) => {
@@ -4340,6 +4457,16 @@ pub fn nrerror_turn_into_diagnostic(
             "UnusedImportTypeAndConstructor".into(),
             format!(
                 "Both type and constructors for {} are unused",
+                format_name(None, ud, names),
+            ),
+            Vec::new(),
+        ),
+
+        NRerrors::UnusedImportedConstructorsAll(ud, name_s, _) => create_warning(
+            name_s,
+            "UnusedImportedConstructorsAll".into(),
+            format!(
+                "The constructors of {} are imported but never used",
                 format_name(None, ud, names),
             ),
             Vec::new(),

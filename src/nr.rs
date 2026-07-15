@@ -57,20 +57,23 @@ use Scope::*;
 
 #[derive(Debug, Clone, Hash, Ord, PartialOrd, Eq, PartialEq)]
 pub enum Export {
-    ConstructorsSome(Name, Vec<Name>),
-    ConstructorsAll(Name, Vec<Name>),
+    // The trailing bool is `is_newtype`: whether the type was declared with `newtype` (exactly one
+    // constructor, and `Coercible`). It is deliberately left out of `show()` so snapshots are
+    // unaffected. (PAY-3260)
+    ConstructorsSome(Name, Vec<Name>, bool),
+    ConstructorsAll(Name, Vec<Name>, bool),
     Just(Name),
 }
 
 impl Export {
     pub fn show<'a>(&'a self, f: &'a impl Fn(&'a ast::Ud) -> String) -> String {
         match self {
-            Export::ConstructorsSome(name, vec) => format!(
+            Export::ConstructorsSome(name, vec, _) => format!(
                 "ConstructorsSome {} {:?}",
                 name.show::<'a>(f),
                 vec.iter().map(|n| n.show::<'a>(f)).collect::<Vec<_>>()
             ),
-            Export::ConstructorsAll(name, vec) => format!(
+            Export::ConstructorsAll(name, vec, _) => format!(
                 "ConstructorsAll {} {:?}",
                 name.show(f),
                 vec.iter().map(|n| n.show(f)).collect::<Vec<_>>()
@@ -81,7 +84,7 @@ impl Export {
 
     pub fn contains(&self, name: Name) -> bool {
         match self {
-            Export::ConstructorsSome(n, xs) | Export::ConstructorsAll(n, xs) => {
+            Export::ConstructorsSome(n, xs, _) | Export::ConstructorsAll(n, xs, _) => {
                 *n == name || xs.contains(&name)
             }
             Export::Just(n) => *n == name,
@@ -90,7 +93,7 @@ impl Export {
 
     pub fn to_names(&self) -> Vec<Name> {
         match self {
-            Export::ConstructorsAll(n, xs) | Export::ConstructorsSome(n, xs) => {
+            Export::ConstructorsAll(n, xs, _) | Export::ConstructorsSome(n, xs, _) => {
                 [vec![*n], xs.to_vec()].concat()
             }
             Export::Just(n) => vec![*n],
@@ -119,6 +122,10 @@ pub enum NRerrors {
     UnusedImportUnqualified(ast::Ud, ast::Span),
     UnusedImportedConstructor(ast::Ud, ast::Span),
     UnusedImportTypeAndConstructor(ast::Ud, Vec<Name>, ast::Span),
+    // `import M (Type(..))` / `import M (Type(A, B))` where the type is used but none of its
+    // constructors are. The first span is the type name (where the diagnostic/action anchors),
+    // the second is the region to delete to drop the constructor list. (PAY-3260)
+    UnusedImportedConstructorsAll(ast::Ud, ast::Span, ast::Span),
     UnusedLocal(Name, ast::Span),
     UnusedDefinition(Name, DefineSpans),
     UnusedConstructor(Name, ast::Span),
@@ -180,6 +187,16 @@ pub struct N<'s> {
 
     pub constructors: BTreeMap<Name, BTreeSet<Name>>,
 
+    // Type Names that were declared with `newtype` (as opposed to `data`). Used to keep `(..)`
+    // when the type may be needed for `Coercible`/`Data.Newtype`. (PAY-3260)
+    pub newtypes: BTreeSet<Name>,
+
+    // Type constructor Uds that appear in a `derive`/`derive newtype` head in this module.
+    // Standalone deriving (e.g. `derive instance Generic MyType _`) requires the type's data
+    // constructors to be in scope even though they are never named syntactically, so we must not
+    // suggest removing `(..)` for such a type. (PAY-3260)
+    pub derived_types: BTreeSet<ast::Ud>,
+
     pub defines: BTreeMap<Name, DefineSpans>,
     pub locals: Vec<Name>,
     pub imports: BTreeMap<Option<ast::Ud>, BTreeMap<ast::Ud, Vec<Export>>>,
@@ -201,6 +218,8 @@ impl<'s> N<'s> {
             resolved: BTreeMap::new(),
             exports: Vec::new(),
             constructors: BTreeMap::new(),
+            newtypes: BTreeSet::new(),
+            derived_types: BTreeSet::new(),
             imports: BTreeMap::new(),
             defines: BTreeMap::new(),
             locals: Vec::new(),
@@ -270,8 +289,8 @@ impl<'s> N<'s> {
                 let is_used = |scope: Scope, x: ast::Ud| -> bool {
                     valid.iter().any(|n| match n {
                         Export::Just(name)
-                        | Export::ConstructorsSome(name, _)
-                        | Export::ConstructorsAll(name, _)
+                        | Export::ConstructorsSome(name, _, _)
+                        | Export::ConstructorsAll(name, _, _)
                             if name.is(scope, x) =>
                         {
                             self.is_used(name)
@@ -304,35 +323,56 @@ impl<'s> N<'s> {
                         }
                     }
                     ast::Import::TypDat(_s, proper_name, data_member) => {
-                        if let Some((ty_unused, fields)) = valid.iter().find_map(|n| match n {
-                            Export::ConstructorsSome(name, fields)
-                            | Export::ConstructorsAll(name, fields)
-                                if name.is(Type, proper_name.0.0) =>
-                            {
-                                Some((!self.is_used(name), fields))
-                            }
-                            _ => None,
-                        }) {
+                        if let Some((ty_unused, fields, is_newtype)) =
+                            valid.iter().find_map(|n| match n {
+                                Export::ConstructorsSome(name, fields, is_newtype)
+                                | Export::ConstructorsAll(name, fields, is_newtype)
+                                    if name.is(Type, proper_name.0.0) =>
+                                {
+                                    Some((!self.is_used(name), fields, *is_newtype))
+                                }
+                                _ => None,
+                            })
+                        {
                             match data_member {
-                                ast::DataMember::All(_) => {
+                                ast::DataMember::All(all_span) => {
                                     let all_unused = fields.iter().all(|name| !self.is_used(name));
-                                    // NOTE: This case cannot be handled by simple
-                                    // syntactical-analysis alone. We need to know about different
-                                    // kinds of requirements from e.g. `class Newtype` which
-                                    // requires the constructors to be in scope.
-                                    //
-                                    // if all_unused && !ty_unused {
-                                    //     self.errors.push(NRerrors::Unused(
-                                    //         "All constructors are unused".into(),
-                                    //         *s,
-                                    //     ));
-                                    // } else
                                     if all_unused && ty_unused {
                                         self.errors.push(NRerrors::UnusedImportTypeAndConstructor(
                                             proper_name.0.0,
                                             fields.clone(),
                                             import.span(),
                                         ));
+                                    } else if all_unused
+                                        // Only offer to drop `(..)` when it is safe to do so
+                                        // syntactically. A `newtype` may need its constructor in
+                                        // scope for `Coercible`/`Data.Newtype`, and a type that is
+                                        // standalone-`derive`d here needs its constructors too —
+                                        // neither names the constructor, so we keep `(..)` in those
+                                        // cases. A `data` type that is never derived is safe,
+                                        // regardless of how many constructors it has. (PAY-3260)
+                                        && !is_newtype
+                                        && !self.derived_types.contains(&proper_name.0.0)
+                                    {
+                                        is_entire_thing_unused = false;
+                                        let del_span = match (&proper_name.0.1, all_span) {
+                                            (
+                                                ast::Span::Known(fi, _, name_hi),
+                                                ast::Span::Known(_, _, all_hi),
+                                            ) => ast::Span::Known(*fi, *name_hi, *all_hi),
+                                            _ => *all_span,
+                                        };
+                                        // Anchor the diagnostic/action over the whole `Type(..)`
+                                        // so it triggers with the cursor anywhere on it, including
+                                        // the `(..)`. The deletion itself only removes the `(..)`.
+                                        let anchor_span = proper_name.0.1.merge(*all_span);
+                                        self.errors.push(
+                                            NRerrors::UnusedImportedConstructorsAll(
+                                                proper_name.0.0,
+                                                anchor_span,
+                                                del_span,
+                                            ),
+                                        );
                                     } else {
                                         is_entire_thing_unused = false;
                                     }
@@ -608,8 +648,11 @@ impl<'s> N<'s> {
                     }
                     Some(ms) => ms.clone(),
                 };
+                let is_newtype = self.newtypes.contains(&x);
                 let out = match ds {
-                    ast::DataMember::All(_) => ConstructorsAll(x, ms.iter().copied().collect()),
+                    ast::DataMember::All(_) => {
+                        ConstructorsAll(x, ms.iter().copied().collect(), is_newtype)
+                    }
                     ast::DataMember::Some(ns) => ConstructorsSome(
                         x,
                         ns.iter()
@@ -626,6 +669,7 @@ impl<'s> N<'s> {
                                 }
                             })
                             .collect(),
+                        is_newtype,
                     ),
                 };
                 self.exports.push(out);
@@ -689,6 +733,7 @@ impl<'s> N<'s> {
                 self.exports.push(Export::ConstructorsAll(
                     *name,
                     co.iter().copied().collect::<Vec<_>>(),
+                    self.newtypes.contains(name),
                 ))
             } else if !cs.contains(name) {
                 self.exports.push(Export::Just(*name))
@@ -816,8 +861,8 @@ impl<'s> N<'s> {
         let mut export_as = |scope: Scope, x: ast::Ud, s: ast::Span| -> Option<Export> {
             if let out @ Some(_) = valid.iter().find_map(|n| match n {
                 Export::Just(name)
-                | Export::ConstructorsSome(name, _)
-                | Export::ConstructorsAll(name, _)
+                | Export::ConstructorsSome(name, _, _)
+                | Export::ConstructorsAll(name, _, _)
                     if name.is(scope, x) =>
                 {
                     self.add_usage(*name, s, Sort::Import);
@@ -842,7 +887,8 @@ impl<'s> N<'s> {
             ast::Import::TypDat(_, x, ast::DataMember::All(_)) => {
                 if let Some(out) = valid.iter().find_map(|n| match n {
                     out
-                    @ (Export::ConstructorsSome(name, _) | Export::ConstructorsAll(name, _))
+                    @ (Export::ConstructorsSome(name, _, _)
+                        | Export::ConstructorsAll(name, _, _))
                         if name.is(Type, x.0.0) =>
                     {
                         self.add_usage(*name, x.0.1, Sort::Import);
@@ -859,12 +905,13 @@ impl<'s> N<'s> {
                 }
             }
             ast::Import::TypDat(_, x, ast::DataMember::Some(cs)) => {
-                if let Some((name, es)) = valid.iter().find_map(|n| match n {
-                    Export::ConstructorsSome(name, cs) | Export::ConstructorsAll(name, cs)
+                if let Some((name, es, is_newtype)) = valid.iter().find_map(|n| match n {
+                    Export::ConstructorsSome(name, cs, is_newtype)
+                    | Export::ConstructorsAll(name, cs, is_newtype)
                         if name.is(Type, x.0.0) =>
                     {
                         self.add_usage(*name, x.0.1, Sort::Import);
-                        Some((name, cs))
+                        Some((name, cs, *is_newtype))
                     }
                     _ => None,
                 }) {
@@ -886,7 +933,7 @@ impl<'s> N<'s> {
                             }
                         })
                         .collect();
-                    Export::ConstructorsSome(*name, cs)
+                    Export::ConstructorsSome(*name, cs, is_newtype)
                 } else {
                     self.errors.push(NRerrors::NotExportedOrDoesNotExist(
                         from, Type, x.0.0, x.0.1,
@@ -941,8 +988,10 @@ impl<'s> N<'s> {
             ast::Decl::NewType(d, _, c, _) => {
                 self.def_global(Type, d.0.0, d.0.1, dec.span(), is_redecl);
                 self.def_global(Term, c.0.0, c.0.1, c.0.1, false);
+                let ty = Name(Type, self.me, d.0.0, Visibility::Public);
+                self.newtypes.insert(ty);
                 self.constructors.insert(
-                    Name(Type, self.me, d.0.0, Visibility::Public),
+                    ty,
                     [Name(Term, self.me, c.0.0, Visibility::Public)].into(),
                 );
             }
@@ -1049,6 +1098,11 @@ impl<'s> N<'s> {
                 self.pop(sf, bindings.span());
             }
             ast::Decl::Derive(_, head) => {
+                // Record which types are derived for; their constructors must stay imported even
+                // if never named syntactically. (PAY-3260)
+                for t in head.2.iter() {
+                    collect_typ_constructors(t, &mut self.derived_types);
+                }
                 let sf = self.push();
                 let _u = self.inst_head(head);
                 self.pop(sf, head.span());
@@ -1706,6 +1760,28 @@ pub fn resolve_names(n: &mut N, prim: ast::Ud, m: &ast::Module) -> Option<ast::U
         Some(h.0.0.0)
     } else {
         None
+    }
+}
+
+// Collect the type constructor Uds mentioned in a type (used to find the types named in a
+// `derive` head). Over-approximates by gathering every constructor it can see. (PAY-3260)
+fn collect_typ_constructors(t: &ast::Typ, out: &mut BTreeSet<ast::Ud>) {
+    match t {
+        ast::Typ::Constructor(q) => {
+            out.insert(q.1 .0 .0);
+        }
+        ast::Typ::App(a, b) | ast::Typ::Arr(a, b) | ast::Typ::Kinded(a, b) => {
+            collect_typ_constructors(a, out);
+            collect_typ_constructors(b, out);
+        }
+        ast::Typ::Op(a, _, b) => {
+            collect_typ_constructors(a, out);
+            collect_typ_constructors(b, out);
+        }
+        ast::Typ::Paren(_, a, _) | ast::Typ::Forall(_, a) | ast::Typ::Constrained(_, a) => {
+            collect_typ_constructors(a, out)
+        }
+        _ => {}
     }
 }
 
