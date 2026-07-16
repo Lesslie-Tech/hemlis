@@ -1098,11 +1098,12 @@ fn expr_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Expr> {
             } else {
                 None
             };
+            let kw = p.span();
             kw_ado(p)?;
             let ds = sep_until_(p, "ado-block", do_statement)?;
             kw_in(p)?;
             let e = expr(p)?;
-            Some(Expr::Ado(q, ds, b!(e)))
+            Some(Expr::Ado(q, kw, ds, b!(e)))
         }
         (Some(T::Qual(_)), Some(T::Do)) | (Some(T::Do), _) => {
             let q = if matches!(p.peekt(), Some(T::Qual(_))) {
@@ -1110,9 +1111,10 @@ fn expr_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Expr> {
             } else {
                 None
             };
+            let kw = p.span();
             kw_do(p)?;
             let ds = sep_until_(p, "do-block", do_statement)?;
-            Some(Expr::Do(q, ds))
+            Some(Expr::Do(q, kw, ds))
         }
         (Some(T::Slash), _) => {
             let start = p.span();

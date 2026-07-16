@@ -429,9 +429,18 @@ mod tests {
         let _ = service.call(req).await;
     }
 
+    /// Shared store of the most recent diagnostics published per document URI.
+    type DiagStore = std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Vec<tower_lsp_server::ls_types::Diagnostic>>,
+        >,
+    >;
+
     /// Build a Backend wrapped in an LspService, with an auto-responder
     /// for server→client requests (workspace_folders, registerCapability, etc.).
-    fn build_test_service() -> super::LspService<super::Backend> {
+    /// Also returns a store that captures `textDocument/publishDiagnostics`
+    /// notifications, keyed by document URI.
+    fn build_test_service() -> (super::LspService<super::Backend>, DiagStore) {
         let (exports, prim, names) = hemlis_lib::build_builtins();
         let (service, socket) = super::LspService::build(|client| super::Backend {
             client,
@@ -464,12 +473,30 @@ mod tests {
         })
         .finish();
 
-        // Spawn a task to auto-respond to server→client requests.
+        // Spawn a task to auto-respond to server→client requests and to
+        // capture published diagnostics.
         use futures::StreamExt as _;
         let (mut req_stream, mut resp_sink) = socket.split();
+        let diagnostics: DiagStore = Default::default();
+        let diagnostics_sink = diagnostics.clone();
         tokio::spawn(async move {
             use futures::SinkExt as _;
             while let Some(req) = req_stream.next().await {
+                // Capture diagnostics notifications (no id).
+                if req.method() == "textDocument/publishDiagnostics" {
+                    if let Some(params) = req.params() {
+                        if let Ok(p) = serde_json::from_value::<
+                            tower_lsp_server::ls_types::PublishDiagnosticsParams,
+                        >(params.clone())
+                        {
+                            diagnostics_sink
+                                .lock()
+                                .unwrap()
+                                .insert(p.uri.as_str().to_string(), p.diagnostics);
+                        }
+                    }
+                    continue;
+                }
                 if let Some(id) = req.id().cloned() {
                     // workspace/workspaceFolders → respond with []
                     // client/registerCapability → respond with null
@@ -485,7 +512,7 @@ mod tests {
             }
         });
 
-        service
+        (service, diagnostics)
     }
 
     /// Run a code action test: parse source, trigger code actions at a position,
@@ -532,6 +559,59 @@ mod tests {
         }
 
         (source, target_line, caret_col, action_title)
+    }
+
+    /// Parse a source string containing a `~~~ Warning message` marker line.
+    /// The run of `~` is visually aligned under the exact span of the warning
+    /// on the preceding content line; any text after the last `~` (and a space)
+    /// is the expected warning message. The message is optional — for
+    /// no-warning assertions the run of `~` can stand alone.
+    /// Returns (source_without_marker, line, start_col, end_col, message), where
+    /// the columns are byte offsets into the content line.
+    fn parse_warning_marker(source: &str) -> (String, u32, u32, u32, String) {
+        let lines: Vec<&str> = source.lines().collect();
+        let (marker_idx, marker_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with('~') && trimmed.len() > 1
+            })
+            .expect("Source must contain a `~~~ Warning message` marker line");
+
+        // Visual columns of the first and last `~` in the run.
+        let first_tilde = marker_line.find('~').unwrap();
+        let last_tilde = marker_line.rfind('~').unwrap();
+
+        let message = marker_line[last_tilde + 1..].trim().to_string();
+
+        let target_line = (marker_idx - 1) as u32;
+        let content_line = lines[marker_idx - 1];
+
+        // Map visual columns to byte offsets in the (possibly multibyte) content line.
+        let to_byte = |visual: usize| -> u32 {
+            content_line
+                .char_indices()
+                .nth(visual)
+                .map(|(byte_idx, _)| byte_idx)
+                .unwrap_or(content_line.len()) as u32
+        };
+        let start_col = to_byte(first_tilde);
+        // The end column is exclusive: the byte offset just past the last `~`.
+        let end_col = to_byte(last_tilde + 1);
+
+        let cleaned: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != marker_idx)
+            .map(|(_, l)| *l)
+            .collect();
+        let mut source = cleaned.join("\n");
+        if !source.is_empty() {
+            source.push('\n');
+        }
+
+        (source, target_line, start_col, end_col, message)
     }
 
     /// Split a test string into multiple modules using `=== Filename.purs ===` separators.
@@ -582,7 +662,7 @@ mod tests {
         character: u32,
         action_title: &str,
     ) -> String {
-        let mut service = build_test_service();
+        let (mut service, _diagnostics) = build_test_service();
 
         // Initialize
         lsp_request(
@@ -785,7 +865,7 @@ mod tests {
         }
         ordered.push((files[target_idx].0.as_str(), files[target_idx].1.as_str()));
 
-        let mut service = build_test_service();
+        let (mut service, _diagnostics) = build_test_service();
 
         lsp_request(
             &mut service,
@@ -861,6 +941,215 @@ mod tests {
                 action_title, titles
             );
         }
+    }
+
+    /// Open a set of modules and return the diagnostics published for `target_file`.
+    /// Mirrors `run_code_action_multi`, but captures `publishDiagnostics` instead
+    /// of requesting code actions.
+    async fn run_diagnostics_multi(
+        files: &[(&str, &str)],
+        target_file: &str,
+    ) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+        let (mut service, diagnostics) = build_test_service();
+
+        // Initialize
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+
+        // Initialized (triggers has_started = true)
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+
+        // Give the server a moment to finish initialized handler
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Open all documents (non-target files first so their exports are available)
+        for (i, (name, source)) in files.iter().enumerate() {
+            let uri = format!("file:///{name}");
+            lsp_notify(
+                &mut service,
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "purescript",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            )
+            .await;
+
+            if i < files.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        // Give on_change time to parse + resolve + publish diagnostics for the last file.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let target_uri = format!("file:///{target_file}");
+        let store = diagnostics.lock().unwrap();
+        store.get(&target_uri).cloned().unwrap_or_default()
+    }
+
+    /// Given a `~~~ Warning message` marker, order the modules (dependencies
+    /// first, target last) and return the diagnostics for the target module,
+    /// along with the expected span and message parsed from the marker.
+    async fn diagnostics_for_marker(
+        source_with_marker: &str,
+    ) -> (
+        Vec<tower_lsp_server::ls_types::Diagnostic>,
+        super::Range,
+        String,
+    ) {
+        let modules = split_modules(source_with_marker);
+
+        let (target_idx, _) = modules
+            .iter()
+            .enumerate()
+            .find(|(_, (_, src))| {
+                src.lines()
+                    .any(|l| l.trim_start().starts_with('~') && l.trim_start().len() > 1)
+            })
+            .expect("One module must contain a `~~~ Warning message` marker line");
+
+        let (_, target_src) = &modules[target_idx];
+        let (cleaned_target, line, start_col, end_col, message) = parse_warning_marker(target_src);
+
+        let files: Vec<(String, String)> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, (name, src))| {
+                if i == target_idx {
+                    (name.clone(), cleaned_target.clone())
+                } else {
+                    (name.clone(), src.clone())
+                }
+            })
+            .collect();
+
+        let mut ordered: Vec<(&str, &str)> = Vec::new();
+        for (i, (name, src)) in files.iter().enumerate() {
+            if i != target_idx {
+                ordered.push((name.as_str(), src.as_str()));
+            }
+        }
+        ordered.push((files[target_idx].0.as_str(), files[target_idx].1.as_str()));
+
+        let diags = run_diagnostics_multi(&ordered, files[target_idx].0.as_str()).await;
+        let expected_range = super::Range {
+            start: super::Position::new(line, start_col),
+            end: super::Position::new(line, end_col),
+        };
+        (diags, expected_range, message)
+    }
+
+    /// Assert that a warning with the marked span and message is emitted.
+    /// The `~` run marks the exact span; the trailing text is the message.
+    async fn assert_warning(source_with_marker: &str) {
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
+        let (diags, expected_range, message) = diagnostics_for_marker(source_with_marker).await;
+        assert!(
+            !message.is_empty(),
+            "assert_warning requires a message after the `~` run"
+        );
+
+        let matched = diags.iter().any(|d| {
+            d.severity == Some(DiagnosticSeverity::WARNING)
+                && d.range == expected_range
+                && d.message == message
+        });
+        if !matched {
+            let found: Vec<_> = diags
+                .iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::WARNING))
+                .map(|d| (d.range, d.message.as_str()))
+                .collect();
+            panic!(
+                "Expected warning {:?} at {:?}, but found warnings: {:?}",
+                message, expected_range, found
+            );
+        }
+    }
+
+    /// Assert that NO warning is emitted at the marked span.
+    /// Only the `~` run is needed — any warning whose range equals the marked
+    /// span fails the assertion.
+    #[allow(dead_code)]
+    async fn assert_no_warning(source_with_marker: &str) {
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
+        let (diags, expected_range, _message) = diagnostics_for_marker(source_with_marker).await;
+
+        // Any warning that covers *any* character in the marked region fails.
+        // Compare the two half-open [start, end) position intervals for overlap.
+        let region_start = (expected_range.start.line, expected_range.start.character);
+        let region_end = (expected_range.end.line, expected_range.end.character);
+        let offending: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::WARNING))
+            .filter(|d| {
+                let warn_start = (d.range.start.line, d.range.start.character);
+                let warn_end = (d.range.end.line, d.range.end.character);
+                region_start < warn_end && warn_start < region_end
+            })
+            .map(|d| (d.range, d.message.as_str()))
+            .collect();
+        if !offending.is_empty() {
+            panic!(
+                "Expected no warning in region {:?}, but found: {:?}",
+                expected_range, offending
+            );
+        }
+    }
+
+    // --- PAY-3687: Warn on unqualified `do` / `ado` ---
+
+    #[tokio::test]
+    async fn style_warn_unqualified_do() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = do
+                ~~ Unqualified `do` block; use a qualified `Module.do`
+              pure unit
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_unqualified_ado() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = ado
+                ~~~ Unqualified `ado` block; use a qualified `Module.ado`
+              x <- pure unit
+              in x
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_qualified_do() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Effect as M
+
+            f = M.do
+                  ~~
+              pure unit
+        "})
+        .await;
     }
 
     #[tokio::test]
@@ -3631,6 +3920,8 @@ impl LanguageServer for Backend {
                         ..CodeAction::default()
                     })
                 }
+                // Warn-only diagnostics have no associated code action.
+                Fixable::Warn(_, _) => {}
             }
         }
         // Offer "Delete unused parameter" for unused function parameters
@@ -4032,6 +4323,8 @@ enum Fixable {
     RenameWithUnderscore(ast::Span),
     /// Replace an expression span with new text. (expr_span, title, replacement, optional_warning)
     ReplaceExpression(ast::Span, String, String, Option<String>),
+    /// Emit a warning at a span with no associated code action. (span, message)
+    Warn(ast::Span, String),
     /// Delete the `(..)`/constructor-list region of an import, keeping just the type. (PAY-3260)
     RemoveUnusedConstructors(ast::Span),
 }
@@ -4704,15 +4997,30 @@ impl Backend {
                                 style::check_module(m, source.value())
                                     .into_iter()
                                     .map(|sd| {
-                                        (
-                                            sd.cursor_span,
-                                            Fixable::ReplaceExpression(
+                                        let fixable = match sd.action {
+                                            style::StyleAction::Warn { message } => {
+                                                Fixable::Warn(sd.expr_span, message)
+                                            }
+                                            style::StyleAction::Fix { title, replacement } => {
+                                                Fixable::ReplaceExpression(
+                                                    sd.expr_span,
+                                                    title,
+                                                    replacement,
+                                                    None,
+                                                )
+                                            }
+                                            style::StyleAction::WarnAndFix {
+                                                message,
+                                                title,
+                                                replacement,
+                                            } => Fixable::ReplaceExpression(
                                                 sd.expr_span,
-                                                sd.title,
-                                                sd.replacement,
-                                                sd.message,
+                                                title,
+                                                replacement,
+                                                Some(message),
                                             ),
-                                        )
+                                        };
+                                        (sd.cursor_span, fixable)
                                     })
                                     .collect::<Vec<_>>()
                             })
@@ -4955,6 +5263,9 @@ impl Backend {
                     Fixable::ReplaceExpression(expr_span, _, _, message) => message
                         .as_ref()
                         .map(|msg| create_warning(*expr_span, "style".into(), msg.clone(), vec![])),
+                    Fixable::Warn(span, message) => {
+                        Some(create_warning(*span, "style".into(), message.clone(), vec![]))
+                    }
                     _ => None,
                 })
                 .collect()

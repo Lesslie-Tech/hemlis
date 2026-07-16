@@ -5,19 +5,29 @@ use crate::parser::op_fixity;
 // Types
 // ---------------------------------------------------------------------------
 
+/// What a style diagnostic does: warn, offer a fix, or both.
+pub enum StyleAction {
+    /// Emit a warning only; no code action (e.g. no safe auto-fix exists).
+    Warn { message: String },
+    /// Offer a code action only; no warning diagnostic.
+    Fix { title: String, replacement: String },
+    /// Emit a warning *and* offer a code action.
+    WarnAndFix {
+        message: String,
+        title: String,
+        replacement: String,
+    },
+}
+
 /// A style diagnostic produced by the checker.
 /// The LSP layer converts this into a Fixable + optional warning diagnostic.
 pub struct StyleDiagnostic {
     /// Span used for cursor matching (e.g. the operator itself).
     pub cursor_span: Span,
-    /// Span of the expression to replace.
+    /// Span of the expression to replace / anchor the warning on.
     pub expr_span: Span,
-    /// Code action title shown in the editor.
-    pub title: String,
-    /// Replacement text for the expression.
-    pub replacement: String,
-    /// Warning message shown as a diagnostic. None = code action only.
-    pub message: Option<String>,
+    /// What the diagnostic offers: a warning, a fix, or both.
+    pub action: StyleAction,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,12 +125,14 @@ fn rule_forbidden_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDi
                 out.push(StyleDiagnostic {
                     cursor_span: expr_span,
                     expr_span,
-                    title: format!("Replace `{}` with `{}`", forbidden.from, forbidden.to),
-                    replacement: format!("{} {} {}", new_lhs, forbidden.to, new_rhs),
-                    message: Some(format!(
-                        "Prefer `{}` over `{}` ({})",
-                        forbidden.to, forbidden.from, forbidden.description
-                    )),
+                    action: StyleAction::WarnAndFix {
+                        title: format!("Replace `{}` with `{}`", forbidden.from, forbidden.to),
+                        replacement: format!("{} {} {}", new_lhs, forbidden.to, new_rhs),
+                        message: format!(
+                            "Prefer `{}` over `{}` ({})",
+                            forbidden.to, forbidden.from, forbidden.description
+                        ),
+                    },
                 });
                 break;
             }
@@ -185,9 +197,10 @@ fn rule_operator_swap(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnos
                 out.push(StyleDiagnostic {
                     cursor_span: op_span,
                     expr_span,
-                    title: format!("Replace `{}` with `{}`", swap.from, swap.to),
-                    replacement,
-                    message: None,
+                    action: StyleAction::Fix {
+                        title: format!("Replace `{}` with `{}`", swap.from, swap.to),
+                        replacement,
+                    },
                 });
                 break;
             }
@@ -230,9 +243,10 @@ fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnost
         out.push(StyleDiagnostic {
             cursor_span: op_span,
             expr_span,
-            title: format!("Replace `{}` with `()`", op_name),
-            replacement: format!("{} {}", parened_func, parened_arg),
-            message: None,
+            action: StyleAction::Fix {
+                title: format!("Replace `{}` with `()`", op_name),
+                replacement: format!("{} {}", parened_func, parened_arg),
+            },
         });
     }
 }
@@ -322,9 +336,11 @@ fn emit_remove_parens(child: &ast::Expr, source: &str, out: &mut Vec<StyleDiagno
             out.push(StyleDiagnostic {
                 cursor_span: paren_span,
                 expr_span: paren_span,
-                title: "Remove unnecessary parenthesis".into(),
-                replacement: text.to_string(),
-                message: Some("Unnecessary parenthesis".into()),
+                action: StyleAction::WarnAndFix {
+                    title: "Remove unnecessary parenthesis".into(),
+                    replacement: text.to_string(),
+                    message: "Unnecessary parenthesis".into(),
+                },
             });
         }
     }
@@ -400,9 +416,11 @@ fn emit_remove_typ_parens(typ: &ast::Typ, source: &str, out: &mut Vec<StyleDiagn
             out.push(StyleDiagnostic {
                 cursor_span: paren_span,
                 expr_span: paren_span,
-                title: "Remove unnecessary parenthesis".into(),
-                replacement: text.to_string(),
-                message: Some("Unnecessary parenthesis".into()),
+                action: StyleAction::WarnAndFix {
+                    title: "Remove unnecessary parenthesis".into(),
+                    replacement: text.to_string(),
+                    message: "Unnecessary parenthesis".into(),
+                },
             });
         }
     }
@@ -470,19 +488,57 @@ fn rule_if_to_case(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic
     let is_long_if = !is_multiline && if_length > 120;
 
     let (cursor_span, message) = if is_multiline {
-        (expr.span(), Some("Prefer `case` over multiline `if`".into()))
+        (expr.span(), Some("Prefer `case` over multiline `if`".to_string()))
     } else if is_long_if {
-        (expr.span(), Some("Line exceeds 120 chars; prefer `case` over long `if`".into()))
+        (expr.span(), Some("Line exceeds 120 chars; prefer `case` over long `if`".to_string()))
     } else {
         (*kw_span, None)
+    };
+
+    let action = match message {
+        Some(message) => StyleAction::WarnAndFix {
+            message,
+            title: "Convert to `case`".into(),
+            replacement,
+        },
+        None => StyleAction::Fix {
+            title: "Convert to `case`".into(),
+            replacement,
+        },
     };
 
     out.push(StyleDiagnostic {
         cursor_span,
         expr_span: expr.span(),
-        title: "Convert to `case`".into(),
-        replacement,
-        message,
+        action,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PAY-3687: warn on unqualified `do` / `ado`
+// ---------------------------------------------------------------------------
+
+/// Warn when a `do`/`ado` block is unqualified (bare `do` rather than
+/// `Module.do`). Warn-only: hemlis can't know which qualified alias to use, so
+/// there is no auto-fix. The diagnostic is anchored on the `do`/`ado` keyword.
+fn rule_unqualified_do(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
+    let (qual, kw, keyword) = match expr {
+        ast::Expr::Do(qual, kw, _) => (qual, kw, "do"),
+        ast::Expr::Ado(qual, kw, _, _) => (qual, kw, "ado"),
+        _ => return,
+    };
+    if qual.is_some() {
+        return;
+    }
+    out.push(StyleDiagnostic {
+        cursor_span: *kw,
+        expr_span: *kw,
+        action: StyleAction::Warn {
+            message: format!(
+                "Unqualified `{kw}` block; use a qualified `Module.{kw}`",
+                kw = keyword
+            ),
+        },
     });
 }
 
@@ -534,6 +590,7 @@ impl<'a> StyleChecker<'a> {
             &mut self.diagnostics,
         );
         rule_if_to_case(expr, self.source, &mut self.diagnostics);
+        rule_unqualified_do(expr, &mut self.diagnostics);
         // =======================================
 
         self.recurse_expr(expr);
@@ -571,11 +628,11 @@ impl<'a> StyleChecker<'a> {
                 self.check_expr_nontail(t);
                 self.check_expr(f);
             }
-            ast::Expr::Do(_, stmts) | ast::Expr::Ado(_, stmts, _) => {
+            ast::Expr::Do(_, _, stmts) | ast::Expr::Ado(_, _, stmts, _) => {
                 for stmt in stmts {
                     self.check_do_stmt(stmt);
                 }
-                if let ast::Expr::Ado(_, _, e) = expr {
+                if let ast::Expr::Ado(_, _, _, e) = expr {
                     self.check_expr(e);
                 }
             }

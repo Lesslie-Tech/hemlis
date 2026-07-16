@@ -1250,7 +1250,7 @@ impl<'s> N<'s> {
                 self.expr(tru);
                 self.expr(fal);
             }
-            ast::Expr::Do(qual, stmts) => {
+            ast::Expr::Do(qual, _, stmts) => {
                 if let Some(qual) = qual {
                     self.resolve(Namespace, None, qual.0);
                 }
@@ -1273,7 +1273,7 @@ impl<'s> N<'s> {
                 }
                 self.pop(sf, stmts.span());
             }
-            ast::Expr::Ado(qual, stmts, ret) => {
+            ast::Expr::Ado(qual, _, stmts, ret) => {
                 if let Some(qual) = qual {
                     self.resolve(Namespace, None, qual.0);
                 }
