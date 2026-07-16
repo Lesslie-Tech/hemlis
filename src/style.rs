@@ -543,17 +543,46 @@ fn rule_unqualified_do(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
 }
 
 // ---------------------------------------------------------------------------
+// PAY-3688: warn on unqualified `pure`
+// ---------------------------------------------------------------------------
+
+/// Warn when `pure` is used unqualified — prefer a qualified form such as
+/// `Applicative.pure`. Warn-only. Qualified uses (`List.pure`, `Array.pure`,
+/// …) carry a `Qual` and are naturally excluded. Imports/exports/type
+/// signatures/definition LHSs are excluded because the checker only visits
+/// expression positions. The whole-module allowance (when the module defines
+/// its own top-level `pure`) is handled by the caller.
+fn rule_unqualified_pure(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
+    if let ast::Expr::Ident(ast::QName(None, name)) = expr {
+        if (name.0).0 == Ud::new("pure") {
+            let span = expr.span();
+            out.push(StyleDiagnostic {
+                cursor_span: span,
+                expr_span: span,
+                action: StyleAction::Warn {
+                    message: "Unqualified `pure`; use a qualified `Applicative.pure`".into(),
+                },
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 struct StyleChecker<'a> {
     source: &'a str,
     diagnostics: Vec<StyleDiagnostic>,
+    /// The module defines its own top-level `pure`, so the unqualified-`pure`
+    /// rule is suppressed for the whole module. (PAY-3688)
+    module_defines_pure: bool,
 }
 
 impl<'a> StyleChecker<'a> {
-    fn new(source: &'a str) -> Self {
+    fn new(source: &'a str, module_defines_pure: bool) -> Self {
         Self {
             source,
             diagnostics: Vec::new(),
+            module_defines_pure,
         }
     }
 
@@ -591,6 +620,9 @@ impl<'a> StyleChecker<'a> {
         );
         rule_if_to_case(expr, self.source, &mut self.diagnostics);
         rule_unqualified_do(expr, &mut self.diagnostics);
+        if !self.module_defines_pure {
+            rule_unqualified_pure(expr, &mut self.diagnostics);
+        }
         // =======================================
 
         self.recurse_expr(expr);
@@ -883,7 +915,18 @@ impl<'a> StyleChecker<'a> {
 // ---------------------------------------------------------------------------
 
 pub fn check_module(module: &ast::Module, source: &str) -> Vec<StyleDiagnostic> {
-    let mut checker = StyleChecker::new(source);
+    // Approximate the Python `ignore_files` set: if the module defines its own
+    // `pure` — a top-level `Def`/`Sig` or a type-class member named `pure`
+    // (e.g. `Control.Applicative`) — suppress the unqualified-`pure` rule for
+    // the whole module. (PAY-3688)
+    let module_defines_pure = module.1.iter().any(|decl| match decl {
+        ast::Decl::Def(name, _, _) | ast::Decl::Sig(name, _) => (name.0).0 == Ud::new("pure"),
+        ast::Decl::Class(_, _, _, _, members) => members
+            .iter()
+            .any(|ast::ClassMember(name, _)| (name.0).0 == Ud::new("pure")),
+        _ => false,
+    });
+    let mut checker = StyleChecker::new(source, module_defines_pure);
     for decl in &module.1 {
         checker.check_decl(decl);
     }

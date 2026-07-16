@@ -1152,6 +1152,65 @@ mod tests {
         .await;
     }
 
+    // --- PAY-3688: Warn on unqualified `pure` ---
+
+    #[tokio::test]
+    async fn style_warn_unqualified_pure() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = pure unit
+                ~~~~ Unqualified `pure`; use a qualified `Applicative.pure`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_qualified_pure() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Data.List as L
+
+            f = L.pure unit
+                  ~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_pure_when_module_defines_pure() {
+        // The module defines its own top-level `pure`, so unqualified `pure`
+        // references must not be flagged anywhere in the module. (PAY-3688)
+        assert_no_warning(indoc! {"
+            module Test where
+
+            pure :: Int -> Int
+            pure x = x
+
+            f = pure 1
+                ~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_pure_when_module_defines_class_member_pure() {
+        // A module that declares a type class with a `pure` member (mirrors
+        // Control.Applicative) defines `pure`, so unqualified `pure` references
+        // must not be flagged. (PAY-3688)
+        assert_no_warning(indoc! {"
+            module Test where
+
+            class Apply f <= Applicative f where
+              pure :: forall a. a -> f a
+
+            when false thunk = pure thunk
+                               ~~~~
+        "})
+        .await;
+    }
+
     #[tokio::test]
     async fn delete_unused_first_parameter() {
         assert_code_action(
