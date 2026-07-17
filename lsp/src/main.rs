@@ -1470,6 +1470,42 @@ mod tests {
         .await;
     }
 
+    // --- PAY-3692: Ctx module import naming convention ---
+
+    #[tokio::test]
+    async fn style_warn_ctx_module_alias_starts_with_ctx() {
+        assert_warning(indoc! {"
+            module Test where
+
+            import Ctx.Time as CtxTime
+                               ~~~~~~~ Ctx module alias should end with `Ctx`: use `TimeCtx`, not `CtxTime`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_ctx_module_name_ends_with_ctx() {
+        assert_warning(indoc! {"
+            module Test where
+
+            import Data.TimeCtx as CtxTime
+                                   ~~~~~~~ Ctx module alias should end with `Ctx`: use `TimeCtx`, not `CtxTime`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_ctx_module_alias_ends_with_ctx() {
+        // `import Ctx.Time as TimeCtx` follows the convention.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Ctx.Time as TimeCtx
+                               ~~~~~~~
+        "})
+        .await;
+    }
+
     #[tokio::test]
     async fn delete_unused_first_parameter() {
         assert_code_action(

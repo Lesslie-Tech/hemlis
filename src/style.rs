@@ -662,6 +662,55 @@ fn rule_import_exact_name(
 }
 
 // ---------------------------------------------------------------------------
+// PAY-3692: Ctx module import naming convention
+// ---------------------------------------------------------------------------
+
+/// Enforce the `Ctx`-module aliasing convention: a Ctx-family module (its name
+/// starts or ends with `Ctx`) should be aliased with `Ctx` *last* and no period
+/// (e.g. `import Ctx.Time as TimeCtx`). Flag aliases that instead *start* with
+/// `Ctx` (`CtxTime`, `Ctx.Time`). Warn-only. (PAY-3692)
+fn rule_import_ctx_naming(imp: &ast::ImportDecl, source: &str, out: &mut Vec<StyleDiagnostic>) {
+    let Some(alias) = &imp.to else {
+        return;
+    };
+    let from_span = imp.from.span();
+    let alias_span = alias.span();
+    let (Some(from_text), Some(alias_text)) = (
+        source_text(source, &from_span),
+        source_text(source, &alias_span),
+    ) else {
+        return;
+    };
+
+    // The module must be Ctx-family: its name starts or ends with `Ctx`.
+    let is_ctx_module =
+        from_text.len() > 3 && (from_text.starts_with("Ctx") || from_text.ends_with("Ctx"));
+    if !is_ctx_module {
+        return;
+    }
+    // The alias only violates the convention if it *starts* with `Ctx`.
+    if !(alias_text.starts_with("Ctx") && alias_text.len() > 3) {
+        return;
+    }
+
+    // Suggest the convention-abiding alias: drop the leading `Ctx`/`Ctx.`, strip
+    // any remaining periods, and append `Ctx`.
+    let base = alias_text.strip_prefix("Ctx").unwrap_or(alias_text);
+    let base = base.strip_prefix('.').unwrap_or(base);
+    let suggestion = format!("{}Ctx", base.replace('.', ""));
+
+    out.push(StyleDiagnostic {
+        cursor_span: alias_span,
+        expr_span: alias_span,
+        action: StyleAction::Warn {
+            message: format!(
+                "Ctx module alias should end with `Ctx`: use `{suggestion}`, not `{alias_text}`"
+            ),
+        },
+    });
+}
+
+// ---------------------------------------------------------------------------
 
 struct StyleChecker<'a> {
     source: &'a str,
@@ -1115,6 +1164,7 @@ pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<Styl
             .collect();
         for imp in &header.2 {
             rule_import_exact_name(imp, &exported_modules, source, &mut checker.diagnostics);
+            rule_import_ctx_naming(imp, source, &mut checker.diagnostics);
         }
     }
     check_docstring_comments(source, fi, &mut checker.diagnostics);
