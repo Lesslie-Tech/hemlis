@@ -1506,6 +1506,53 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn style_fix_ctx_module_alias_renames_usages() {
+        // The rename fixes the import alias and every qualified usage. (PAY-3692)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                import Ctx.Time as CtxTime
+                                   ^ Rename alias `CtxTime` to `TimeCtx`
+
+                f = CtxTime.now
+            "},
+            indoc! {"
+                module Test where
+
+                import Ctx.Time as TimeCtx
+
+                f = TimeCtx.now
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_ctx_module_dotted_alias_renames_usages() {
+        // A multi-segment alias like `Ctx.Random` must still rename its usages
+        // (`Ctx.Random.newMem`), matching the whole dotted alias. (PAY-3692)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                import Ctx.Random as Ctx.Random
+                                     ^ Rename alias `Ctx.Random` to `RandomCtx`
+
+                f = Ctx.Random.newMem 1
+            "},
+            indoc! {"
+                module Test where
+
+                import Ctx.Random as RandomCtx
+
+                f = RandomCtx.newMem 1
+            "},
+        )
+        .await;
+    }
+
     // --- PAY-3693: Additional forbidden operators (rewrite via `map`) ---
 
     #[tokio::test]
@@ -4541,6 +4588,24 @@ impl LanguageServer for Backend {
                 }
                 // Warn-only diagnostics have no associated code action.
                 Fixable::Warn(_, _) => {}
+                Fixable::RenameEdits(edits, title, _) => {
+                    let text_edits: Vec<TextEdit> = edits
+                        .iter()
+                        .map(|(span, new_text)| {
+                            TextEdit::new(span_to_range(span), new_text.clone())
+                        })
+                        .collect();
+                    out.push(CodeAction {
+                        title: title.clone(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit::new(
+                            [(uri.clone(), text_edits)].into(),
+                        )),
+                        is_preferred: Some(true),
+                        ..CodeAction::default()
+                    })
+                }
             }
         }
         // Offer "Delete unused parameter" for unused function parameters
@@ -4944,6 +5009,9 @@ enum Fixable {
     ReplaceExpression(ast::Span, String, String, Option<String>),
     /// Emit a warning at a span with no associated code action. (span, message)
     Warn(ast::Span, String),
+    /// Warn and offer a multi-edit code action (e.g. renaming an alias and all
+    /// its usages). (edits, title, message)
+    RenameEdits(Vec<(ast::Span, String)>, String, String),
     /// Delete the `(..)`/constructor-list region of an import, keeping just the type. (PAY-3260)
     RemoveUnusedConstructors(ast::Span),
 }
@@ -5638,6 +5706,11 @@ impl Backend {
                                                 replacement,
                                                 Some(message),
                                             ),
+                                            style::StyleAction::WarnAndRename {
+                                                message,
+                                                title,
+                                                edits,
+                                            } => Fixable::RenameEdits(edits, title, message),
                                         };
                                         (sd.cursor_span, fixable)
                                     })
@@ -5885,6 +5958,9 @@ impl Backend {
                         .as_ref()
                         .map(|msg| create_warning(*anchor_span, "style".into(), msg.clone(), vec![])),
                     Fixable::Warn(_, message) => {
+                        Some(create_warning(*anchor_span, "style".into(), message.clone(), vec![]))
+                    }
+                    Fixable::RenameEdits(_, _, message) => {
                         Some(create_warning(*anchor_span, "style".into(), message.clone(), vec![]))
                     }
                     _ => None,

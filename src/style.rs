@@ -17,6 +17,13 @@ pub enum StyleAction {
         title: String,
         replacement: String,
     },
+    /// Emit a warning *and* offer a code action that applies several edits at
+    /// once (e.g. renaming an import alias plus all its qualified usages).
+    WarnAndRename {
+        message: String,
+        title: String,
+        edits: Vec<(Span, String)>,
+    },
 }
 
 /// A style diagnostic produced by the checker.
@@ -797,7 +804,8 @@ fn rule_import_exact_name(
 /// Enforce the `Ctx`-module aliasing convention: a Ctx-family module (its name
 /// starts or ends with `Ctx`) should be aliased with `Ctx` *last* and no period
 /// (e.g. `import Ctx.Time as TimeCtx`). Flag aliases that instead *start* with
-/// `Ctx` (`CtxTime`, `Ctx.Time`). Warn-only. (PAY-3692)
+/// `Ctx` (`CtxTime`, `Ctx.Time`) and offer a rename that fixes the import alias
+/// and every qualified usage of it. (PAY-3692)
 fn rule_import_ctx_naming(imp: &ast::ImportDecl, source: &str, out: &mut Vec<StyleDiagnostic>) {
     let Some(alias) = &imp.to else {
         return;
@@ -828,15 +836,58 @@ fn rule_import_ctx_naming(imp: &ast::ImportDecl, source: &str, out: &mut Vec<Sty
     let base = base.strip_prefix('.').unwrap_or(base);
     let suggestion = format!("{}Ctx", base.replace('.', ""));
 
+    let message =
+        format!("Ctx module alias should end with `Ctx`: use `{suggestion}`, not `{alias_text}`");
+
+    // Rename the alias in the import plus every qualified usage of it. This is
+    // safe within the module because qualified names are module-local.
+    let action = match qualifier_rename_edits(source, &alias_span, alias_text, &suggestion) {
+        Some(edits) => StyleAction::WarnAndRename {
+            message,
+            title: format!("Rename alias `{alias_text}` to `{suggestion}`"),
+            edits,
+        },
+        None => StyleAction::Warn { message },
+    };
+
     out.push(StyleDiagnostic {
         cursor_span: alias_span,
         expr_span: alias_span,
-        action: StyleAction::Warn {
-            message: format!(
-                "Ctx module alias should end with `Ctx`: use `{suggestion}`, not `{alias_text}`"
-            ),
-        },
+        action,
     });
+}
+
+/// Collect the edits to rename a module alias `old` to `new`: the alias in the
+/// `as` clause plus every qualifier token whose leading segment is `old`.
+/// Qualifiers are found by lexing, so usages in expressions, types and patterns
+/// are all covered. Returns `None` if the alias span has no file id.
+fn qualifier_rename_edits(
+    source: &str,
+    alias_span: &Span,
+    old: &str,
+    new: &str,
+) -> Option<Vec<(Span, String)>> {
+    use logos::Logos as _;
+    let fi = alias_span.fi()?;
+    let mut edits = vec![(*alias_span, new.to_string())];
+
+    let starts = line_starts(source);
+    for (tok, byte_span) in crate::lexer::Token::lexer(source).spanned() {
+        let Ok(crate::lexer::Token::Qual(q)) = tok else {
+            continue;
+        };
+        // `q` includes the trailing dot(s). A usage of the alias looks like
+        // `<alias>.…`, so `q` must start with the (possibly dotted) alias
+        // followed by a `.` segment boundary. The boundary check avoids matching
+        // a longer name that merely shares a prefix (`Ctx` vs `CtxTime`).
+        if !(q.starts_with(old) && q[old.len()..].starts_with('.')) {
+            continue;
+        }
+        let lo = byte_to_pos(&starts, byte_span.start);
+        let hi = byte_to_pos(&starts, byte_span.start + old.len());
+        edits.push((Span::Known(fi, lo, hi), new.to_string()));
+    }
+    Some(edits)
 }
 
 // ---------------------------------------------------------------------------
