@@ -840,6 +840,86 @@ fn rule_import_ctx_naming(imp: &ast::ImportDecl, source: &str, out: &mut Vec<Sty
 }
 
 // ---------------------------------------------------------------------------
+// PAY-3694: prefer `let` over `where`
+// ---------------------------------------------------------------------------
+
+/// Reindent a block of text so its base column moves from `old_col` to
+/// `new_col`. The first line carries no leading indent (it starts at the block
+/// span), so it gets `new_col` spaces; subsequent lines are shifted by the same
+/// delta, preserving relative structure. Blank lines are left empty.
+fn reindent_block(text: &str, old_col: usize, new_col: usize) -> String {
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if i == 0 {
+            out.push_str(&" ".repeat(new_col));
+            out.push_str(line);
+        } else if line.trim().is_empty() {
+            // leave blank line empty
+        } else {
+            let cur = line.len() - line.trim_start().len();
+            let shifted = (cur as isize - old_col as isize + new_col as isize).max(0) as usize;
+            out.push_str(&" ".repeat(shifted));
+            out.push_str(line.trim_start());
+        }
+    }
+    out
+}
+
+/// Build the `let … in …` replacement for a `body where binds` expression,
+/// preserving the bindings' internal layout by shifting them under the new
+/// `let`. Returns `None` if any span can't be resolved.
+fn build_let_fix(where_expr: &ast::Expr, source: &str) -> Option<String> {
+    let ast::Expr::Where(_, body, binds) = where_expr else {
+        return None;
+    };
+    let body_text = source_text(source, &body.span())?;
+    let binds_span = binds.span();
+    let binds_text = source_text(source, &binds_span)?;
+
+    // The replacement starts where the body did, so `let` sits at that column.
+    let let_col = where_expr.span().lo().1;
+    let bind_col = let_col + 2;
+    let old_col = binds_span.lo().1;
+    let binds_re = reindent_block(binds_text, old_col, bind_col);
+    let indent = " ".repeat(let_col);
+    Some(format!("let\n{binds_re}\n{indent}in {body_text}"))
+}
+
+/// Warn on a `where` block, preferring `let`. Offers a `where → let` fix only
+/// for an unconditional body (`fixable`); when guards are present the `where`
+/// scopes over all of them, so it's warn-only. (PAY-3694)
+fn rule_prefer_let(
+    where_expr: &ast::Expr,
+    fixable: bool,
+    source: &str,
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    let ast::Expr::Where(where_span, _, _) = where_expr else {
+        return;
+    };
+    let message = "Prefer `let` over `where`".to_string();
+    let action = fixable
+        .then(|| build_let_fix(where_expr, source))
+        .flatten()
+        .map(|replacement| StyleAction::WarnAndFix {
+            message: message.clone(),
+            title: "Convert `where` to `let`".into(),
+            replacement,
+        })
+        .unwrap_or(StyleAction::Warn { message });
+
+    out.push(StyleDiagnostic {
+        // Warn on the `where` keyword; the fix replaces the whole expression.
+        cursor_span: *where_span,
+        expr_span: where_expr.span(),
+        action,
+    });
+}
+
+// ---------------------------------------------------------------------------
 
 struct StyleChecker<'a> {
     source: &'a str,
@@ -1025,7 +1105,8 @@ impl<'a> StyleChecker<'a> {
 
     fn check_guarded_expr(&mut self, ge: &ast::GuardedExpr) {
         match ge {
-            ast::GuardedExpr::Unconditional(e) => self.check_expr(e),
+            // An unconditional body may carry a `where` we can rewrite to `let`.
+            ast::GuardedExpr::Unconditional(e) => self.check_where_body(e, true),
             ast::GuardedExpr::Guarded(arms) => {
                 for (guards, e) in arms {
                     for g in guards {
@@ -1035,9 +1116,25 @@ impl<'a> StyleChecker<'a> {
                             ast::Guard::Binder(_, e) => self.check_expr_nontail(e),
                         }
                     }
-                    self.check_expr(e);
+                    // A `where` here scopes over all guards, so it can't be a
+                    // simple `let … in`: warn only, no fix.
+                    self.check_where_body(e, false);
                 }
             }
+        }
+    }
+
+    /// Check a guarded-expression body, handling a trailing `where` (PAY-3694).
+    /// `fixable` is true only for an unconditional single body, where the
+    /// `where` can be safely rewritten to `let … in`.
+    fn check_where_body(&mut self, e: &ast::Expr, fixable: bool) {
+        if let ast::Expr::Where(_, body, binds) = e {
+            rule_prefer_let(e, fixable, self.source, &mut self.diagnostics);
+            // `where` follows the body, so the body is non-tail.
+            self.check_expr_nontail(body);
+            self.check_let_bindings(binds);
+        } else {
+            self.check_expr(e);
         }
     }
 

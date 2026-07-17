@@ -1679,6 +1679,98 @@ mod tests {
         .await;
     }
 
+    // --- PAY-3694: Prefer `let` over `where` ---
+
+    #[tokio::test]
+    async fn style_warn_where() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f x = y
+              where
+              ~~~~~ Prefer `let` over `where`
+              y = x + 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_where_to_let() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = y
+                  where
+                  ^ Convert `where` to `let`
+                  y = x + 1
+            "},
+            indoc! {"
+                module Test where
+
+                f x = let
+                        y = x + 1
+                      in y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_where_to_let_multiline() {
+        // Multiple bindings keep their relative layout, shifted under `let`.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = y
+                  where
+                  ^ Convert `where` to `let`
+                  y = z + 1
+                  z = x
+            "},
+            indoc! {"
+                module Test where
+
+                f x = let
+                        y = z + 1
+                        z = x
+                      in y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_where_with_guards() {
+        // Guards make the `where` scope over all branches — still warned.
+        assert_warning(indoc! {"
+            module Test where
+
+            f x
+              | x > 0 = a
+              where
+              ~~~~~ Prefer `let` over `where`
+              a = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_fix_where_with_guards() {
+        // ...but no `where → let` fix is offered when guards are present.
+        assert_no_code_action(indoc! {"
+            module Test where
+
+            f x
+              | x > 0 = a
+              where
+              ^ Convert `where` to `let`
+              a = 1
+        "})
+        .await;
+    }
+
     #[tokio::test]
     async fn delete_unused_first_parameter() {
         assert_code_action(
