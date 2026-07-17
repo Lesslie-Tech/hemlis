@@ -608,6 +608,60 @@ fn rule_qualified_constructor(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) 
 }
 
 // ---------------------------------------------------------------------------
+// PAY-3691: import top-level modules with exact name
+// ---------------------------------------------------------------------------
+
+/// Warn when a single-segment (top-level) module is imported under a different
+/// alias, e.g. `import Foo as Bar`. A single-character alias (`import Foo as F`)
+/// is allowed, as is importing under the exact name (`import Foo as Foo`). An
+/// alias that is itself re-exported via `module Alias` in the export list is
+/// also allowed — that's the intentional module re-export pattern (e.g. Joe).
+/// Warn-only: renaming the alias would require rewriting every `Bar.x`
+/// reference, which the pure-AST style checker can't do. The comparison is
+/// textual on the module name as written. (PAY-3691)
+fn rule_import_exact_name(
+    imp: &ast::ImportDecl,
+    exported_modules: &[Ud],
+    source: &str,
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    let Some(alias) = &imp.to else {
+        return;
+    };
+    // The alias is re-exported (`module Alias`), so aliasing to it is intentional.
+    if exported_modules.contains(&(alias.0).0) {
+        return;
+    }
+    let from_span = imp.from.span();
+    let alias_span = alias.span();
+    let (Some(from_text), Some(alias_text)) = (
+        source_text(source, &from_span),
+        source_text(source, &alias_span),
+    ) else {
+        return;
+    };
+
+    // Only single-segment (top-level) modules; multi-segment names may
+    // legitimately be aliased to their last segment (`Data.Maybe as Maybe`).
+    if from_text.contains('.') {
+        return;
+    }
+    // Importing under the exact name, or a single-character abbreviation, is ok.
+    if alias_text == from_text || alias_text.chars().count() == 1 {
+        return;
+    }
+
+    let first = from_text.chars().next().unwrap_or('?');
+    out.push(StyleDiagnostic {
+        cursor_span: alias_span,
+        expr_span: alias_span,
+        action: StyleAction::Warn {
+            message: format!("Import `{from_text}` as `{from_text}` or `{first}`, not `{alias_text}`"),
+        },
+    });
+}
+
+// ---------------------------------------------------------------------------
 
 struct StyleChecker<'a> {
     source: &'a str,
@@ -1045,6 +1099,23 @@ pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<Styl
     let mut checker = StyleChecker::new(source, module_defines_pure);
     for decl in &module.1 {
         checker.check_decl(decl);
+    }
+    // Header imports (`import Foo as Bar`) are not decls; traverse them here.
+    if let Some(header) = &module.0 {
+        // Modules re-exported via `module X` in the export list — aliasing an
+        // import to one of these is the intentional re-export pattern.
+        let exported_modules: Vec<Ud> = header
+            .1
+            .iter()
+            .flatten()
+            .filter_map(|e| match e {
+                ast::Export::Module(m) => Some((m.0).0),
+                _ => None,
+            })
+            .collect();
+        for imp in &header.2 {
+            rule_import_exact_name(imp, &exported_modules, source, &mut checker.diagnostics);
+        }
     }
     check_docstring_comments(source, fi, &mut checker.diagnostics);
     checker.diagnostics

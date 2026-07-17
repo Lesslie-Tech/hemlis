@@ -573,10 +573,7 @@ mod tests {
         let (marker_idx, marker_line) = lines
             .iter()
             .enumerate()
-            .find(|(_, l)| {
-                let trimmed = l.trim_start();
-                trimmed.starts_with('~') && trimmed.len() > 1
-            })
+            .find(|(_, l)| l.trim_start().starts_with('~'))
             .expect("Source must contain a `~~~ Warning message` marker line");
 
         // Visual columns of the first and last `~` in the run.
@@ -1017,8 +1014,7 @@ mod tests {
             .iter()
             .enumerate()
             .find(|(_, (_, src))| {
-                src.lines()
-                    .any(|l| l.trim_start().starts_with('~') && l.trim_start().len() > 1)
+                src.lines().any(|l| l.trim_start().starts_with('~'))
             })
             .expect("One module must contain a `~~~ Warning message` marker line");
 
@@ -1394,6 +1390,82 @@ mod tests {
 
             f = \"--|\"
                  ~~~
+        "})
+        .await;
+    }
+
+    // --- PAY-3691: Import top-level modules with exact name ---
+
+    #[tokio::test]
+    async fn style_warn_top_level_import_aliased() {
+        assert_warning(indoc! {"
+            module Test where
+
+            import Foo as Bar
+                          ~~~ Import `Foo` as `Foo` or `F`, not `Bar`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_multi_segment_import_aliased() {
+        // `Data.Maybe` is not a top-level module, so aliasing it is fine.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Data.Maybe as Maybe
+                                 ~~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_single_char_alias() {
+        // A single-character alias is allowed.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Foo as F
+                          ~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_import_alias_matches_name() {
+        // `import Foo as Foo` has a matching alias, so nothing to flag.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Foo as Foo
+                          ~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_import_alias_is_exported_module() {
+        // The module re-export pattern (mirrors Joe.purs): the alias `Exports`
+        // is re-exported via `module Exports`, so aliasing to it is intentional
+        // and must not be flagged. (PAY-3691)
+        assert_no_warning(indoc! {"
+            module Test (module Exports) where
+
+            import Foo as Exports
+                          ~~~~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_import_alias_is_exported_module_any_name() {
+        // The re-export alias can be named anything — the only requirement is
+        // that it appears as `module <alias>` in the export list. (PAY-3691)
+        assert_no_warning(indoc! {"
+            module Test (module Reexport) where
+
+            import Foo as Reexport
+                          ~~~~~~~~
         "})
         .await;
     }
