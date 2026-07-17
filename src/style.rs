@@ -114,6 +114,7 @@ fn rule_forbidden_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDi
         let op_ud = (qop.1).0 .0;
         for forbidden in FORBIDDEN_OPS {
             if op_ud == Ud::new(forbidden.from) {
+                let op_span = (qop.1).0 .1;
                 let expr_span = expr.span();
                 let lhs_text = source_text(source, &lhs.span()).unwrap_or("_");
                 let rhs_text = source_text(source, &rhs.span()).unwrap_or("_");
@@ -123,7 +124,8 @@ fn rule_forbidden_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDi
                 let new_rhs = maybe_paren(lhs_text, lhs, target_prec);
 
                 out.push(StyleDiagnostic {
-                    cursor_span: expr_span,
+                    // Warn on just the operator, but replace the whole expression.
+                    cursor_span: op_span,
                     expr_span,
                     action: StyleAction::WarnAndFix {
                         title: format!("Replace `{}` with `{}`", forbidden.from, forbidden.to),
@@ -138,6 +140,133 @@ fn rule_forbidden_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDi
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PAY-3693: confusing nested-map operators (`<$$>`, `<##>`, `<###>`)
+// ---------------------------------------------------------------------------
+
+/// A confusing nested-map operator and how to rewrite it with `map`.
+struct ConfusingMapOp {
+    from: &'static str,
+    /// `true` when the function is the *right* operand (`<#>`/flipped family),
+    /// `false` when it's the *left* operand (`<$>` family).
+    flipped: bool,
+    /// How many `map`s to wrap the function operand in.
+    levels: usize,
+}
+
+const CONFUSING_MAP_OPS: &[ConfusingMapOp] = &[
+    // a <$$> b  →  map a <$> b
+    ConfusingMapOp {
+        from: "<$$>",
+        flipped: false,
+        levels: 1,
+    },
+    // a <##> b  →  a <#> map b
+    ConfusingMapOp {
+        from: "<##>",
+        flipped: true,
+        levels: 1,
+    },
+    // a <###> b →  a <#> map (map b)
+    ConfusingMapOp {
+        from: "<###>",
+        flipped: true,
+        levels: 2,
+    },
+];
+
+/// Wrap `operand` in `levels` nested `map` applications, parenthesizing the
+/// operand when it isn't an atom and each intermediate `map …` application.
+fn nested_map(levels: usize, operand_text: &str, operand: &ast::Expr) -> String {
+    let arg = if is_atom(operand) {
+        operand_text.to_string()
+    } else {
+        format!("({})", operand_text)
+    };
+    let mut result = format!("map {}", arg);
+    for _ in 1..levels {
+        result = format!("map ({})", result);
+    }
+    result
+}
+
+/// Parenthesize `text` for use as an operand of `outer_op` (on the left when
+/// `on_left`), reusing the associativity-aware redundant-paren logic so a
+/// same-precedence, same-associativity operand isn't needlessly wrapped.
+fn maybe_paren_operand(text: &str, operand: &ast::Expr, outer_op: Ud, on_left: bool) -> String {
+    let ctx = if on_left {
+        ParenContext::OpLeft(outer_op)
+    } else {
+        ParenContext::OpRight(outer_op)
+    };
+    if paren_is_unnecessary(operand, &ctx) {
+        text.to_string()
+    } else {
+        format!("({})", text)
+    }
+}
+
+/// Rewrite the confusing nested-map operators to explicit `map` + `<$>`/`<#>`.
+/// The whitespace/layout around the operator is preserved verbatim (only the
+/// operator and the function operand are rewritten), and the non-wrapped
+/// operand is parenthesized via the associativity-aware redundant-paren logic.
+/// (PAY-3693)
+fn rule_confusing_map_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+    let ast::Expr::Op(lhs, qop, rhs) = expr else {
+        return;
+    };
+    let op_ud = (qop.1).0 .0;
+    let Some(mo) = CONFUSING_MAP_OPS.iter().find(|mo| op_ud == Ud::new(mo.from)) else {
+        return;
+    };
+
+    let op_span = (qop.1).0 .1;
+    let expr_span = expr.span();
+
+    // Byte ranges so we can preserve the exact source layout between tokens.
+    let (Some((lhs_lo, lhs_hi)), Some((op_lo, op_hi)), Some((rhs_lo, rhs_hi))) = (
+        span_to_byte_range(source, &lhs.span()),
+        span_to_byte_range(source, &op_span),
+        span_to_byte_range(source, &rhs.span()),
+    ) else {
+        return;
+    };
+    let lhs_text = source.get(lhs_lo..lhs_hi).unwrap_or("_");
+    let rhs_text = source.get(rhs_lo..rhs_hi).unwrap_or("_");
+    // Whitespace/newlines around the operator — kept verbatim.
+    let gap_before = source.get(lhs_hi..op_lo).unwrap_or(" ");
+    let gap_after = source.get(op_hi..rhs_lo).unwrap_or(" ");
+
+    let (new_lhs, new_op, new_rhs) = if mo.flipped {
+        // Function is the right operand: a <#> map(^levels) b
+        (
+            maybe_paren_operand(lhs_text, lhs, Ud::new("<#>"), true),
+            "<#>",
+            nested_map(mo.levels, rhs_text, rhs),
+        )
+    } else {
+        // Function is the left operand: map(^levels) a <$> b
+        (
+            nested_map(mo.levels, lhs_text, lhs),
+            "<$>",
+            maybe_paren_operand(rhs_text, rhs, Ud::new("<$>"), false),
+        )
+    };
+
+    let replacement = format!("{new_lhs}{gap_before}{new_op}{gap_after}{new_rhs}");
+
+    out.push(StyleDiagnostic {
+        // Warn on just the operator, but replace the whole expression.
+        cursor_span: op_span,
+        expr_span,
+        action: StyleAction::WarnAndFix {
+            title: format!("Rewrite `{}` using `map`", mo.from),
+            replacement,
+            message: format!("Avoid the confusing operator `{}`", mo.from),
+        },
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +880,7 @@ impl<'a> StyleChecker<'a> {
     ) {
         // ===== RULES (add new rules here) =====
         rule_forbidden_operator(expr, self.source, &mut self.diagnostics);
+        rule_confusing_map_operator(expr, self.source, &mut self.diagnostics);
         rule_operator_swap(expr, self.source, &mut self.diagnostics);
         rule_op_to_parens(expr, self.source, &mut self.diagnostics);
         rule_unnecessary_parens(

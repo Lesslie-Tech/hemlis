@@ -1506,6 +1506,179 @@ mod tests {
         .await;
     }
 
+    // --- PAY-3693: Additional forbidden operators (rewrite via `map`) ---
+
+    #[tokio::test]
+    async fn style_warn_confusing_operator_double_map() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = a <$$> b
+                  ~~~~ Avoid the confusing operator `<$$>`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_confusing_operator_double_hash() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = a <##> b
+                  ~~~~ Avoid the confusing operator `<##>`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_confusing_operator_triple_hash() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = a <###> b
+                  ~~~~~ Avoid the confusing operator `<###>`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_map() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <$$> b
+                      ^ Rewrite `<$$>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = map a <$> b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <##> b
+                      ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = a <#> map b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_triple_hash() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <###> b
+                      ^ Rewrite `<###>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = a <#> map (map b)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_map_parenthesizes_lower_prec_operand() {
+        // The rhs `b <#> c` binds looser than `<$>`, so it must be parenthesized.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <$$> b <#> c
+                      ^ Rewrite `<$$>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = map a <$> (b <#> c)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash_parenthesizes_application_operand() {
+        // The function operand `g b` is an application, so `map` must parenthesize it.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <##> g b
+                      ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = a <#> map (g b)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash_no_redundant_parens_on_chain() {
+        // The lhs `x <#> y` is a same-precedence left-associative chain, so it
+        // must NOT be parenthesized when it becomes the lhs of `<#>`. (PAY-3693)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x <#> y <##> z
+                            ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = x <#> y <#> map z
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash_multiline() {
+        // The lhs spans multiple lines; the layout around the operator is
+        // preserved, so the rewritten operator stays on its own line. (PAY-3693)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f =
+                  foo
+                    <#> bar
+                    <##> baz
+                    ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f =
+                  foo
+                    <#> bar
+                    <#> map baz
+            "},
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn delete_unused_first_parameter() {
         assert_code_action(
@@ -5613,12 +5786,14 @@ impl Backend {
         let sty = if let Some(x) = self.fixables.try_get(&fi).try_unwrap() {
             x.value()
                 .iter()
-                .filter_map(|(_, f)| match f {
-                    Fixable::ReplaceExpression(expr_span, _, _, message) => message
+                .filter_map(|(anchor_span, f)| match f {
+                    // Anchor the warning on the cursor span (e.g. just the
+                    // operator), which may be narrower than the replacement range.
+                    Fixable::ReplaceExpression(_, _, _, message) => message
                         .as_ref()
-                        .map(|msg| create_warning(*expr_span, "style".into(), msg.clone(), vec![])),
-                    Fixable::Warn(span, message) => {
-                        Some(create_warning(*span, "style".into(), message.clone(), vec![]))
+                        .map(|msg| create_warning(*anchor_span, "style".into(), msg.clone(), vec![])),
+                    Fixable::Warn(_, message) => {
+                        Some(create_warning(*anchor_span, "style".into(), message.clone(), vec![]))
                     }
                     _ => None,
                 })
