@@ -568,6 +568,46 @@ fn rule_unqualified_pure(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
 }
 
 // ---------------------------------------------------------------------------
+// PAY-3689: warn on qualified `Just` / `Left` / `Right`
+// ---------------------------------------------------------------------------
+
+/// Constructors that should be used unqualified, matched textually on the
+/// qualifier alias as written. (qualifier, constructor)
+const QUALIFIED_CONSTRUCTORS: &[(&str, &str)] = &[
+    ("Maybe", "Just"),
+    ("Either", "Left"),
+    ("Either", "Right"),
+];
+
+/// Warn on qualified `Maybe.Just`, `Either.Left`, `Either.Right` — these are
+/// idiomatically used unqualified. Offers a code action that strips the
+/// qualifier; this is safe in practice because these constructors are almost
+/// always already in scope (imported via `Maybe(..)` / `Either(..)`). The
+/// match is textual on the qualifier alias, mirroring the `codestyle.py`
+/// regexes.
+fn rule_qualified_constructor(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
+    if let ast::Expr::Constructor(ast::QProperName(Some(qual), name)) = expr {
+        let qual_ud = (qual.0).0;
+        let name_ud = (name.0).0;
+        for (q, n) in QUALIFIED_CONSTRUCTORS {
+            if qual_ud == Ud::new(q) && name_ud == Ud::new(n) {
+                let span = expr.span();
+                out.push(StyleDiagnostic {
+                    cursor_span: span,
+                    expr_span: span,
+                    action: StyleAction::WarnAndFix {
+                        message: format!("Prefer unqualified `{n}` over `{q}.{n}`"),
+                        title: format!("Replace `{q}.{n}` with `{n}`"),
+                        replacement: n.to_string(),
+                    },
+                });
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 struct StyleChecker<'a> {
     source: &'a str,
@@ -623,6 +663,7 @@ impl<'a> StyleChecker<'a> {
         if !self.module_defines_pure {
             rule_unqualified_pure(expr, &mut self.diagnostics);
         }
+        rule_qualified_constructor(expr, &mut self.diagnostics);
         // =======================================
 
         self.recurse_expr(expr);
@@ -911,10 +952,85 @@ impl<'a> StyleChecker<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// PAY-3690: docstring comment spacing `-- | `
+// ---------------------------------------------------------------------------
+
+/// Map a byte offset in `source` to a 0-based `(line, column)`, where `column`
+/// is a byte offset within the line. Matches the column convention the lexer
+/// uses for AST spans.
+fn byte_to_pos(line_starts: &[usize], byte: usize) -> (usize, usize) {
+    let line = line_starts.partition_point(|&s| s <= byte) - 1;
+    (line, byte - line_starts[line])
+}
+
+/// Given a line-comment slice (starting with `--`), decide whether it is a
+/// docstring marker (`--`, optional spaces, `|`) that needs re-spacing: exactly
+/// one space before `|` and at least one after (when it has content). Extra
+/// spaces after `|` are preserved (multi-line docstring indentation). Returns
+/// `(prefix_len, replacement)` for the `--…|…` prefix, or `None` for
+/// non-docstring comments and already-correct ones.
+fn docstring_prefix_fix(comment: &str) -> Option<(usize, String)> {
+    let after_dashes = comment.strip_prefix("--")?;
+    let spaces_before = after_dashes.len() - after_dashes.trim_start_matches(' ').len();
+    let after_spaces = &after_dashes[spaces_before..];
+    // Only a `|` immediately after the (optional) spaces marks a docstring.
+    let after_pipe = after_spaces.strip_prefix('|')?;
+    let spaces_after = after_pipe.len() - after_pipe.trim_start_matches(' ').len();
+    let content = &after_pipe[spaces_after..];
+    let has_content = !content.is_empty();
+
+    // Require exactly one space before `|`, and — when there is content — *at
+    // least* one space after. Extra spaces after `|` are intentional
+    // indentation (common in multi-line docstrings), so they're preserved.
+    let after_ok = if has_content {
+        spaces_after >= 1
+    } else {
+        spaces_after == 0
+    };
+    if spaces_before == 1 && after_ok {
+        return None;
+    }
+
+    let prefix_len = 2 + spaces_before + 1 + spaces_after;
+    let kept_spaces_after = if has_content { spaces_after.max(1) } else { 0 };
+    let replacement = format!("-- |{}", " ".repeat(kept_spaces_after));
+    Some((prefix_len, replacement))
+}
+
+/// Scan line comments for mis-spaced docstring markers (`--|`, `-- |x`, …) and
+/// emit a fixable warning that normalizes them to `-- | `. Comments are not in
+/// the AST, so this is a lexer-level pass. String literals are lexed as
+/// separate tokens, so `--|` inside a string is never seen here. (PAY-3690)
+fn check_docstring_comments(source: &str, fi: ast::Fi, out: &mut Vec<StyleDiagnostic>) {
+    use logos::Logos as _;
+    let starts = line_starts(source);
+    for (tok, byte_span) in crate::lexer::Token::lexer(source).spanned() {
+        let Ok(crate::lexer::Token::LineComment(_)) = tok else {
+            continue;
+        };
+        let text = &source[byte_span.start..byte_span.end];
+        let Some((prefix_len, replacement)) = docstring_prefix_fix(text) else {
+            continue;
+        };
+        let (line, col) = byte_to_pos(&starts, byte_span.start);
+        let span = Span::Known(fi, (line, col), (line, col + prefix_len));
+        out.push(StyleDiagnostic {
+            cursor_span: span,
+            expr_span: span,
+            action: StyleAction::WarnAndFix {
+                message: "Docstring comment should use `-- | ` (single space around `|`)".into(),
+                title: "Fix docstring comment spacing".into(),
+                replacement,
+            },
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn check_module(module: &ast::Module, source: &str) -> Vec<StyleDiagnostic> {
+pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<StyleDiagnostic> {
     // Approximate the Python `ignore_files` set: if the module defines its own
     // `pure` — a top-level `Def`/`Sig` or a type-class member named `pure`
     // (e.g. `Control.Applicative`) — suppress the unqualified-`pure` rule for
@@ -930,5 +1046,6 @@ pub fn check_module(module: &ast::Module, source: &str) -> Vec<StyleDiagnostic> 
     for decl in &module.1 {
         checker.check_decl(decl);
     }
+    check_docstring_comments(source, fi, &mut checker.diagnostics);
     checker.diagnostics
 }

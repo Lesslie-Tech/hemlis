@@ -1211,6 +1211,193 @@ mod tests {
         .await;
     }
 
+    // --- PAY-3689: Warn on qualified `Just` / `Left` / `Right` ---
+
+    #[tokio::test]
+    async fn style_warn_qualified_just() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = Maybe.Just 1
+                ~~~~~~~~~~ Prefer unqualified `Just` over `Maybe.Just`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_qualified_left() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = Either.Left 1
+                ~~~~~~~~~~~ Prefer unqualified `Left` over `Either.Left`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_qualified_right() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = Either.Right 1
+                ~~~~~~~~~~~~ Prefer unqualified `Right` over `Either.Right`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_unqualified_just() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            f = Just 1
+                ~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_qualified_nothing() {
+        // Only Just/Left/Right are flagged; other qualified constructors are fine.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            f = Maybe.Nothing
+                ~~~~~~~~~~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_strip_qualifier_from_just() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = Maybe.Just 1
+                          ^ Replace `Maybe.Just` with `Just`
+            "},
+            indoc! {"
+                module Test where
+
+                f = Just 1
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_strip_qualifier_from_right() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = Either.Right 1
+                           ^ Replace `Either.Right` with `Right`
+            "},
+            indoc! {"
+                module Test where
+
+                f = Right 1
+            "},
+        )
+        .await;
+    }
+
+    // --- PAY-3690: Docstring comment spacing `-- | ` ---
+
+    #[tokio::test]
+    async fn style_warn_docstring_missing_space() {
+        assert_warning(indoc! {"
+            module Test where
+
+            --|foo
+            ~~~ Docstring comment should use `-- | ` (single space around `|`)
+            f = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_docstring_missing_both_spaces() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                --|foo
+                ^ Fix docstring comment spacing
+                f = 1
+            "},
+            indoc! {"
+                module Test where
+
+                -- | foo
+                f = 1
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_docstring_missing_space_after_pipe() {
+        // `-- |foo` has the space before `|` but not after — still fixed.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                -- |foo
+                ^ Fix docstring comment spacing
+                f = 1
+            "},
+            indoc! {"
+                module Test where
+
+                -- | foo
+                f = 1
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_docstring_correct_spacing() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            -- | bar
+            ~~~~~
+            f = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_docstring_extra_indentation() {
+        // Extra spaces after `|` are intentional indentation (common in
+        // multi-line docstrings) and must not be flagged. (PAY-3690)
+        assert_no_warning(indoc! {"
+            module Test where
+
+            -- |   hello
+            ~~~~~~~
+            f = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_double_dash_pipe_in_string() {
+        // `--|` inside a string literal must not be flagged.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            f = \"--|\"
+                 ~~~
+        "})
+        .await;
+    }
+
     #[tokio::test]
     async fn delete_unused_first_parameter() {
         assert_code_action(
@@ -5053,7 +5240,7 @@ impl Backend {
                             .try_get(&fi)
                             .try_unwrap()
                             .map(|source| {
-                                style::check_module(m, source.value())
+                                style::check_module(m, source.value(), fi)
                                     .into_iter()
                                     .map(|sd| {
                                         let fixable = match sd.action {
