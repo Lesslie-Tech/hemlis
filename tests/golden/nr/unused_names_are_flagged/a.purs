@@ -12,23 +12,35 @@ a = AB
 
 f x = 1
 
--- + args: --names --xx --resolve tests/nr/unused_names_are_flagged/a.purs tests/nr/unused_names_are_flagged/b.purs_import tests/nr/unused_names_are_flagged/c.purs_import
+-- + args: --names --xx --resolve tests/golden/nr/unused_names_are_flagged/a.purs tests/golden/nr/unused_names_are_flagged/b.purs_import tests/golden/nr/unused_names_are_flagged/c.purs_import
 -- + expected stdout:
--- + Unused("Local is unused", Known(Fi(1), (10, 6), (10, 7)))
--- + Unused("Local is unused", Known(Fi(0), (12, 2), (12, 3)))
--- + Unused("Term is unused", Known(Fi(0), (3, 10), (3, 12)))
--- + Unused("Type is unused", Known(Fi(0), (3, 14), (3, 18)))
--- + Unused("Class is unused", Known(Fi(0), (3, 26), (3, 28)))
--- + Unused("Local is unused", Known(Fi(3), (12, 2), (12, 3)))
--- + Unused("Term is unused", Known(Fi(3), (3, 10), (3, 12)))
--- + Unused("Type is unused", Known(Fi(3), (3, 14), (3, 18)))
--- + Unused("Class is unused", Known(Fi(3), (3, 26), (3, 28)))
+-- + UnusedLocal(Name(Term, Ud(18086178835076887451, 'B'), Ud(4497542318236667727, 'y'), Private((10, 6))), Known(Fi(1), (10, 6), (10, 7)))
+-- + UnusedLocal(Name(Term, Ud(13211085446099756707, 'A'), Ud(8312289520117458465, 'x'), Private((12, 2))), Known(Fi(0), (12, 2), (12, 3)))
+-- + UnusedImport(Term, Ud(7166475107114103771, 'e'), Known(Fi(0), (3, 10), (3, 12)))
+-- + UnusedImport(Type, Ud(17872905433123856768, 'B'), Known(Fi(0), (3, 14), (3, 18)))
+-- + UnusedImport(Class, Ud(5069386282947683699, 'E'), Known(Fi(0), (3, 20), (3, 28)))
+-- + UnusedImportUnqualified(Ud(16567872259610830857, 'C'), Known(Fi(0), (3, 0), (3, 100027)))
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(4506850079084802999, 'f'), Public), DefineSpans { name: Known(Fi(0), (7, 0), (7, 3)), sig: Some(Known(Fi(0), (7, 0), (7, 18))), body: [] })
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(6251214085580200729, 'f'), Public), DefineSpans { name: Known(Fi(0), (12, 0), (12, 1)), sig: Some(Known(Fi(0), (12, 0), (12, 7))), body: [] })
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(8186225505942432243, 'a'), Public), DefineSpans { name: Known(Fi(0), (9, 0), (9, 1)), sig: Some(Known(Fi(0), (9, 0), (9, 6))), body: [Known(Fi(0), (10, 0), (10, 6))] })
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(8312289520117458465, 'x'), Private((12, 2))), DefineSpans { name: Known(Fi(0), (12, 2), (12, 3)), sig: Some(Known(Fi(0), (12, 2), (12, 3))), body: [Known(Fi(0), (12, 2), (12, 7))] })
+-- + UnusedLocal(Name(Term, Ud(13211085446099756707, 'A'), Ud(8312289520117458465, 'x'), Private((12, 2))), Known(Fi(3), (12, 2), (12, 3)))
+-- + UnusedImport(Term, Ud(7166475107114103771, 'e'), Known(Fi(3), (3, 10), (3, 12)))
+-- + UnusedImport(Type, Ud(17872905433123856768, 'B'), Known(Fi(3), (3, 14), (3, 18)))
+-- + UnusedImport(Class, Ud(5069386282947683699, 'E'), Known(Fi(3), (3, 20), (3, 28)))
+-- + UnusedImportUnqualified(Ud(16567872259610830857, 'C'), Known(Fi(3), (3, 0), (3, 100027)))
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(4506850079084802999, 'f'), Public), DefineSpans { name: Known(Fi(3), (7, 0), (7, 3)), sig: Some(Known(Fi(3), (7, 0), (7, 18))), body: [] })
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(6251214085580200729, 'f'), Public), DefineSpans { name: Known(Fi(3), (12, 0), (12, 1)), sig: Some(Known(Fi(3), (12, 0), (12, 7))), body: [] })
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(8186225505942432243, 'a'), Public), DefineSpans { name: Known(Fi(3), (9, 0), (9, 1)), sig: Some(Known(Fi(3), (9, 0), (9, 6))), body: [Known(Fi(3), (10, 0), (10, 6))] })
+-- + UnusedDefinition(Name(Term, Ud(13211085446099756707, 'A'), Ud(8312289520117458465, 'x'), Private((12, 2))), DefineSpans { name: Known(Fi(3), (12, 2), (12, 3)), sig: Some(Known(Fi(3), (12, 2), (12, 3))), body: [Known(Fi(3), (12, 2), (12, 7))] })
 -- + NAMES
+-- + > <label>
+-- +    Label <label> y Public: ["(Known(Fi(1), (10, 6), (10, 7)), Ref)"]
 -- + > A
 -- +    Type A a Private((7, 14)): ["(Known(Fi(3), (7, 14), (7, 15)), Def)"]
 -- +    Term A foo Public: ["(Known(Fi(3), (7, 0), (7, 3)), Def)"]
 -- +    Term A f Public: ["(Known(Fi(3), (12, 0), (12, 1)), Def)"]
--- +    Term A a Public: ["(Known(Fi(3), (9, 0), (9, 1)), Def)", "(Known(Fi(3), (10, 0), (10, 1)), Def)", "(Known(Fi(3), (10, 0), (10, 1)), Def2)"]
+-- +    Term A a Public: ["(Known(Fi(3), (9, 0), (9, 1)), Def)", "(Known(Fi(3), (10, 0), (10, 1)), Def2)"]
 -- +    Term A x Private((12, 2)): ["(Known(Fi(3), (12, 2), (12, 3)), Def)"]
 -- +    Module A A Public: ["(Known(Fi(3), (0, 7), (0, 8)), Def)"]
 -- +    Namespace A Q Public: ["(Known(Fi(3), (0, 27), (0, 28)), Export)", "(Known(Fi(3), (2, 17), (2, 18)), Def)"]

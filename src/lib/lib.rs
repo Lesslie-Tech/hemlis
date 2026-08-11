@@ -29,6 +29,11 @@ pub fn build_builtins() -> (
 
     let prim = ast::Ud::new("Prim");
 
+    // Record labels have no owning module; `nr` tags them with `Ud::zero()`.
+    // Register a readable name so name/usage dumps don't try to look up an
+    // unregistered sentinel.
+    names.insert(ast::Ud::zero(), "<label>".to_string());
+
     let h = |a: Scope, n: &'static str, s: &'static str| -> (Scope, ast::Ud, ast::Ud) {
         let s_ud = ast::Ud::new(s);
         names.insert(s_ud, s.into());

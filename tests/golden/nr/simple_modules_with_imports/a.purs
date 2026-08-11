@@ -17,12 +17,13 @@ f =
   in
     b
 
--- + args: --names --tree --resolve --imports --exports tests/nr/simple_modules_with_imports/b.purs_import tests/nr/simple_modules_with_imports/c.purs_import tests/nr/simple_modules_with_imports/d.purs_import
+-- + args: --names --tree --resolve --imports --exports tests/golden/nr/simple_modules_with_imports/b.purs_import tests/golden/nr/simple_modules_with_imports/c.purs_import tests/golden/nr/simple_modules_with_imports/d.purs_import
 -- + expected stdout:
--- + Unused("Local is unused", Known(Fi(3), (15, 4), (15, 5)))
--- + NotExportedOrDoesNotExist(Ud(18086178835076887451, false), Term, Ud(16260972211344176173, false), Known(Fi(2), (2, 17), (2, 20)))
--- + Unknown(Term, None, Ud(1475969176590154986, false), Known(Fi(2), (14, 6), (14, 7)))
--- + Unknown(Term, None, Ud(16260972211344176173, false), Known(Fi(2), (16, 6), (16, 9)))
+-- + UnusedDefinition(Name(Class, Ud(16567872259610830857, 'C'), Ud(1586760653624655092, 'O'), Public), DefineSpans { name: Known(Fi(1), (9, 14), (9, 17)), sig: Some(Known(Fi(1), (9, 6), (10, 28))), body: [] })
+-- + UnusedLocal(Name(Term, Ud(13211085446099756707, 'A'), Ud(8186225505942432243, 'a'), Private((15, 4))), Known(Fi(3), (15, 4), (15, 5)))
+-- + NotExportedOrDoesNotExist(Ud(18086178835076887451, 'B'), Term, Ud(16260972211344176173, 'b'), Known(Fi(2), (2, 17), (2, 20)))
+-- + Unknown(Term, None, Ud(1475969176590154986, 'Q'), Known(Fi(2), (14, 6), (14, 7)))
+-- + Unknown(Term, None, Ud(16260972211344176173, 'b'), Known(Fi(2), (16, 6), (16, 9)))
 -- + TREE: B
 -- + Module
 -- +  Header
@@ -30,9 +31,14 @@ f =
 -- +    (0, 7)->(0, 8)
 -- +   NULL
 -- +    ImportDecl
+-- +     (2, 0)->(2, 6)
 -- +     MName
 -- +      (2, 7)->(2, 8)
 -- +     NULL
+-- +     NULL
+-- +     (0, 0)->(0, 0)
+-- +   (0, 0)->(0, 6)
+-- +   (0, 9)->(0, 14)
 -- +   Decl::Def
 -- +    Name
 -- +     (4, 0)->(4, 3)
@@ -78,6 +84,8 @@ f =
 -- +    Export::Typ
 -- +     ProperName
 -- +      (0, 36)->(0, 39)
+-- +   (0, 0)->(0, 6)
+-- +   (0, 41)->(0, 46)
 -- +   Decl::Data
 -- +    ProperName
 -- +     (2, 5)->(2, 8)
@@ -152,12 +160,18 @@ f =
 -- +    (0, 7)->(0, 8)
 -- +   NULL
 -- +    ImportDecl
+-- +     (2, 0)->(2, 6)
 -- +     MName
 -- +      (2, 7)->(2, 8)
 -- +      Import::Value
+-- +       (2, 17)->(2, 20)
 -- +       Name
 -- +        (2, 17)->(2, 20)
 -- +     NULL
+-- +     NULL
+-- +     (4, 0)->(4, 4)
+-- +   (0, 0)->(0, 6)
+-- +   (0, 9)->(0, 14)
 -- +   Decl::Data
 -- +    ProperName
 -- +     (4, 5)->(4, 8)
@@ -272,6 +286,8 @@ f =
 -- +   MName
 -- +    (0, 7)->(0, 8)
 -- +   NULL
+-- +   (0, 0)->(0, 6)
+-- +   (0, 9)->(0, 14)
 -- +   Decl::Data
 -- +    ProperName
 -- +     (2, 5)->(2, 6)
@@ -323,13 +339,13 @@ f =
 -- +           NULL
 -- +           Name
 -- +            (6, 26)->(6, 27)
--- +       (8, 0)->(8, 1)
+-- +       (6, 28)->(6, 29)
 -- +   Decl::Sig
 -- +    Name
 -- +     (8, 0)->(8, 1)
 -- +    Typ::Int
 -- +     Int
--- +      (8, 5)->(8, 7)
+-- +      (8, 5)->(8, 6)
 -- +   Decl::Def
 -- +    Name
 -- +     (9, 0)->(9, 1)
@@ -346,6 +362,7 @@ f =
 -- +         NULL
 -- +         Name
 -- +          (9, 7)->(9, 8)
+-- +       (9, 9)->(9, 10)
 -- +        RecordUpdate::Branch
 -- +         Label
 -- +          (9, 11)->(9, 14)
@@ -357,6 +374,7 @@ f =
 -- +             NULL
 -- +             Name
 -- +              (9, 21)->(9, 22)
+-- +       (9, 25)->(9, 26)
 -- +   Decl::Sig
 -- +    Name
 -- +     (11, 0)->(11, 8)
@@ -397,6 +415,10 @@ f =
 -- +         (17, 4)->(17, 5)
 -- + 
 -- + NAMES
+-- + > <label>
+-- +    Label <label> x Public: ["(Known(Fi(3), (6, 23), (6, 24)), Ref)"]
+-- +    Label <label> r Public: ["(Known(Fi(3), (6, 10), (6, 11)), Ref)"]
+-- +    Label <label> b Public: ["(Known(Fi(2), (19, 8), (19, 9)), Ref)"]
 -- + > D
 -- +    Type D a Private((5, 11)): ["(Known(Fi(2), (5, 11), (5, 12)), Def)"]
 -- +    Type D a Private((13, 14)): ["(Known(Fi(2), (13, 14), (13, 15)), Def)", "(Known(Fi(2), (13, 23), (13, 24)), Ref)", "(Known(Fi(2), (14, 9), (14, 10)), Ref)"]
@@ -404,11 +426,11 @@ f =
 -- +    Type D Maybe Public: ["(Known(Fi(2), (5, 5), (5, 10)), Def)", "(Known(Fi(2), (13, 17), (13, 22)), Ref)"]
 -- +    Type D Tag Public: ["(Known(Fi(2), (4, 5), (4, 8)), Def)", "(Known(Fi(2), (7, 13), (7, 16)), Ref)", "(Known(Fi(2), (7, 20), (7, 23)), Ref)"]
 -- +    Term D tag Private((8, 10)): ["(Known(Fi(2), (8, 10), (8, 13)), Def)", "(Known(Fi(2), (8, 16), (8, 19)), Ref)"]
--- +    Term D foo Public: ["(Known(Fi(2), (13, 0), (13, 3)), Def)", "(Known(Fi(2), (14, 0), (14, 3)), Def)", "(Known(Fi(2), (14, 0), (14, 3)), Def2)"]
+-- +    Term D foo Public: ["(Known(Fi(2), (13, 0), (13, 3)), Def)", "(Known(Fi(2), (14, 0), (14, 3)), Def2)"]
 -- +    Term D a Private((19, 2)): ["(Known(Fi(2), (19, 2), (19, 3)), Def)", "(Known(Fi(2), (19, 6), (19, 7)), Ref)"]
--- +    Term D x Public: ["(Known(Fi(2), (18, 0), (18, 1)), Def)", "(Known(Fi(2), (19, 0), (19, 1)), Def)", "(Known(Fi(2), (19, 0), (19, 1)), Def2)"]
+-- +    Term D x Public: ["(Known(Fi(2), (18, 0), (18, 1)), Def)", "(Known(Fi(2), (19, 0), (19, 1)), Def2)"]
 -- +    Term D biz Public: ["(Known(Fi(2), (16, 0), (16, 3)), Def)"]
--- +    Term D internal_ Public: ["(Known(Fi(2), (7, 0), (7, 9)), Def)", "(Known(Fi(2), (8, 0), (8, 9)), Def)", "(Known(Fi(2), (8, 0), (8, 9)), Def2)"]
+-- +    Term D internal_ Public: ["(Known(Fi(2), (7, 0), (7, 9)), Def)", "(Known(Fi(2), (8, 0), (8, 9)), Def2)"]
 -- +    Module D D Public: ["(Known(Fi(2), (0, 7), (0, 8)), Def)"]
 -- + > A
 -- +    Type A a Private((4, 11)): ["(Known(Fi(3), (4, 11), (4, 12)), Def)", "(Known(Fi(3), (4, 18), (4, 19)), Ref)"]
@@ -419,7 +441,7 @@ f =
 -- +    Term A readJSON Public: ["(Known(Fi(3), (11, 0), (11, 8)), Def)"]
 -- +    Term A f Public: ["(Known(Fi(0), (5, 15), (5, 16)), Ref)", "(Known(Fi(3), (13, 0), (13, 1)), Def)"]
 -- +    Term A a Private((15, 4)): ["(Known(Fi(3), (15, 4), (15, 5)), Def)"]
--- +    Term A a Public: ["(Known(Fi(3), (8, 0), (8, 1)), Def)", "(Known(Fi(3), (9, 0), (9, 1)), Def)", "(Known(Fi(3), (9, 0), (9, 1)), Def2)", "(Known(Fi(3), (9, 7), (9, 8)), Ref)", "(Known(Fi(3), (9, 21), (9, 22)), Ref)"]
+-- +    Term A a Public: ["(Known(Fi(3), (8, 0), (8, 1)), Def)", "(Known(Fi(3), (9, 0), (9, 1)), Def2)", "(Known(Fi(3), (9, 7), (9, 8)), Ref)", "(Known(Fi(3), (9, 21), (9, 22)), Ref)"]
 -- +    Term A r Private((6, 10)): ["(Known(Fi(3), (6, 10), (6, 11)), Def)", "(Known(Fi(3), (6, 26), (6, 27)), Ref)"]
 -- +    Term A C Public: ["(Known(Fi(3), (2, 13), (2, 14)), Def)"]
 -- +    Term A QQ Public: ["(Known(Fi(3), (4, 15), (4, 17)), Def)", "(Known(Fi(3), (9, 4), (9, 6)), Ref)"]

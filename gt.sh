@@ -1,2 +1,4 @@
 #!/usr/bin/env bash
-cargo b && goldentests --overwrite target/debug/hemlis tests/ -- "-- + "
+# Regenerate golden-test baselines by running the in-tree harness in overwrite
+# mode. No external `goldentests` binary required.
+GOLDENTESTS_OVERWRITE=1 cargo test --test goldentests

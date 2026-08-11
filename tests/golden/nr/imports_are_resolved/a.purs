@@ -2,9 +2,10 @@ module A where
 
 b = 1
 
--- + args: --names --xx --resolve tests/nr/imports_are_resolved/a.purs tests/nr/imports_are_resolved/b.purs_import
+-- + args: --names --xx --resolve tests/golden/nr/imports_are_resolved/a.purs tests/golden/nr/imports_are_resolved/b.purs_import
 -- + expected stdout:
--- + Unused("Term is unused", Known(Fi(1), (2, 10), (2, 11)))
+-- + UnusedImport(Term, Ud(16993177596579750922, 'b'), Known(Fi(1), (2, 10), (2, 11)))
+-- + UnusedImportUnqualified(Ud(13211085446099756707, 'A'), Known(Fi(1), (2, 0), (2, 100010)))
 -- + NAMES
 -- + > A
 -- +    Term A b Public: ["(Known(Fi(1), (2, 10), (2, 11)), Import)", "(Known(Fi(2), (2, 0), (2, 1)), Def)"]

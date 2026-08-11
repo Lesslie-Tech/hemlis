@@ -19,13 +19,15 @@ f =
 
 -- + args: --tree --names --resolve
 -- + expected stdout:
--- + Unused("Local is unused", Known(Fi(0), (15, 4), (15, 5)))
+-- + UnusedLocal(Name(Term, Ud(13211085446099756707, 'A'), Ud(8186225505942432243, 'a'), Private((15, 4))), Known(Fi(0), (15, 4), (15, 5)))
 -- + TREE: A
 -- + Module
 -- +  Header
 -- +   MName
 -- +    (0, 7)->(0, 8)
 -- +   NULL
+-- +   (0, 0)->(0, 6)
+-- +   (0, 9)->(0, 14)
 -- +   Decl::Data
 -- +    ProperName
 -- +     (2, 5)->(2, 6)
@@ -77,13 +79,13 @@ f =
 -- +           NULL
 -- +           Name
 -- +            (6, 26)->(6, 27)
--- +       (8, 0)->(8, 1)
+-- +       (6, 28)->(6, 29)
 -- +   Decl::Sig
 -- +    Name
 -- +     (8, 0)->(8, 1)
 -- +    Typ::Int
 -- +     Int
--- +      (8, 5)->(8, 7)
+-- +      (8, 5)->(8, 6)
 -- +   Decl::Def
 -- +    Name
 -- +     (9, 0)->(9, 1)
@@ -100,6 +102,7 @@ f =
 -- +         NULL
 -- +         Name
 -- +          (9, 7)->(9, 8)
+-- +       (9, 9)->(9, 10)
 -- +        RecordUpdate::Branch
 -- +         Label
 -- +          (9, 11)->(9, 14)
@@ -111,6 +114,7 @@ f =
 -- +             NULL
 -- +             Name
 -- +              (9, 21)->(9, 22)
+-- +       (9, 25)->(9, 26)
 -- +   Decl::Sig
 -- +    Name
 -- +     (11, 0)->(11, 8)
@@ -151,6 +155,9 @@ f =
 -- +         (17, 4)->(17, 5)
 -- + 
 -- + NAMES
+-- + > <label>
+-- +    Label <label> x Public: ["(Known(Fi(0), (6, 23), (6, 24)), Ref)"]
+-- +    Label <label> r Public: ["(Known(Fi(0), (6, 10), (6, 11)), Ref)"]
 -- + > A
 -- +    Type A a Private((4, 11)): ["(Known(Fi(0), (4, 11), (4, 12)), Def)", "(Known(Fi(0), (4, 18), (4, 19)), Ref)"]
 -- +    Type A a Private((11, 20)): ["(Known(Fi(0), (11, 20), (11, 21)), Def)", "(Known(Fi(0), (11, 30), (11, 31)), Ref)"]
@@ -160,7 +167,7 @@ f =
 -- +    Term A readJSON Public: ["(Known(Fi(0), (11, 0), (11, 8)), Def)"]
 -- +    Term A f Public: ["(Known(Fi(0), (13, 0), (13, 1)), Def)"]
 -- +    Term A a Private((15, 4)): ["(Known(Fi(0), (15, 4), (15, 5)), Def)"]
--- +    Term A a Public: ["(Known(Fi(0), (8, 0), (8, 1)), Def)", "(Known(Fi(0), (9, 0), (9, 1)), Def)", "(Known(Fi(0), (9, 0), (9, 1)), Def2)", "(Known(Fi(0), (9, 7), (9, 8)), Ref)", "(Known(Fi(0), (9, 21), (9, 22)), Ref)"]
+-- +    Term A a Public: ["(Known(Fi(0), (8, 0), (8, 1)), Def)", "(Known(Fi(0), (9, 0), (9, 1)), Def2)", "(Known(Fi(0), (9, 7), (9, 8)), Ref)", "(Known(Fi(0), (9, 21), (9, 22)), Ref)"]
 -- +    Term A r Private((6, 10)): ["(Known(Fi(0), (6, 10), (6, 11)), Def)", "(Known(Fi(0), (6, 26), (6, 27)), Ref)"]
 -- +    Term A C Public: ["(Known(Fi(0), (2, 13), (2, 14)), Def)"]
 -- +    Term A QQ Public: ["(Known(Fi(0), (4, 15), (4, 17)), Def)", "(Known(Fi(0), (9, 4), (9, 6)), Ref)"]
