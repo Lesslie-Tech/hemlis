@@ -17,6 +17,7 @@ Module
    GuardedExpr::Unconditional
     Expr::Do
      NULL
+     (3, 4)->(3, 6)
       DoStmt::Stmt
        Binder::Var
         Name

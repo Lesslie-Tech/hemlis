@@ -95,6 +95,7 @@ Module
               (13, 12)->(13, 13)
           Expr::Do
            NULL
+           (15, 8)->(15, 10)
             DoStmt::Stmt
              Binder::Var
               Name
