@@ -624,6 +624,9 @@ fn typ_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Typ> {
 pub(crate) enum Prec {
     L(usize),
     R(usize),
+    /// Non-associative (PureScript `infix`), e.g. `==` and `/=`. Chaining these (`x == y == z`)
+    /// has no meaningful associativity, so neither operand's parens are ever redundant.
+    N(usize),
 }
 
 impl Prec {
@@ -632,8 +635,10 @@ impl Prec {
     }
 
     fn next(&self, current: usize) -> Option<usize> {
+        // `N` mirrors `L` here so parsing is unchanged: a non-associative op does not recurse into
+        // its right operand at equal precedence.
         match (current, self) {
-            (s, Self::L(o)) if o > &s => Some(s + 1),
+            (s, Self::L(o) | Self::N(o)) if o > &s => Some(s + 1),
             (s, Self::R(o)) if o > &s => Some(s + 1),
             (s, Self::R(o)) if o == &s => Some(s),
             _ => None,
@@ -642,12 +647,18 @@ impl Prec {
 
     pub fn prec(&self) -> usize {
         match self {
-            Self::L(a) | Self::R(a) => *a,
+            Self::L(a) | Self::R(a) | Self::N(a) => *a,
         }
     }
 
     pub fn is_left(&self) -> bool {
         matches!(self, Self::L(_))
+    }
+
+    /// True for non-associative operators (`infix`), where chaining is not meaningfully
+    /// left- or right-associative.
+    pub fn is_non_assoc(&self) -> bool {
+        matches!(self, Self::N(_))
     }
 }
 
@@ -921,10 +932,10 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     }
     // Precedence 4
     if ud == Ud::new("==") {
-        return L(5);
+        return N(5);
     }
     if ud == Ud::new("/=") {
-        return L(5);
+        return N(5);
     }
     if ud == Ud::new("<") {
         return L(5);

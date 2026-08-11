@@ -508,18 +508,28 @@ fn rule_unnecessary_parens(
         let same_op_removable = match (outer_op, inner.as_ref()) {
             (Some((outer, on_left)), ast::Expr::Op(_, inner_qop, _)) => {
                 let inner_ud = (inner_qop.1).0 .0;
-                // Same operator: the parens are only redundant on the associativity side.
-                inner_ud == outer && (on_left == op_fixity(inner_ud).is_left())
+                // Same operator: the parens are only redundant on the associativity side. A
+                // non-associative operator (`==`, `/=`) has no associativity side, so its parens
+                // are never redundant — `(x == y) == z` must keep them.
+                inner_ud == outer
+                    && !op_fixity(inner_ud).is_non_assoc()
+                    && (on_left == op_fixity(inner_ud).is_left())
             }
             _ => false,
         };
         // "Whole expression in its context" removal is unsafe for an open expression that isn't in
         // tail position: it would extend right and swallow the following token. (PAY-3322)
         let whole_expr_removable = !inside_app_or_op && (tail_ok || !is_open_expr(inner));
-        let removable = matches!(inner.as_ref(), ast::Expr::Paren(..))
-            || is_atom(inner)
-            || whole_expr_removable
-            || same_op_removable;
+        // An operator section like `("a" <> _)` is a lambda shorthand: the parens are what make
+        // the `_` a section rather than a bare wildcard/hole. Removing them changes the meaning,
+        // so the parens are always necessary.
+        let is_operator_section = matches!(inner.as_ref(), ast::Expr::Op(l, _, r)
+            if matches!(l.as_ref(), ast::Expr::Section(_)) || matches!(r.as_ref(), ast::Expr::Section(_)));
+        let removable = !is_operator_section
+            && (matches!(inner.as_ref(), ast::Expr::Paren(..))
+                || is_atom(inner)
+                || whole_expr_removable
+                || same_op_removable);
         if removable {
             emit_remove_parens(expr, source, out);
         }
@@ -531,6 +541,12 @@ fn rule_unnecessary_parens(
 // ---------------------------------------------------------------------------
 
 fn is_typ_atom(typ: &ast::Typ) -> bool {
+    // A negative type-level int (`-1`) is a prefix form, not an atom: unwrapping
+    // `(-1)` in application/operand position would not reparse (`Compare n -1 GT`).
+    // Treat it like value-level `Negate` and keep its parens.
+    if matches!(typ, ast::Typ::Int(true, _)) {
+        return false;
+    }
     matches!(
         typ,
         ast::Typ::Wildcard(_)

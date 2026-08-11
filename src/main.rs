@@ -2911,6 +2911,33 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn style_keep_parens_operator_section() {
+        // ("a" <> _) is an operator section (lambda shorthand). Removing the parens
+        // leaves the bare `_` as a wildcard/hole, changing the meaning entirely.
+        assert_no_code_action(indoc! {r#"
+                module Test where
+
+                f = Array.apply [ ("a" <> _), ("b" <> _) ] [ "c", "d" ]
+                                  ^ Remove unnecessary parenthesis
+            "#})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_eq_left_operand() {
+        // (x == y) == false — == has no meaningful directionality (it is symmetric), so
+        // chaining `x == y == false` reads as ambiguous/confusing even if it parses. Keep
+        // the parens.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                notEq x y = (x == y) == false
+                            ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
     // --- Unnecessary type parenthesis ---
 
     #[tokio::test]
