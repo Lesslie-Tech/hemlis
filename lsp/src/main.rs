@@ -9,7 +9,6 @@ use std::str::FromStr;
 use std::sync::RwLock;
 use std::thread::sleep;
 use std::time::Duration;
-// use tokio::sync::RwLock;
 
 use ast::{Ast, Pos};
 use dashmap::DashMap;
@@ -336,7 +335,7 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_hover_snippet, strip_hover_comment_prefix, StyleMode};
+    use super::{StyleMode, format_hover_snippet, strip_hover_comment_prefix};
     use indoc::indoc;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{CodeActionOrCommand, TextEdit, Uri};
@@ -1013,9 +1012,7 @@ mod tests {
         let (target_idx, _) = modules
             .iter()
             .enumerate()
-            .find(|(_, (_, src))| {
-                src.lines().any(|l| l.trim_start().starts_with('~'))
-            })
+            .find(|(_, (_, src))| src.lines().any(|l| l.trim_start().starts_with('~')))
             .expect("One module must contain a `~~~ Warning message` marker line");
 
         let (_, target_src) = &modules[target_idx];
@@ -1249,18 +1246,6 @@ mod tests {
 
             f = Just 1
                 ~~~~
-        "})
-        .await;
-    }
-
-    #[tokio::test]
-    async fn style_no_warn_qualified_nothing() {
-        // Only Just/Left/Right are flagged; other qualified constructors are fine.
-        assert_no_warning(indoc! {"
-            module Test where
-
-            f = Maybe.Nothing
-                ~~~~~~~~~~~~~
         "})
         .await;
     }
@@ -3902,7 +3887,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<PrepareRenameResponse>> {
         if let Some((name, range)) =
             self.resolve_name_and_range(&params.text_document.uri, params.position)
-        && name.scope() != nr::Scope::Label
+            && name.scope() != nr::Scope::Label
         {
             Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
                 range,
@@ -4570,22 +4555,20 @@ impl LanguageServer for Backend {
                         ..CodeAction::default()
                     })
                 }
-                Fixable::RemoveUnusedConstructors(del_span) => {
-                    out.push(CodeAction {
-                        title: "RemoveUnusedConstructors".into(),
-                        kind: Some(CodeActionKind::QUICKFIX),
-                        diagnostics: None,
-                        edit: Some(WorkspaceEdit::new(
-                            [(
-                                uri.clone(),
-                                vec![TextEdit::new(span_to_range(del_span), "".into())],
-                            )]
-                            .into(),
-                        )),
-                        is_preferred: Some(true),
-                        ..CodeAction::default()
-                    })
-                }
+                Fixable::RemoveUnusedConstructors(del_span) => out.push(CodeAction {
+                    title: "RemoveUnusedConstructors".into(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: None,
+                    edit: Some(WorkspaceEdit::new(
+                        [(
+                            uri.clone(),
+                            vec![TextEdit::new(span_to_range(del_span), "".into())],
+                        )]
+                        .into(),
+                    )),
+                    is_preferred: Some(true),
+                    ..CodeAction::default()
+                }),
                 // Warn-only diagnostics have no associated code action.
                 Fixable::Warn(_, _) => {}
                 Fixable::RenameEdits(edits, title, _) => {
@@ -4599,9 +4582,7 @@ impl LanguageServer for Backend {
                         title: title.clone(),
                         kind: Some(CodeActionKind::QUICKFIX),
                         diagnostics: None,
-                        edit: Some(WorkspaceEdit::new(
-                            [(uri.clone(), text_edits)].into(),
-                        )),
+                        edit: Some(WorkspaceEdit::new([(uri.clone(), text_edits)].into())),
                         is_preferred: Some(true),
                         ..CodeAction::default()
                     })
@@ -4625,7 +4606,7 @@ impl LanguageServer for Backend {
                         if let ast::Decl::Def(name, binders, _) = decl {
                             binders.iter().enumerate().find_map(|(idx, binder)| {
                                 if binder_is_simple_var(binder) && binder.span().contains(at.lo()) {
-                                    Some((name.0 .0, idx))
+                                    Some((name.0.0, idx))
                                 } else {
                                     None
                                 }
@@ -4641,7 +4622,7 @@ impl LanguageServer for Backend {
                         for decl in module.1.iter() {
                             match decl {
                                 ast::Decl::Def(name, binders, _)
-                                    if name.0 .0 == func_ud && binders.len() > param_idx =>
+                                    if name.0.0 == func_ud && binders.len() > param_idx =>
                                 {
                                     let source = self.fi_to_source.try_get(&fi).try_unwrap();
                                     let binder_spans: Vec<_> = binders
@@ -4656,7 +4637,7 @@ impl LanguageServer for Backend {
                                         "".into(),
                                     ));
                                 }
-                                ast::Decl::Sig(name, typ) if name.0 .0 == func_ud => {
+                                ast::Decl::Sig(name, typ) if name.0.0 == func_ud => {
                                     let types = flatten_arr_chain(typ);
                                     if param_idx < types.len().saturating_sub(1) {
                                         let type_spans: Vec<_> =
@@ -4700,14 +4681,14 @@ impl LanguageServer for Backend {
                                     let field_ud = match field {
                                         ast::RecordLabelBinder::Pun(n) => {
                                             if n.span().contains(at.lo()) {
-                                                Some(n.0 .0)
+                                                Some(n.0.0)
                                             } else {
                                                 None
                                             }
                                         }
                                         _ => None,
                                     };
-                                    field_ud.map(|ud| (name.0 .0, param_idx, ud))
+                                    field_ud.map(|ud| (name.0.0, param_idx, ud))
                                 })
                             })
                         } else {
@@ -4720,7 +4701,7 @@ impl LanguageServer for Backend {
                         // remove the entire parameter and its type arrow instead.
                         let is_last_field = module.1.iter().any(|decl| {
                             if let ast::Decl::Def(name, binders, _) = decl {
-                                if name.0 .0 != func_ud || binders.len() <= param_idx {
+                                if name.0.0 != func_ud || binders.len() <= param_idx {
                                     return false;
                                 }
                                 let fields = match &binders[param_idx] {
@@ -4742,7 +4723,7 @@ impl LanguageServer for Backend {
                         for decl in module.1.iter() {
                             match decl {
                                 ast::Decl::Def(name, binders, _)
-                                    if name.0 .0 == func_ud && binders.len() > param_idx =>
+                                    if name.0.0 == func_ud && binders.len() > param_idx =>
                                 {
                                     if is_last_field {
                                         let source = self.fi_to_source.try_get(&fi).try_unwrap();
@@ -4780,7 +4761,7 @@ impl LanguageServer for Backend {
                                         }
                                     }
                                 }
-                                ast::Decl::Sig(name, typ) if name.0 .0 == func_ud => {
+                                ast::Decl::Sig(name, typ) if name.0.0 == func_ud => {
                                     let types = flatten_arr_chain(typ);
                                     if param_idx < types.len().saturating_sub(1) {
                                         if is_last_field {
@@ -4793,7 +4774,7 @@ impl LanguageServer for Backend {
                                         } else if let ast::Typ::Record(s_row) = types[param_idx] {
                                             let row = &s_row.0;
                                             if let Some(idx) =
-                                                row.0.iter().position(|(l, _)| l.0 .0 == field_ud)
+                                                row.0.iter().position(|(l, _)| l.0.0 == field_ud)
                                             {
                                                 let row_spans: Vec<_> =
                                                     row.0.iter().map(|f| f.span()).collect();
@@ -5334,7 +5315,7 @@ pub fn nrerror_turn_into_diagnostic(
             Vec::new(),
         ),
         NRerrors::NotAConstructor(d, m) => create_error(
-            m.0 .1,
+            m.0.1,
             "NotAConstructor".into(),
             format!(
                 "{} does not have a constructors {}",
@@ -5344,7 +5325,7 @@ pub fn nrerror_turn_into_diagnostic(
                     .map(|x| x.clone())
                     .unwrap_or_else(|| "?".into()),
                 names
-                    .try_get(&m.0 .0)
+                    .try_get(&m.0.0)
                     .try_unwrap()
                     .map(|x| x.clone())
                     .unwrap_or_else(|| "?".into())
@@ -5568,14 +5549,10 @@ impl Backend {
                     let m = m?;
                     let (me, imports) = {
                         let header = m.0.clone()?;
-                        let me = header.0 .0 .0;
+                        let me = header.0.0.0;
                         (
                             me,
-                            header
-                                .2
-                                .iter()
-                                .map(|x| x.from.0 .0)
-                                .collect::<BTreeSet<_>>(),
+                            header.2.iter().map(|x| x.from.0.0).collect::<BTreeSet<_>>(),
                         )
                     };
                     self.modules.insert(me, m.clone());
@@ -5650,7 +5627,7 @@ impl Backend {
         fi: ast::Fi,
         version: Option<i32>,
     ) -> Option<(bool, ast::Ud)> {
-        let me = m.0.as_ref()?.0 .0 .0;
+        let me = m.0.as_ref()?.0.0.0;
         let mut n = nr::N::new(me, &self.exports);
         nr::resolve_names(&mut n, self.prim, m);
 
@@ -5954,15 +5931,21 @@ impl Backend {
                 .filter_map(|(anchor_span, f)| match f {
                     // Anchor the warning on the cursor span (e.g. just the
                     // operator), which may be narrower than the replacement range.
-                    Fixable::ReplaceExpression(_, _, _, message) => message
-                        .as_ref()
-                        .map(|msg| create_warning(*anchor_span, "style".into(), msg.clone(), vec![])),
-                    Fixable::Warn(_, message) => {
-                        Some(create_warning(*anchor_span, "style".into(), message.clone(), vec![]))
-                    }
-                    Fixable::RenameEdits(_, _, message) => {
-                        Some(create_warning(*anchor_span, "style".into(), message.clone(), vec![]))
-                    }
+                    Fixable::ReplaceExpression(_, _, _, message) => message.as_ref().map(|msg| {
+                        create_warning(*anchor_span, "style".into(), msg.clone(), vec![])
+                    }),
+                    Fixable::Warn(_, message) => Some(create_warning(
+                        *anchor_span,
+                        "style".into(),
+                        message.clone(),
+                        vec![],
+                    )),
+                    Fixable::RenameEdits(_, _, message) => Some(create_warning(
+                        *anchor_span,
+                        "style".into(),
+                        message.clone(),
+                        vec![],
+                    )),
                     _ => None,
                 })
                 .collect()

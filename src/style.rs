@@ -711,6 +711,7 @@ fn rule_unqualified_pure(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
 /// qualifier alias as written. (qualifier, constructor)
 const QUALIFIED_CONSTRUCTORS: &[(&str, &str)] = &[
     ("Maybe", "Just"),
+    ("Maybe", "Nothing"),
     ("Either", "Left"),
     ("Either", "Right"),
 ];
