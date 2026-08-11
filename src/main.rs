@@ -1,54 +1,6244 @@
-use std::{collections::BTreeSet, env};
+#![allow(clippy::type_complexity)]
+#![feature(btree_cursors)]
 
-use hemlis_lib::{parse_and_resolve_names, parse_modules, version, Flag as LibFlag};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Bound;
+use std::str::FromStr;
+use std::sync::RwLock;
+use std::thread::sleep;
+use std::time::Duration;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
-enum Flag {
-    Resolve,
-    Parse,
-    Version,
+use ast::{Ast, Pos};
+use dashmap::DashMap;
+use futures::future::join_all;
+use hemlis_lib::*;
+use nr::{Export, NRerrors, Name, Scope, Visibility};
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tower_lsp_server::jsonrpc::{Error, ErrorCode, Result};
+use tower_lsp_server::ls_types::notification::Notification;
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tracing::instrument;
+use tracing_subscriber::filter::FilterFn;
+use tracing_subscriber::{layer::SubscriberExt, prelude::*, util::SubscriberInitExt};
+
+macro_rules! or_ {
+    ($e:expr, $b:block) => {
+        if let Some(x) = $e {
+            x
+        } else $b
+    }
 }
 
-#[allow(dead_code)]
-fn main() {
-    let mut flags = BTreeSet::new();
-    let mut lib_flags = BTreeSet::new();
-    let mut files = Vec::new();
-    let mut parsing_options = true;
-    for arg in env::args().skip(1) {
-        if arg == "--" {
-            parsing_options = true;
-            continue;
+fn span_to_range(s: &ast::Span) -> Range {
+    range(s.lo(), s.hi())
+}
+
+fn range(lo: ast::Pos, hi: ast::Pos) -> Range {
+    Range {
+        start: pos_from_tup(lo),
+        end: pos_from_tup(hi),
+    }
+}
+
+#[derive(Debug)]
+struct Backend {
+    client: Client,
+
+    prim: ast::Ud,
+
+    locked: RwLock<()>,
+    has_started: RwLock<bool>,
+    names: DashMap<ast::Ud, String>,
+
+    fi_to_uri: DashMap<ast::Fi, Uri>,
+    fi_to_ud: DashMap<ast::Fi, ast::Ud>,
+    fi_to_source: DashMap<ast::Fi, String>,
+    uri_to_fi: DashMap<Uri, ast::Fi>,
+    fi_to_version: DashMap<ast::Fi, Option<i32>>,
+    ud_to_fi: DashMap<ast::Ud, ast::Fi>,
+
+    importers: DashMap<ast::Ud, BTreeSet<ast::Ud>>,
+    imports: DashMap<ast::Ud, BTreeMap<Option<ast::Ud>, Vec<Export>>>,
+
+    previouse_global_usages: DashMap<ast::Fi, BTreeSet<(Name, ast::Span, nr::Sort)>>,
+    // NOTE: Maybe I should remove these clones - but maybe there are bigger fish to fry in this
+    // codebase.
+    previouse_defines: DashMap<ast::Fi, BTreeSet<(Name, nr::DefineSpans)>>,
+
+    // The option here should always be Some - but `None` lets us do a better partition search
+    // here.
+    available_locals: DashMap<ast::Fi, BTreeSet<((usize, usize), Option<Name>)>>,
+
+    exports: DashMap<ast::Ud, Vec<Export>>,
+    modules: DashMap<ast::Ud, ast::Module>,
+    resolved: DashMap<ast::Ud, BTreeMap<(Pos, Pos), Name>>,
+    defines: DashMap<Name, nr::DefineSpans>,
+    // TODO: Fields are technically not memory managed here - they are just always appended. This
+    // should probably be fixed - but ATM computers are fast LOL.
+    //
+    // This can easily be fixed by stripping out the field names if we come accross them - but we
+    // can also like not do that.
+    references: DashMap<ast::Ud, BTreeMap<Name, BTreeSet<(ast::Span, nr::Sort)>>>,
+
+    syntax_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
+    name_resolution_errors: DashMap<ast::Fi, Vec<tower_lsp_server::ls_types::Diagnostic>>,
+    fixables: DashMap<ast::Fi, Vec<(ast::Span, Fixable)>>,
+    /// Files currently open in the editor (tracked via didOpen/didClose).
+    open_files: DashMap<ast::Fi, ()>,
+
+    /// Whether the client supports dynamic registration of workspace/didChangeWatchedFiles.
+    /// If false, the server sets up its own native file watcher.
+    client_watch_dynamic_registration: std::sync::OnceLock<bool>,
+
+    /// Controls when style diagnostics and code actions are produced.
+    style_mode: RwLock<StyleMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StyleMode {
+    /// No style diagnostics or code actions.
+    Off,
+    /// Style checks only for files open in the editor (default).
+    OpenFilesOnly,
+    /// Style checks for all files in the workspace.
+    AllFiles,
+}
+
+impl Default for StyleMode {
+    fn default() -> Self {
+        Self::OpenFilesOnly
+    }
+}
+
+impl StyleMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "openFilesOnly" => Self::OpenFilesOnly,
+            "allFiles" => Self::AllFiles,
+            _ => Self::default(),
         }
-        if parsing_options && arg.starts_with("-") {
-            match arg.as_ref() {
-                "-t" | "--tokens" => lib_flags.insert(LibFlag::Tokens),
-                "-a" | "--tree" => lib_flags.insert(LibFlag::Tree),
-                "-n" | "--names" => lib_flags.insert(LibFlag::Usages),
-                "-e" | "--exports" => lib_flags.insert(LibFlag::Exports),
-                "-i" | "--imports" => lib_flags.insert(LibFlag::Imports),
-                "-x" | "--xx" => lib_flags.insert(LibFlag::Resolved),
-                "-r" | "--resolve" => flags.insert(Flag::Resolve),
-                "-p" | "--parse" => flags.insert(Flag::Parse),
-                "-v" | "--version" => flags.insert(Flag::Version),
-                _ => {
-                    eprintln!("Not a valid argument {} - aborting", arg);
-                    continue;
-                }
-            };
-        } else {
-            parsing_options = false;
-            files.push(arg);
+    }
+}
+
+impl Backend {
+    fn resolve_name(&self, uri: &Uri, pos: Position) -> Option<Name> {
+        let m = self
+            .fi_to_ud
+            .try_get(&*self.uri_to_fi.try_get(uri).try_unwrap()?)
+            .try_unwrap()?;
+        let pos = (pos.line as usize, pos.character as usize + 1);
+        let lut = self.resolved.try_get(&m).try_unwrap()?;
+        let cur = lut.lower_bound(Bound::Included(&(pos, pos)));
+        let ((lo, hi), name) = cur.peek_prev()?;
+        if !(*lo <= pos && pos <= *hi) {
+            return None;
+        }
+        Some(*name)
+    }
+
+    fn resolve_name_and_range(&self, uri: &Uri, pos: Position) -> Option<(Name, Range)> {
+        let m = self
+            .fi_to_ud
+            .try_get(&*self.uri_to_fi.try_get(uri).try_unwrap()?)
+            .try_unwrap()?;
+        let pos = (pos.line as usize, pos.character as usize + 1);
+        let lut = self.resolved.try_get(&m).try_unwrap()?;
+        let cur = lut.lower_bound(Bound::Included(&(pos, pos)));
+        let ((lo, hi), name) = cur.peek_prev()?;
+        if !(*lo <= pos && pos <= *hi) {
+            return None;
+        }
+        Some((*name, range(*lo, *hi)))
+    }
+
+    fn got_refresh(&self, fi: ast::Fi, version: Option<i32>) -> bool {
+        match self.fi_to_version.try_get(&fi) {
+            dashmap::try_result::TryResult::Present(x) => x.value() != &version,
+            dashmap::try_result::TryResult::Absent => true,
+            dashmap::try_result::TryResult::Locked => true,
         }
     }
 
-    if flags.contains(&Flag::Version) {
-        println!("version: {}", version());
-        return;
+    fn get_documentation_for_name(&self, name: Name) -> String {
+        use std::fmt::Write;
+        let mut target = String::new();
+
+        (|| {
+            let def_at = self.defines.try_get(&name).try_unwrap()?;
+            let fi = *self.ud_to_fi.try_get(&name.module()).try_unwrap()?;
+            let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
+
+            let whole_thing = def_at
+                .body
+                .span()
+                .merge(def_at.name)
+                .merge(def_at.sig.unwrap_or(def_at.name));
+
+            if whole_thing.line_range() < 8
+                || (name.scope() != Scope::Module && name.name().is_proper())
+            {
+                // This is an artifact of the parser not knowing where comments belong - here it
+                // thinks the comments are part of the tail of the def - not the head of the
+                // next def.
+                if let Some(x) = try_find_lines(
+                    &source,
+                    whole_thing.lo().0,
+                    if whole_thing.hi().1 < 2 {
+                        whole_thing.hi().0.saturating_sub(1)
+                    } else {
+                        whole_thing.hi().0
+                    },
+                ) {
+                    writeln!(target, "```purescript").unwrap();
+                    format_hover_snippet(x, true).split('\n').for_each(|x| {
+                        writeln!(target, "{}", x).unwrap();
+                    });
+                    writeln!(target, "```").unwrap();
+                }
+            } else {
+                let the_thing = def_at.name.merge(def_at.sig.unwrap_or(def_at.name));
+                if let Some(x) = try_find_lines(&source, the_thing.lo().0, the_thing.hi().0) {
+                    writeln!(target, "```purescript").unwrap();
+                    format_hover_snippet(x, false).split('\n').for_each(|x| {
+                        writeln!(target, "{}", x).unwrap();
+                    });
+                    writeln!(target, "```").unwrap();
+                }
+            }
+
+            if let Some(x) =
+                try_find_comments_before(&source, def_at.sig.unwrap_or(def_at.name).lo().0)
+            {
+                writeln!(target).unwrap();
+                x.split("\n").for_each(|x| {
+                    writeln!(target, "{}", strip_hover_comment_prefix(x)).unwrap();
+                })
+            }
+
+            Some(())
+        })();
+
+        if !target.is_empty() {
+            writeln!(target).unwrap();
+        }
+        write!(target, "{:?} {}", name.scope(), self.name_(&name.name())).unwrap();
+        if let Some(module_name) = self.name(&name.module()) {
+            write!(target, ", in {}", module_name).unwrap();
+        }
+        writeln!(target).unwrap();
+        target
     }
-    if flags.contains(&Flag::Resolve) {
-        parse_and_resolve_names(lib_flags, files);
+}
+
+fn try_find_word(source: &str, line: usize, offset: usize) -> Option<&str> {
+    let mut it = source.match_indices("\n");
+    let (line_start, _) = it.nth(line.saturating_sub(1))?;
+    let (line_end, _) = it.next()?;
+    let at = (line_start + 1 + offset).min(line_end);
+    let start = source[..at].rfind(char::is_whitespace)?;
+    let end = source[at..].find(char::is_whitespace)?;
+    Some(&source[start + 1..end + at])
+}
+
+fn try_find_lines(source: &str, lo: usize, hi: usize) -> Option<&str> {
+    let mut it = source.match_indices("\n");
+    let (line_start, _) = it.nth(lo.saturating_sub(1))?;
+    let (line_end, _) = it.nth(hi - lo)?;
+    Some(&source[line_start + 1..line_end])
+}
+
+fn dedent(s: &str) -> String {
+    let min_indent = s
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    s.split('\n')
+        .map(|line| {
+            if line.len() >= min_indent {
+                &line[min_indent..]
+            } else {
+                line.trim_start()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_hover_snippet(source: &str, trim_trailing_comments: bool) -> String {
+    let source = if trim_trailing_comments {
+        source
+            .split('\n')
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .skip_while(|line| {
+                let line = line.trim();
+                line.starts_with("--") || line.is_empty()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
     } else {
-        parse_modules(lib_flags, files);
+        source.to_string()
+    };
+    dedent(&source)
+        .split('\n')
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn strip_hover_comment_prefix(line: &str) -> &str {
+    line.trim_start()
+        .trim_start_matches("--")
+        .trim_start()
+        .trim_start_matches("|")
+        .trim_start()
+}
+
+fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
+    let mut it = source.match_indices("\n");
+    let (at, _) = it.nth(line)?;
+    let last = source[..at].rfind("\n")?;
+    let mut first = last;
+    while let Some(better_guess) = (|| {
+        let better_guess = source[..first].rfind("\n")?;
+        let comment_at = source[better_guess..first].find("--")?;
+        if source[better_guess..better_guess + comment_at]
+            .chars()
+            .all(char::is_whitespace)
+        {
+            Some(better_guess)
+        } else {
+            None
+        }
+    })() {
+        first = better_guess;
     }
+    let first = first;
+    if first == last {
+        None
+    } else {
+        Some(&source[first + 1..last])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StyleMode, format_hover_snippet, strip_hover_comment_prefix};
+    use indoc::indoc;
+    use std::str::FromStr;
+    use tower_lsp_server::ls_types::{CodeActionOrCommand, TextEdit, Uri};
+
+    #[test]
+    fn hover_snippet_dedents_short_definitions() {
+        let source = "        lookupSinkSatisfied :: Map StepId (Tuple StarBuck StarBuck) -> StarBuck\n        lookupSinkSatisfied amounts =\n\n          -- trailing comment";
+
+        assert_eq!(
+            format_hover_snippet(source, true),
+            "lookupSinkSatisfied :: Map StepId (Tuple StarBuck StarBuck) -> StarBuck\nlookupSinkSatisfied amounts ="
+        );
+    }
+
+    #[test]
+    fn hover_doc_comments_strip_indented_haddock_prefixes() {
+        assert_eq!(
+            strip_hover_comment_prefix("        -- | The sum of the buy amounts"),
+            "The sum of the buy amounts"
+        );
+        assert_eq!(
+            strip_hover_comment_prefix("        -- NOTE[sg]: leave non-haddock text alone"),
+            "NOTE[sg]: leave non-haddock text alone"
+        );
+    }
+
+    /// Helper: apply a set of LSP TextEdits to a source string.
+    /// Edits are applied in reverse order so that earlier edits don't
+    /// shift the positions of later ones.
+    fn apply_edits(source: &str, edits: &mut Vec<TextEdit>) -> String {
+        // Convert (line, col) to byte offset
+        let to_offset = |source: &str, line: u32, col: u32| -> usize {
+            let mut offset = 0;
+            for (i, l) in source.lines().enumerate() {
+                if i == line as usize {
+                    return offset + (col as usize).min(l.len());
+                }
+                offset += l.len() + 1; // +1 for \n
+            }
+            offset.min(source.len())
+        };
+
+        // Sort edits by start position in reverse so we can apply from end to start
+        edits.sort_by(|a, b| {
+            let a_start = (a.range.start.line, a.range.start.character);
+            let b_start = (b.range.start.line, b.range.start.character);
+            b_start.cmp(&a_start)
+        });
+
+        let mut result = source.to_string();
+        for edit in edits.iter() {
+            let start = to_offset(&result, edit.range.start.line, edit.range.start.character);
+            let end = to_offset(&result, edit.range.end.line, edit.range.end.character);
+            result.replace_range(start..end, &edit.new_text);
+        }
+        result
+    }
+
+    /// Send a JSON-RPC request through the LspService and return the response.
+    async fn lsp_request(
+        service: &mut super::LspService<super::Backend>,
+        id: i64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Option<tower_lsp_server::jsonrpc::Response> {
+        use tower_service::Service;
+        let req = tower_lsp_server::jsonrpc::Request::build(method.to_string())
+            .params(params)
+            .id(id)
+            .finish();
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .unwrap();
+        service.call(req).await.unwrap()
+    }
+
+    /// Send a JSON-RPC notification (no id, no response expected).
+    async fn lsp_notify(
+        service: &mut super::LspService<super::Backend>,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        use tower_service::Service;
+        let req = tower_lsp_server::jsonrpc::Request::build(method.to_string())
+            .params(params)
+            .finish();
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .unwrap();
+        let _ = service.call(req).await;
+    }
+
+    /// Shared store of the most recent diagnostics published per document URI.
+    type DiagStore = std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Vec<tower_lsp_server::ls_types::Diagnostic>>,
+        >,
+    >;
+
+    /// Build a Backend wrapped in an LspService, with an auto-responder
+    /// for server→client requests (workspace_folders, registerCapability, etc.).
+    /// Also returns a store that captures `textDocument/publishDiagnostics`
+    /// notifications, keyed by document URI.
+    fn build_test_service() -> (super::LspService<super::Backend>, DiagStore) {
+        let (exports, prim, names) = hemlis_lib::build_builtins();
+        let (service, socket) = super::LspService::build(|client| super::Backend {
+            client,
+            prim,
+            names,
+            locked: ().into(),
+            has_started: false.into(),
+            fi_to_uri: Default::default(),
+            fi_to_ud: Default::default(),
+            fi_to_source: Default::default(),
+            ud_to_fi: Default::default(),
+            uri_to_fi: Default::default(),
+            fi_to_version: Default::default(),
+            importers: Default::default(),
+            imports: Default::default(),
+            available_locals: Default::default(),
+            previouse_defines: Default::default(),
+            previouse_global_usages: Default::default(),
+            exports,
+            modules: Default::default(),
+            resolved: Default::default(),
+            defines: Default::default(),
+            references: Default::default(),
+            syntax_errors: Default::default(),
+            name_resolution_errors: Default::default(),
+            fixables: Default::default(),
+            open_files: Default::default(),
+            client_watch_dynamic_registration: std::sync::OnceLock::new(),
+            style_mode: std::sync::RwLock::new(StyleMode::default()),
+        })
+        .finish();
+
+        // Spawn a task to auto-respond to server→client requests and to
+        // capture published diagnostics.
+        use futures::StreamExt as _;
+        let (mut req_stream, mut resp_sink) = socket.split();
+        let diagnostics: DiagStore = Default::default();
+        let diagnostics_sink = diagnostics.clone();
+        tokio::spawn(async move {
+            use futures::SinkExt as _;
+            while let Some(req) = req_stream.next().await {
+                // Capture diagnostics notifications (no id).
+                if req.method() == "textDocument/publishDiagnostics" {
+                    if let Some(params) = req.params() {
+                        if let Ok(p) = serde_json::from_value::<
+                            tower_lsp_server::ls_types::PublishDiagnosticsParams,
+                        >(params.clone())
+                        {
+                            diagnostics_sink
+                                .lock()
+                                .unwrap()
+                                .insert(p.uri.as_str().to_string(), p.diagnostics);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(id) = req.id().cloned() {
+                    // workspace/workspaceFolders → respond with []
+                    // client/registerCapability → respond with null
+                    // anything else → respond with null
+                    let result = if req.method() == "workspace/workspaceFolders" {
+                        serde_json::json!([])
+                    } else {
+                        serde_json::json!(null)
+                    };
+                    let response = tower_lsp_server::jsonrpc::Response::from_ok(id, result);
+                    let _ = resp_sink.send(response).await;
+                }
+            }
+        });
+
+        (service, diagnostics)
+    }
+
+    /// Run a code action test: parse source, trigger code actions at a position,
+    /// find the action with the given title, apply its edits, and compare.
+    /// Parse a source string containing a `^ Action title` marker line.
+    /// Returns (source_without_marker, line, column, action_title).
+    fn parse_marker(source: &str) -> (String, u32, u32, String) {
+        let lines: Vec<&str> = source.lines().collect();
+        let (marker_idx, marker_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| {
+                let trimmed = l.trim_start();
+                trimmed.starts_with('^') && trimmed.len() > 1
+            })
+            .expect("Source must contain a `^ Action title` marker line");
+
+        let action_title = marker_line[marker_line.find('^').unwrap() + 1..]
+            .trim()
+            .to_string();
+        let target_line = (marker_idx - 1) as u32;
+
+        // The `^` in the marker line is visually aligned under the target
+        // character. Since the marker line is ASCII-only, `^` byte offset ==
+        // visual column. Map that visual column to the byte offset in the
+        // content line, which may contain multibyte UTF-8 characters.
+        let visual_col = marker_line.find('^').unwrap();
+        let content_line = lines[marker_idx - 1];
+        let caret_col = content_line
+            .char_indices()
+            .nth(visual_col)
+            .map(|(byte_idx, _)| byte_idx)
+            .unwrap_or(content_line.len()) as u32;
+
+        let cleaned: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != marker_idx)
+            .map(|(_, l)| *l)
+            .collect();
+        let mut source = cleaned.join("\n");
+        if !source.is_empty() {
+            source.push('\n');
+        }
+
+        (source, target_line, caret_col, action_title)
+    }
+
+    /// Parse a source string containing a `~~~ Warning message` marker line.
+    /// The run of `~` is visually aligned under the exact span of the warning
+    /// on the preceding content line; any text after the last `~` (and a space)
+    /// is the expected warning message. The message is optional — for
+    /// no-warning assertions the run of `~` can stand alone.
+    /// Returns (source_without_marker, line, start_col, end_col, message), where
+    /// the columns are byte offsets into the content line.
+    fn parse_warning_marker(source: &str) -> (String, u32, u32, u32, String) {
+        let lines: Vec<&str> = source.lines().collect();
+        let (marker_idx, marker_line) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, l)| l.trim_start().starts_with('~'))
+            .expect("Source must contain a `~~~ Warning message` marker line");
+
+        // Visual columns of the first and last `~` in the run.
+        let first_tilde = marker_line.find('~').unwrap();
+        let last_tilde = marker_line.rfind('~').unwrap();
+
+        let message = marker_line[last_tilde + 1..].trim().to_string();
+
+        let target_line = (marker_idx - 1) as u32;
+        let content_line = lines[marker_idx - 1];
+
+        // Map visual columns to byte offsets in the (possibly multibyte) content line.
+        let to_byte = |visual: usize| -> u32 {
+            content_line
+                .char_indices()
+                .nth(visual)
+                .map(|(byte_idx, _)| byte_idx)
+                .unwrap_or(content_line.len()) as u32
+        };
+        let start_col = to_byte(first_tilde);
+        // The end column is exclusive: the byte offset just past the last `~`.
+        let end_col = to_byte(last_tilde + 1);
+
+        let cleaned: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != marker_idx)
+            .map(|(_, l)| *l)
+            .collect();
+        let mut source = cleaned.join("\n");
+        if !source.is_empty() {
+            source.push('\n');
+        }
+
+        (source, target_line, start_col, end_col, message)
+    }
+
+    /// Split a test string into multiple modules using `=== Filename.purs ===` separators.
+    /// Returns a list of (filename, source) pairs.
+    /// If no separator is found, the entire string is treated as a single file "test.purs".
+    fn split_modules(input: &str) -> Vec<(String, String)> {
+        let mut modules = Vec::new();
+        let mut current_name: Option<String> = None;
+        let mut current_lines: Vec<&str> = Vec::new();
+
+        for line in input.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("=== ") && trimmed.ends_with(" ===") {
+                if let Some(name) = current_name.take() {
+                    let mut src = current_lines.join("\n");
+                    src.push('\n');
+                    modules.push((name, src));
+                    current_lines.clear();
+                }
+                let name = trimmed
+                    .strip_prefix("=== ")
+                    .unwrap()
+                    .strip_suffix(" ===")
+                    .unwrap()
+                    .to_string();
+                current_name = Some(name);
+            } else {
+                current_lines.push(line);
+            }
+        }
+
+        if let Some(name) = current_name {
+            let mut src = current_lines.join("\n");
+            src.push('\n');
+            modules.push((name, src));
+        } else {
+            // No separators found — single file
+            modules.push(("test.purs".into(), input.into()));
+        }
+
+        modules
+    }
+
+    async fn run_code_action_multi(
+        files: &[(&str, &str)],
+        target_file: &str,
+        line: u32,
+        character: u32,
+        action_title: &str,
+    ) -> String {
+        let (mut service, _diagnostics) = build_test_service();
+
+        // Initialize
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+
+        // Initialized (triggers has_started = true)
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+
+        // Give the server a moment to finish initialized handler
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Open all documents (non-target files first so their exports are available)
+        for (i, (name, source)) in files.iter().enumerate() {
+            let uri = format!("file:///{name}");
+            lsp_notify(
+                &mut service,
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "purescript",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            )
+            .await;
+
+            // After each file, give on_change time to parse + resolve
+            if i < files.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        // Give on_change time to parse + resolve the last file
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let target_uri = format!("file:///{target_file}");
+
+        // Request code actions at the given position
+        let resp = lsp_request(
+            &mut service,
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": target_uri },
+                "range": {
+                    "start": { "line": line, "character": character },
+                    "end": { "line": line, "character": character }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        )
+        .await
+        .expect("Expected a response from codeAction");
+
+        let (_, body) = resp.into_parts();
+        let result = body.expect("codeAction should succeed");
+
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(result).expect("Failed to parse code actions");
+
+        let action = actions
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) if ca.title == action_title => Some(ca),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                let titles: Vec<_> = actions
+                    .iter()
+                    .map(|a| match a {
+                        CodeActionOrCommand::CodeAction(ca) => ca.title.as_str(),
+                        CodeActionOrCommand::Command(c) => c.title.as_str(),
+                    })
+                    .collect();
+                panic!(
+                    "Code action {:?} not found. Available: {:?}",
+                    action_title, titles
+                );
+            });
+
+        let workspace_edit = action.edit.as_ref().expect("Code action should have edits");
+        let changes = workspace_edit
+            .changes
+            .as_ref()
+            .expect("Should have changes");
+
+        let target_source = files
+            .iter()
+            .find(|(name, _)| *name == target_file)
+            .unwrap()
+            .1;
+        let file_edits = changes
+            .get(&Uri::from_str(&target_uri).unwrap())
+            .expect("Should have edits for target file");
+
+        apply_edits(target_source, &mut file_edits.clone())
+    }
+
+    /// Test a code action using a `^ Action title` marker in the source.
+    /// Supports multi-module tests with `=== Filename.purs ===` separators.
+    /// The module containing the `^` marker is the test target.
+    async fn assert_code_action(source_with_marker: &str, expected: &str) {
+        let modules = split_modules(source_with_marker);
+
+        // Find which module has the marker
+        let (target_idx, _) = modules
+            .iter()
+            .enumerate()
+            .find(|(_, (_, src))| {
+                src.lines()
+                    .any(|l| l.trim_start().starts_with('^') && l.trim_start().len() > 1)
+            })
+            .expect("One module must contain a `^ Action title` marker line");
+
+        let (_, target_src) = &modules[target_idx];
+        let (cleaned_target, line, character, action_title) = parse_marker(target_src);
+
+        // Build the file list with the cleaned target
+        let files: Vec<(String, String)> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, (name, src))| {
+                if i == target_idx {
+                    (name.clone(), cleaned_target.clone())
+                } else {
+                    (name.clone(), src.clone())
+                }
+            })
+            .collect();
+
+        // Open dependency modules before the target module
+        let mut ordered: Vec<(&str, &str)> = Vec::new();
+        for (i, (name, src)) in files.iter().enumerate() {
+            if i != target_idx {
+                ordered.push((name.as_str(), src.as_str()));
+            }
+        }
+        ordered.push((files[target_idx].0.as_str(), files[target_idx].1.as_str()));
+
+        let actual = run_code_action_multi(
+            &ordered,
+            files[target_idx].0.as_str(),
+            line,
+            character,
+            &action_title,
+        )
+        .await;
+        assert_eq!(
+            actual, expected,
+            "Code action {:?} produced wrong result",
+            action_title
+        );
+    }
+
+    /// Assert that a specific code action is NOT offered at the marker position.
+    #[allow(dead_code)]
+    async fn assert_no_code_action(source_with_marker: &str) {
+        let modules = split_modules(source_with_marker);
+
+        let (target_idx, _) = modules
+            .iter()
+            .enumerate()
+            .find(|(_, (_, src))| {
+                src.lines()
+                    .any(|l| l.trim_start().starts_with('^') && l.trim_start().len() > 1)
+            })
+            .expect("One module must contain a `^ Action title` marker line");
+
+        let (_, target_src) = &modules[target_idx];
+        let (cleaned_target, line, character, action_title) = parse_marker(target_src);
+
+        let files: Vec<(String, String)> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, (name, src))| {
+                if i == target_idx {
+                    (name.clone(), cleaned_target.clone())
+                } else {
+                    (name.clone(), src.clone())
+                }
+            })
+            .collect();
+
+        let mut ordered: Vec<(&str, &str)> = Vec::new();
+        for (i, (name, src)) in files.iter().enumerate() {
+            if i != target_idx {
+                ordered.push((name.as_str(), src.as_str()));
+            }
+        }
+        ordered.push((files[target_idx].0.as_str(), files[target_idx].1.as_str()));
+
+        let (mut service, _diagnostics) = build_test_service();
+
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        for (i, (name, source)) in ordered.iter().enumerate() {
+            let uri = format!("file:///{name}");
+            lsp_notify(
+                &mut service,
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "purescript",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            )
+            .await;
+            if i < ordered.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let target_uri = format!("file:///{}", files[target_idx].0);
+        let resp = lsp_request(
+            &mut service,
+            2,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": target_uri },
+                "range": {
+                    "start": { "line": line, "character": character },
+                    "end": { "line": line, "character": character }
+                },
+                "context": { "diagnostics": [] }
+            }),
+        )
+        .await
+        .expect("Expected a response from codeAction");
+
+        let (_, body) = resp.into_parts();
+        let result = body.expect("codeAction should succeed");
+        let actions: Vec<CodeActionOrCommand> =
+            serde_json::from_value(result).expect("Failed to parse code actions");
+
+        let found = actions.iter().any(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) => ca.title == action_title,
+            _ => false,
+        });
+        if found {
+            let titles: Vec<_> = actions
+                .iter()
+                .map(|a| match a {
+                    CodeActionOrCommand::CodeAction(ca) => ca.title.as_str(),
+                    CodeActionOrCommand::Command(c) => c.title.as_str(),
+                })
+                .collect();
+            panic!(
+                "Code action {:?} should NOT be offered, but was found among: {:?}",
+                action_title, titles
+            );
+        }
+    }
+
+    /// Open a set of modules and return the diagnostics published for `target_file`.
+    /// Mirrors `run_code_action_multi`, but captures `publishDiagnostics` instead
+    /// of requesting code actions.
+    async fn run_diagnostics_multi(
+        files: &[(&str, &str)],
+        target_file: &str,
+    ) -> Vec<tower_lsp_server::ls_types::Diagnostic> {
+        let (mut service, diagnostics) = build_test_service();
+
+        // Initialize
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+
+        // Initialized (triggers has_started = true)
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+
+        // Give the server a moment to finish initialized handler
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Open all documents (non-target files first so their exports are available)
+        for (i, (name, source)) in files.iter().enumerate() {
+            let uri = format!("file:///{name}");
+            lsp_notify(
+                &mut service,
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "purescript",
+                        "version": 1,
+                        "text": source
+                    }
+                }),
+            )
+            .await;
+
+            if i < files.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        // Give on_change time to parse + resolve + publish diagnostics for the last file.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let target_uri = format!("file:///{target_file}");
+        let store = diagnostics.lock().unwrap();
+        store.get(&target_uri).cloned().unwrap_or_default()
+    }
+
+    /// Given a `~~~ Warning message` marker, order the modules (dependencies
+    /// first, target last) and return the diagnostics for the target module,
+    /// along with the expected span and message parsed from the marker.
+    async fn diagnostics_for_marker(
+        source_with_marker: &str,
+    ) -> (
+        Vec<tower_lsp_server::ls_types::Diagnostic>,
+        super::Range,
+        String,
+    ) {
+        let modules = split_modules(source_with_marker);
+
+        let (target_idx, _) = modules
+            .iter()
+            .enumerate()
+            .find(|(_, (_, src))| src.lines().any(|l| l.trim_start().starts_with('~')))
+            .expect("One module must contain a `~~~ Warning message` marker line");
+
+        let (_, target_src) = &modules[target_idx];
+        let (cleaned_target, line, start_col, end_col, message) = parse_warning_marker(target_src);
+
+        let files: Vec<(String, String)> = modules
+            .iter()
+            .enumerate()
+            .map(|(i, (name, src))| {
+                if i == target_idx {
+                    (name.clone(), cleaned_target.clone())
+                } else {
+                    (name.clone(), src.clone())
+                }
+            })
+            .collect();
+
+        let mut ordered: Vec<(&str, &str)> = Vec::new();
+        for (i, (name, src)) in files.iter().enumerate() {
+            if i != target_idx {
+                ordered.push((name.as_str(), src.as_str()));
+            }
+        }
+        ordered.push((files[target_idx].0.as_str(), files[target_idx].1.as_str()));
+
+        let diags = run_diagnostics_multi(&ordered, files[target_idx].0.as_str()).await;
+        let expected_range = super::Range {
+            start: super::Position::new(line, start_col),
+            end: super::Position::new(line, end_col),
+        };
+        (diags, expected_range, message)
+    }
+
+    /// Assert that a warning with the marked span and message is emitted.
+    /// The `~` run marks the exact span; the trailing text is the message.
+    async fn assert_warning(source_with_marker: &str) {
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
+        let (diags, expected_range, message) = diagnostics_for_marker(source_with_marker).await;
+        assert!(
+            !message.is_empty(),
+            "assert_warning requires a message after the `~` run"
+        );
+
+        let matched = diags.iter().any(|d| {
+            d.severity == Some(DiagnosticSeverity::WARNING)
+                && d.range == expected_range
+                && d.message == message
+        });
+        if !matched {
+            let found: Vec<_> = diags
+                .iter()
+                .filter(|d| d.severity == Some(DiagnosticSeverity::WARNING))
+                .map(|d| (d.range, d.message.as_str()))
+                .collect();
+            panic!(
+                "Expected warning {:?} at {:?}, but found warnings: {:?}",
+                message, expected_range, found
+            );
+        }
+    }
+
+    /// Assert that NO warning is emitted at the marked span.
+    /// Only the `~` run is needed — any warning whose range equals the marked
+    /// span fails the assertion.
+    #[allow(dead_code)]
+    async fn assert_no_warning(source_with_marker: &str) {
+        use tower_lsp_server::ls_types::DiagnosticSeverity;
+        let (diags, expected_range, _message) = diagnostics_for_marker(source_with_marker).await;
+
+        // Any warning that covers *any* character in the marked region fails.
+        // Compare the two half-open [start, end) position intervals for overlap.
+        let region_start = (expected_range.start.line, expected_range.start.character);
+        let region_end = (expected_range.end.line, expected_range.end.character);
+        let offending: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::WARNING))
+            .filter(|d| {
+                let warn_start = (d.range.start.line, d.range.start.character);
+                let warn_end = (d.range.end.line, d.range.end.character);
+                region_start < warn_end && warn_start < region_end
+            })
+            .map(|d| (d.range, d.message.as_str()))
+            .collect();
+        if !offending.is_empty() {
+            panic!(
+                "Expected no warning in region {:?}, but found: {:?}",
+                expected_range, offending
+            );
+        }
+    }
+
+    // --- PAY-3687: Warn on unqualified `do` / `ado` ---
+
+    #[tokio::test]
+    async fn style_warn_unqualified_do() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = do
+                ~~ Unqualified `do` block; use a qualified `Module.do`
+              pure unit
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_unqualified_ado() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = ado
+                ~~~ Unqualified `ado` block; use a qualified `Module.ado`
+              x <- pure unit
+              in x
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_qualified_do() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Effect as M
+
+            f = M.do
+                  ~~
+              pure unit
+        "})
+        .await;
+    }
+
+    // --- PAY-3688: Warn on unqualified `pure` ---
+
+    #[tokio::test]
+    async fn style_warn_unqualified_pure() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = pure unit
+                ~~~~ Unqualified `pure`; use a qualified `Applicative.pure`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_qualified_pure() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Data.List as L
+
+            f = L.pure unit
+                  ~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_pure_when_module_defines_pure() {
+        // The module defines its own top-level `pure`, so unqualified `pure`
+        // references must not be flagged anywhere in the module. (PAY-3688)
+        assert_no_warning(indoc! {"
+            module Test where
+
+            pure :: Int -> Int
+            pure x = x
+
+            f = pure 1
+                ~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_pure_when_module_defines_class_member_pure() {
+        // A module that declares a type class with a `pure` member (mirrors
+        // Control.Applicative) defines `pure`, so unqualified `pure` references
+        // must not be flagged. (PAY-3688)
+        assert_no_warning(indoc! {"
+            module Test where
+
+            class Apply f <= Applicative f where
+              pure :: forall a. a -> f a
+
+            when false thunk = pure thunk
+                               ~~~~
+        "})
+        .await;
+    }
+
+    // --- PAY-3689: Warn on qualified `Just` / `Left` / `Right` ---
+
+    #[tokio::test]
+    async fn style_warn_qualified_just() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = Maybe.Just 1
+                ~~~~~~~~~~ Prefer unqualified `Just` over `Maybe.Just`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_qualified_left() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = Either.Left 1
+                ~~~~~~~~~~~ Prefer unqualified `Left` over `Either.Left`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_qualified_right() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = Either.Right 1
+                ~~~~~~~~~~~~ Prefer unqualified `Right` over `Either.Right`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_unqualified_just() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            f = Just 1
+                ~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_strip_qualifier_from_just() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = Maybe.Just 1
+                          ^ Replace `Maybe.Just` with `Just`
+            "},
+            indoc! {"
+                module Test where
+
+                f = Just 1
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_strip_qualifier_from_right() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = Either.Right 1
+                           ^ Replace `Either.Right` with `Right`
+            "},
+            indoc! {"
+                module Test where
+
+                f = Right 1
+            "},
+        )
+        .await;
+    }
+
+    // --- PAY-3690: Docstring comment spacing `-- | ` ---
+
+    #[tokio::test]
+    async fn style_warn_docstring_missing_space() {
+        assert_warning(indoc! {"
+            module Test where
+
+            --|foo
+            ~~~ Docstring comment should use `-- | ` (single space around `|`)
+            f = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_docstring_missing_both_spaces() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                --|foo
+                ^ Fix docstring comment spacing
+                f = 1
+            "},
+            indoc! {"
+                module Test where
+
+                -- | foo
+                f = 1
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_docstring_missing_space_after_pipe() {
+        // `-- |foo` has the space before `|` but not after — still fixed.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                -- |foo
+                ^ Fix docstring comment spacing
+                f = 1
+            "},
+            indoc! {"
+                module Test where
+
+                -- | foo
+                f = 1
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_docstring_correct_spacing() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            -- | bar
+            ~~~~~
+            f = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_docstring_extra_indentation() {
+        // Extra spaces after `|` are intentional indentation (common in
+        // multi-line docstrings) and must not be flagged. (PAY-3690)
+        assert_no_warning(indoc! {"
+            module Test where
+
+            -- |   hello
+            ~~~~~~~
+            f = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_double_dash_pipe_in_string() {
+        // `--|` inside a string literal must not be flagged.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            f = \"--|\"
+                 ~~~
+        "})
+        .await;
+    }
+
+    // --- PAY-3691: Import top-level modules with exact name ---
+
+    #[tokio::test]
+    async fn style_warn_top_level_import_aliased() {
+        assert_warning(indoc! {"
+            module Test where
+
+            import Foo as Bar
+                          ~~~ Import `Foo` as `Foo` or `F`, not `Bar`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_multi_segment_import_aliased() {
+        // `Data.Maybe` is not a top-level module, so aliasing it is fine.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Data.Maybe as Maybe
+                                 ~~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_single_char_alias() {
+        // A single-character alias is allowed.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Foo as F
+                          ~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_import_alias_matches_name() {
+        // `import Foo as Foo` has a matching alias, so nothing to flag.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Foo as Foo
+                          ~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_import_alias_is_exported_module() {
+        // The module re-export pattern (mirrors Joe.purs): the alias `Exports`
+        // is re-exported via `module Exports`, so aliasing to it is intentional
+        // and must not be flagged. (PAY-3691)
+        assert_no_warning(indoc! {"
+            module Test (module Exports) where
+
+            import Foo as Exports
+                          ~~~~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_import_alias_is_exported_module_any_name() {
+        // The re-export alias can be named anything — the only requirement is
+        // that it appears as `module <alias>` in the export list. (PAY-3691)
+        assert_no_warning(indoc! {"
+            module Test (module Reexport) where
+
+            import Foo as Reexport
+                          ~~~~~~~~
+        "})
+        .await;
+    }
+
+    // --- PAY-3692: Ctx module import naming convention ---
+
+    #[tokio::test]
+    async fn style_warn_ctx_module_alias_starts_with_ctx() {
+        assert_warning(indoc! {"
+            module Test where
+
+            import Ctx.Time as CtxTime
+                               ~~~~~~~ Ctx module alias should end with `Ctx`: use `TimeCtx`, not `CtxTime`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_ctx_module_name_ends_with_ctx() {
+        assert_warning(indoc! {"
+            module Test where
+
+            import Data.TimeCtx as CtxTime
+                                   ~~~~~~~ Ctx module alias should end with `Ctx`: use `TimeCtx`, not `CtxTime`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_ctx_module_alias_ends_with_ctx() {
+        // `import Ctx.Time as TimeCtx` follows the convention.
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Ctx.Time as TimeCtx
+                               ~~~~~~~
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_ctx_module_alias_renames_usages() {
+        // The rename fixes the import alias and every qualified usage. (PAY-3692)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                import Ctx.Time as CtxTime
+                                   ^ Rename alias `CtxTime` to `TimeCtx`
+
+                f = CtxTime.now
+            "},
+            indoc! {"
+                module Test where
+
+                import Ctx.Time as TimeCtx
+
+                f = TimeCtx.now
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_ctx_module_dotted_alias_renames_usages() {
+        // A multi-segment alias like `Ctx.Random` must still rename its usages
+        // (`Ctx.Random.newMem`), matching the whole dotted alias. (PAY-3692)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                import Ctx.Random as Ctx.Random
+                                     ^ Rename alias `Ctx.Random` to `RandomCtx`
+
+                f = Ctx.Random.newMem 1
+            "},
+            indoc! {"
+                module Test where
+
+                import Ctx.Random as RandomCtx
+
+                f = RandomCtx.newMem 1
+            "},
+        )
+        .await;
+    }
+
+    // --- PAY-3693: Additional forbidden operators (rewrite via `map`) ---
+
+    #[tokio::test]
+    async fn style_warn_confusing_operator_double_map() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = a <$$> b
+                  ~~~~ Avoid the confusing operator `<$$>`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_confusing_operator_double_hash() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = a <##> b
+                  ~~~~ Avoid the confusing operator `<##>`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_confusing_operator_triple_hash() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = a <###> b
+                  ~~~~~ Avoid the confusing operator `<###>`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_map() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <$$> b
+                      ^ Rewrite `<$$>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = map a <$> b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <##> b
+                      ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = a <#> map b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_triple_hash() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <###> b
+                      ^ Rewrite `<###>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = a <#> map (map b)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_map_parenthesizes_lower_prec_operand() {
+        // The rhs `b <#> c` binds looser than `<$>`, so it must be parenthesized.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <$$> b <#> c
+                      ^ Rewrite `<$$>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = map a <$> (b <#> c)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash_parenthesizes_application_operand() {
+        // The function operand `g b` is an application, so `map` must parenthesize it.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <##> g b
+                      ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = a <#> map (g b)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash_no_redundant_parens_on_chain() {
+        // The lhs `x <#> y` is a same-precedence left-associative chain, so it
+        // must NOT be parenthesized when it becomes the lhs of `<#>`. (PAY-3693)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x <#> y <##> z
+                            ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f = x <#> y <#> map z
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_double_hash_multiline() {
+        // The lhs spans multiple lines; the layout around the operator is
+        // preserved, so the rewritten operator stays on its own line. (PAY-3693)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f =
+                  foo
+                    <#> bar
+                    <##> baz
+                    ^ Rewrite `<##>` using `map`
+            "},
+            indoc! {"
+                module Test where
+
+                f =
+                  foo
+                    <#> bar
+                    <#> map baz
+            "},
+        )
+        .await;
+    }
+
+    // --- PAY-3694: Prefer `let` over `where` ---
+
+    #[tokio::test]
+    async fn style_warn_where() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f x = y
+              where
+              ~~~~~ Prefer `let` over `where`
+              y = x + 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_where_to_let() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = y
+                  where
+                  ^ Convert `where` to `let`
+                  y = x + 1
+            "},
+            indoc! {"
+                module Test where
+
+                f x = let
+                        y = x + 1
+                      in y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_where_to_let_multiline() {
+        // Multiple bindings keep their relative layout, shifted under `let`.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = y
+                  where
+                  ^ Convert `where` to `let`
+                  y = z + 1
+                  z = x
+            "},
+            indoc! {"
+                module Test where
+
+                f x = let
+                        y = z + 1
+                        z = x
+                      in y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_where_with_guards() {
+        // Guards make the `where` scope over all branches — still warned.
+        assert_warning(indoc! {"
+            module Test where
+
+            f x
+              | x > 0 = a
+              where
+              ~~~~~ Prefer `let` over `where`
+              a = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_fix_where_with_guards() {
+        // ...but no `where → let` fix is offered when guards are present.
+        assert_no_code_action(indoc! {"
+            module Test where
+
+            f x
+              | x > 0 = a
+              where
+              ^ Convert `where` to `let`
+              a = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_first_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> Int -> Boolean
+                foo x y = y
+                    ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: Int -> Boolean
+                foo y = y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_last_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> Int -> Boolean
+                foo x y = x
+                      ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: String -> Boolean
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_middle_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> Int -> Boolean -> String
+                foo a b c = a
+                      ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: String -> Boolean -> String
+                foo a c = a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_record_field() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String, baz :: Int } -> String
+                foo { bar, baz } = bar
+                           ^ Delete unused record field
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String } -> String
+                foo { bar } = bar
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_first_record_field() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String, baz :: Int } -> String
+                foo { bar, baz } = baz
+                      ^ Delete unused record field
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: { baz :: Int } -> String
+                foo { baz } = baz
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_last_record_field_removes_entire_parameter() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: String } -> Int
+                foo { bar } = 42
+                      ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: Int
+                foo = 42
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_param_with_record_neighbor() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> { bar :: Int } -> Boolean
+                foo x { bar } = bar
+                    ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: { bar :: Int } -> Boolean
+                foo { bar } = bar
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_record_between_params() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                foo :: String -> { bar :: Boolean } -> Int -> String
+                foo hello { bar } num = hello
+                            ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                foo :: String -> Int -> String
+                foo hello num = hello
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_record_field_preserves_surrounding_arrows() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                run :: String -> { foo :: Boolean } -> Int -> String
+                run hello { foo } bar = hello
+                            ^ Delete unused parameter
+            "},
+            indoc! {"
+                module Test where
+
+                run :: String -> Int -> String
+                run hello bar = hello
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn burn_all_unused_imports_partial_import_list() {
+        // Prim.Ordering exports: Ordering, LT, GT, EQ (all Type scope)
+        // We use Ordering and LT but not GT and EQ.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                import Prim.Ordering (Ordering, LT, GT, EQ)
+                ^ BurnAllUnusedImport
+
+                foo :: Ordering -> LT
+                foo x = x
+            "},
+            indoc! {"
+                module Test where
+
+                import Prim.Ordering (Ordering, LT)
+
+                foo :: Ordering -> LT
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn burn_all_unused_imports_constructor_syntax() {
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                data MyType = Foo | Bar | Baz
+
+                hello = 0
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (MyType(..), hello)
+                ^ BurnAllUnusedImport
+
+                foo :: Int
+                foo = hello
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (hello)
+
+                foo :: Int
+                foo = hello
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_class_import() {
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                class A a
+
+                b = 0
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (class A, b)
+                                  ^ DeleteUnusedImport
+
+                foo = b
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (b)
+
+                foo = b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delete_unused_class_import_not_first() {
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                class A a
+
+                b = 0
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (b, class A)
+                                     ^ DeleteUnusedImport
+
+                foo = b
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (b)
+
+                foo = b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remove_unused_constructors_from_import() {
+        // import Lib (MyType(..)) but only the type is used (in a signature), never a
+        // constructor → offer a code action that drops the (..). (PAY-3260)
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                data MyType = Foo | Bar
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (MyType(..))
+                            ^ RemoveUnusedConstructors
+
+                foo :: MyType -> MyType
+                foo x = x
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (MyType)
+
+                foo :: MyType -> MyType
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn remove_unused_constructors_single_constructor_data() {
+        // A single-constructor `data` type (not a newtype, so not Coercible) used only as a type:
+        // dropping `(..)` is safe. Mirrors Money.StarBuck. (PAY-3260)
+        assert_code_action(
+            indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                data StarBuck = StarBuck Int
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (StarBuck(..))
+                                    ^ RemoveUnusedConstructors
+
+                foo :: StarBuck -> StarBuck
+                foo x = x
+            "},
+            indoc! {"
+                module Test where
+
+                import Lib (StarBuck)
+
+                foo :: StarBuck -> StarBuck
+                foo x = x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn keep_newtype_constructors_in_import() {
+        // A `newtype` may need its constructor imported for `Coercible`/`Data.Newtype` even when
+        // never named syntactically, so we must NOT suggest removing `(..)`. (PAY-3260)
+        assert_no_code_action(indoc! {"
+                === Lib.purs ===
+                module Lib where
+
+                newtype Wrapper = Wrapper Int
+
+                === Test.purs ===
+                module Test where
+
+                import Lib (Wrapper(..))
+                            ^ RemoveUnusedConstructors
+
+                foo :: Wrapper -> Wrapper
+                foo x = x
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_bind_reverse() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a =<< b
+                      ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = b >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_compose_reverse() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <<< b
+                      ^ Replace `<<<` with `>>>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = b >>> a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_nested_same_precedence() {
+        // f =<< g =<< x  parses as  f =<< (g =<< x)  (infixr 1)
+        // Replacing the outer =<< must parenthesize the rhs because
+        // mixing =<< (infixr 1) and >>= (infixl 1) at the same
+        // precedence is a parse error without parens.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a =<< b =<< c
+                      ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (b =<< c) >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_nested_compose() {
+        // a <<< b <<< c  parses as  a <<< (b <<< c)  (infixr 9)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a <<< b <<< c
+                      ^ Replace `<<<` with `>>>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (b <<< c) >>> a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_under_dollar() {
+        // f $ a =<< b  parses as  f $ (a =<< b)
+        // Fixing inner =<< replaces just that subexpression.
+        // Result: f $ b >>= a — correct because $ (prec 0) < >>= (prec 1).
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ a =<< b
+                          ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g $ b >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_with_higher_prec_operand() {
+        // a =<< b + c  parses as  a =<< (b + c)
+        // + is prec 6, >>= is prec 1, so b + c >>= a is correct — no parens needed.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a =<< b + c
+                      ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = b + c >>= a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_app_operands() {
+        // (f a) =<< (g b)  — App operands don't need parens.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a b =<< c d
+                        ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = c d >>= a b
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_replace_forbidden_operator_backtick_infix_operand() {
+        // a `foo` b =<< c  parses as  (a `foo` b) =<< c
+        // Infix operand needs parens when it becomes the rhs.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a `foo` b =<< c
+                              ^ Replace `=<<` with `>>=`
+            "},
+            indoc! {"
+                module Test where
+
+                f = c >>= (a `foo` b)
+            "},
+        )
+        .await;
+    }
+
+    // --- PAY-3098: Operator conversion code actions ---
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_hash() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ x
+                      ^ Replace `$` with `#`
+            "},
+            indoc! {"
+                module Test where
+
+                f = x # g
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_parens() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ x
+                      ^ Replace `$` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (x)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_hash_to_dollar() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x # g
+                      ^ Replace `#` with `$`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (g $ x)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_hash_to_parens() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x # g
+                      ^ Replace `#` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (x)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_map_to_flipped_map() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g <$> x
+                        ^ Replace `<$>` with `<#>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (x <#> g)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_flipped_map_to_map() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = x <#> g
+                        ^ Replace `<#>` with `<$>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g <$> x
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_map_to_flipped_map_in_applicative_chain() {
+        // f <$> x <*> y  parses as  (f <$> x) <*> y
+        // Converting inner <$> to <#> must wrap in parens since <#> is prec 1
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g <$> x <*> y
+                        ^ Replace `<$>` with `<#>`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (x <#> g) <*> y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_parens_complex_rhs() {
+        // f $ x + y  should become  f (x + y)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ x + y
+                      ^ Replace `$` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (x + y)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_hash_chain_last_to_dollar() {
+        // With correct fixity: a # b >>= c # d  parses as  ((a # b) >>= c) # d
+        // Cursor on last #: converting  ((a # b) >>= c) # d  to  (d $ ((a # b) >>= c))
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a # b >>= c # d
+                                ^ Replace `#` with `$`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (d $ a # b >>= c)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_hash_paren_operand() {
+        // f $ (a + b)  →  (a + b) # f
+        // The explicit parens in the RHS must be preserved.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ (a + b)
+                      ^ Replace `$` with `#`
+            "},
+            indoc! {"
+                module Test where
+
+                f = (a + b) # g
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_parens_paren_operand() {
+        // f $ (a + b)  →  f (a + b)
+        // The parens are already there — just drop the $.
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g $ (a + b)
+                      ^ Replace `$` with `()`
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (a + b)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_dollar_to_hash_multiapp_lhs() {
+        // clamp 1 1000 $ x  →  x # clamp 1 1000
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = clamp 1 1000 $ x
+                                 ^ Replace `$` with `#`
+            "},
+            indoc! {"
+                module Test where
+
+                f = x # clamp 1 1000
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_fmap_to_flipped_in_do_block() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = do
+                  a <- g $ h <<< j <$> [1, 2, 3]
+                                    ^ Replace `<$>` with `<#>`
+                  k $ b 1
+            "},
+            indoc! {"
+                module Test where
+
+                f = do
+                  a <- g $ ([1, 2, 3] <#> h <<< j)
+                  k $ b 1
+            "},
+        )
+        .await;
+    }
+
+    // --- Unnecessary parenthesis (PAY-3104) ---
+
+    #[tokio::test]
+    async fn style_remove_parens_multiline_lambda() {
+        // Outer parens around a multiline lambda — the closing ) is on its own line
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f =
+                  ( \\x ->
+                  ^ Remove unnecessary parenthesis
+                      Just (pure unit)
+                  )
+            "},
+            indoc! {"
+                module Test where
+
+                f =
+                  \\x ->
+                      Just (pure unit)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_after_multibyte_char() {
+        // ä is 2 bytes in UTF-8 but 1 UTF-16 code unit — the paren span must
+        // still line up with the LSP character offset.
+        assert_code_action(
+            indoc! {r#"
+                module Test where
+
+                f = g "ä" (bar)
+                          ^ Remove unnecessary parenthesis
+            "#},
+            indoc! {r#"
+                module Test where
+
+                f = g "ä" bar
+            "#},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_whole_rhs() {
+        // f = (bar baz) — paren is the whole RHS, not inside App/Op
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = (bar baz)
+                    ^ Remove unnecessary parenthesis
+            "},
+            indoc! {"
+                module Test where
+
+                f = bar baz
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_double() {
+        // ((x)) → (x)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g ((a))
+                      ^ Remove unnecessary parenthesis
+            "},
+            indoc! {"
+                module Test where
+
+                f = g (a)
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_atom_in_app_arg() {
+        // f (a) → f a
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = g (a)
+                      ^ Remove unnecessary parenthesis
+            "},
+            indoc! {"
+                module Test where
+
+                f = g a
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_app_in_app_func() {
+        // (f a) b — parens might be needed (partial application, etc.)
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (g a) b
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_app_in_app_arg() {
+        // f (g a) — parens needed, f (g a) ≠ f g a
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = h (g a)
+                      ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_higher_prec_op_left() {
+        // (a * b) + c — different operators, keep parens
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (a * b) + c
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_lower_prec_op_left() {
+        // (a + b) * c — parens needed
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (a + b) * c
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_in_record_access() {
+        // (f a).field — parens needed, otherwise .field binds to `a`
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (g a).x
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_in_record_update() {
+        // (f a) { x = 1 } — parens needed for record update target
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (g a) { x = 1 }
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_negative_literal() {
+        // f (-120.0) — removing parens turns negation into subtraction
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = g (-120.0)
+                      ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_negation_of_op() {
+        // a * -(b / c) — removing parens gives a * -b / c = a * (-b) / c, changing the meaning.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = a * -(b / c)
+                         ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_negation_of_op_bare() {
+        // -(b / c) — the negation applies to the whole quotient; -b / c = (-b) / c differs.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = -(b / c)
+                     ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_app_in_op() {
+        // (g a) + c — app inside op, keep parens
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (g a) + c
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_same_prec_left_assoc_left() {
+        // (a + b) + c → a + b + c (+ is left-assoc)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = (a + b) + c
+                    ^ Remove unnecessary parenthesis
+            "},
+            indoc! {"
+                module Test where
+
+                f = a + b + c
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_left_assoc_right_operand() {
+        // a + (b + c) — + is infixl, so a + b + c parses as (a + b) + c. Dropping the parens
+        // changes the parse tree. Even though + is algebraically associative for Int, hemlis has
+        // no types and can't assume that (Number rounding / custom Semiring instances), so we
+        // conservatively keep the parens. (PAY-3202)
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = a + (b + c)
+                        ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_same_prec_right_assoc_right() {
+        // a $ (b $ c) → a $ b $ c ($ is right-assoc)
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = a $ (b $ c)
+                        ^ Remove unnecessary parenthesis
+            "},
+            indoc! {"
+                module Test where
+
+                f = a $ b $ c
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_right_assoc_left_operand_dollar() {
+        // (a $ b) $ c — $ is infixr, so a $ b $ c parses as a $ (b $ c). (a $ b) $ c is a
+        // different expression, so the parens must be kept. (PAY-3202)
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (a $ b) $ c
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_right_assoc_left_operand() {
+        // (x : ys) : zs — : is infixr, so the left parens are necessary:
+        // x : ys : zs parses as x : (ys : zs), a different (ill-typed) expression.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = (x : ys) : zs
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_case_in_guard() {
+        // (case ...) used as a guard: `case` is an open, right-extending expression, so removing
+        // the parens lets it swallow the trailing `= body`, changing the parse. The parens are
+        // necessary. Simplified from the PAY-3322 screenshot.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f x
+                  | (case x of _ -> true) = x
+                    ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    // --- Unnecessary type parenthesis ---
+
+    #[tokio::test]
+    async fn style_remove_type_parens_atom() {
+        // (Int) in a type signature
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f :: (Int) -> String
+                     ^ Remove unnecessary parenthesis
+            "},
+            indoc! {"
+                module Test where
+
+                f :: Int -> String
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_type_parens_whole_sig() {
+        // Parens wrapping the whole type — not inside App/Op
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f :: (Int -> String)
+                     ^ Remove unnecessary parenthesis
+            "},
+            indoc! {"
+                module Test where
+
+                f :: Int -> String
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_in_app() {
+        // (a -> b) applied to c — parens are needed
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f :: (Int -> String) -> Boolean
+                     ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_in_data_ctor() {
+        // Data constructor args are positional — parens around App are needed
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                data Permission = RequiresCounterSignFrom (List UserId)
+                                                          ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_in_newtype() {
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                newtype BankfilesPayableId = BankfilesPayableId (Tuple EndToEndId String)
+                                                                ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_remove_parens_around_record_update() {
+        assert_code_action(
+            indoc! {r#"
+                module Test where
+
+                f = (params { page = 1 })
+                    ^ Remove unnecessary parenthesis
+            "#},
+            indoc! {r#"
+                module Test where
+
+                f = params { page = 1 }
+            "#},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_in_vta() {
+        // @(Foo Bar) — type app inside VTA needs parens
+        assert_no_code_action(indoc! {r#"
+                module Test where
+
+                f = g @(Foo Bar) x
+                        ^ Remove unnecessary parenthesis
+            "#})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_typed_expr_in_app() {
+        // (\_ -> expr) :: type — lambda needs parens inside typed expression
+        assert_no_code_action(indoc! {r#"
+                module Test where
+
+                f = g ((\_ -> x) :: Int -> Int)
+                         ^ Remove unnecessary parenthesis
+            "#})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_type_parens_unit_thunk() {
+        // (Unit -> X) is a lazy-value pattern — keep parens for readability
+        assert_no_code_action(indoc! {r#"
+                module Test where
+
+                f :: String -> (Unit -> Int)
+                                ^ Remove unnecessary parenthesis
+            "#})
+        .await;
+    }
+
+    // ---- PAY-3099: if → case conversion ----
+
+    #[tokio::test]
+    async fn style_convert_if_to_case_simple() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = if x then 1 else 0
+                      ^ Convert to `case`
+            "},
+            indoc! {"
+                module Test where
+
+                f x = case x of
+                        true -> 1
+                        false -> 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_multiline_if_cond_then_same_line() {
+        // if cond then\n  body\nelse\n  body — most common multiline pattern
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x =
+                  if x then
+                  ^ Convert to `case`
+                    1
+                  else
+                    0
+            "},
+            indoc! {"
+                module Test where
+
+                f x =
+                  case x of
+                    true -> 1
+                    false -> 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_multiline_if_multiline_bodies() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x =
+                  if x then
+                  ^ Convert to `case`
+                    pure 1
+                  else
+                    pure 0
+            "},
+            indoc! {"
+                module Test where
+
+                f x =
+                  case x of
+                    true -> pure 1
+                    false -> pure 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_if_to_case_nested_in_do() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = Foo.do
+                  x <- bar
+                  if x then
+                  ^ Convert to `case`
+                    pure 1
+                  else
+                    pure 0
+            "},
+            indoc! {"
+                module Test where
+
+                f = Foo.do
+                  x <- bar
+                  case x of
+                    true -> pure 1
+                    false -> pure 0
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_convert_if_to_case_inline_in_expr() {
+        // if used as argument inside parens
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = g (if x then 1 else 0) y
+                         ^ Convert to `case`
+            "},
+            indoc! {"
+                module Test where
+
+                f x = g (case x of
+                           true -> 1
+                           false -> 0) y
+            "},
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_long_single_line_if() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f x = if x then someVeryLongFunctionNameHere anotherVeryLongArgumentName thirdVeryLongArgument else otherVeryLongFunctionNameHere anotherArg
+                      ^ Convert to `case`
+            "},
+            indoc! {"
+                module Test where
+
+                f x = case x of
+                        true -> someVeryLongFunctionNameHere anotherVeryLongArgumentName thirdVeryLongArgument
+                        false -> otherVeryLongFunctionNameHere anotherArg
+            "},
+        )
+        .await;
+    }
+}
+
+impl LanguageServer for Backend {
+    #[instrument(skip(self))]
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let dynamic_watch = params
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.did_change_watched_files.as_ref())
+            .and_then(|d| d.dynamic_registration)
+            .unwrap_or(false);
+        let _ = self.client_watch_dynamic_registration.set(dynamic_watch);
+
+        // Read style mode from initializationOptions
+        if let Some(opts) = params.initialization_options {
+            if let Some(style) = opts.get("style").and_then(|v| v.as_str()) {
+                *self.style_mode.write().unwrap() = StyleMode::from_str(style);
+            }
+        }
+
+        Ok(InitializeResult {
+            server_info: None,
+            offset_encoding: None,
+            capabilities: ServerCapabilities {
+                text_document_sync: Some(TextDocumentSyncCapability::Options(
+                    TextDocumentSyncOptions {
+                        open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::FULL),
+                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                            include_text: Some(true),
+                        })),
+                        ..Default::default()
+                    },
+                )),
+                hover_provider: Some(HoverProviderCapability::Options(HoverOptions {
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(false),
+                    },
+                })),
+                completion_provider: Some(CompletionOptions {
+                    resolve_provider: Some(true),
+                    trigger_characters: Some(vec![".".to_string()]),
+                    work_done_progress_options: Default::default(),
+                    all_commit_characters: None,
+                    completion_item: Some(CompletionOptionsCompletionItem {
+                        label_details_support: Some(true),
+                    }),
+                }),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec!["load_workspace".to_string(), "random_command".to_string()],
+                    work_done_progress_options: Default::default(),
+                }),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: None,
+                }),
+                semantic_tokens_provider: None,
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: Some(false),
+                    },
+                })),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(Vec::new()),
+                        work_done_progress_options: (WorkDoneProgressOptions {
+                            work_done_progress: Some(false),
+                        }),
+                        resolve_provider: None,
+                    },
+                )),
+                position_encoding: Some(PositionEncodingKind::UTF8),
+                ..ServerCapabilities::default()
+            },
+        })
+    }
+
+    #[instrument(skip(self))]
+    async fn initialized(&self, _: InitializedParams) {
+        let folders = {
+            tracing::info!("version {}", hemlis_lib::version());
+            tracing::info!("Scanning...");
+            let folders = self
+                .client
+                .workspace_folders()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            self.load_workspace(folders.clone());
+            tracing::info!("Done scanning");
+            let mut futures = Vec::new();
+            for i in self.fi_to_uri.iter() {
+                futures.push(self.show_errors(*i.key(), None));
+            }
+            join_all(futures).await;
+            folders
+        };
+        {
+            let mut write = self.has_started.write().unwrap();
+            *write = true;
+        }
+        {
+            let registration = Registration {
+                id: "workspace/didChangeWatchedFiles".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: Some(serde_json::json!({
+                    "watchers": [
+                        {
+                            "globPattern": "**/*.purs"
+                        }
+                    ]
+                })),
+            };
+
+            self.client
+                .register_capability(vec![registration])
+                .await
+                .unwrap();
+        }
+
+        // Fall back to a native file watcher when the client doesn't support dynamic
+        // registration of workspace/didChangeWatchedFiles (e.g. neovim on Linux).
+        let use_native_watcher = !self
+            .client_watch_dynamic_registration
+            .get()
+            .copied()
+            .unwrap_or(false);
+
+        if use_native_watcher {
+            let watch_dirs: Vec<std::path::PathBuf> = folders
+                .iter()
+                .filter_map(|f| {
+                    let s = f.uri.to_string();
+                    Some(std::path::PathBuf::from(s.strip_prefix("file://")?))
+                })
+                .collect();
+
+            if !watch_dirs.is_empty() {
+                // Build a Weak<Backend> from &self. tower-lsp-server wraps the backend in
+                // Arc<S> inside its Router and dispatches by calling &*arc, so self is
+                // always the interior of a live Arc<Backend>.
+                let weak_self: std::sync::Weak<Backend> = unsafe {
+                    std::sync::Arc::increment_strong_count(self as *const Backend);
+                    let arc = std::sync::Arc::from_raw(self as *const Backend);
+                    let weak = std::sync::Arc::downgrade(&arc);
+                    // arc's drop restores the original refcount
+                    weak
+                };
+
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::path::PathBuf>();
+
+                std::thread::spawn(move || {
+                    use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+                    let result = RecommendedWatcher::new(
+                        move |result: notify::Result<notify::Event>| {
+                            if let Ok(event) = result {
+                                match event.kind {
+                                    EventKind::Create(_) | EventKind::Modify(_) => {
+                                        for path in event.paths {
+                                            if path.extension().map_or(false, |e| e == "purs") {
+                                                let _ = tx.send(path);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        },
+                        Config::default(),
+                    );
+                    match result {
+                        Ok(mut watcher) => {
+                            for dir in &watch_dirs {
+                                if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
+                                    tracing::error!("Failed to watch {:?}: {}", dir, e);
+                                }
+                            }
+                            tracing::info!("Native file watcher active for {:?}", watch_dirs);
+                            loop {
+                                std::thread::sleep(Duration::from_secs(3600));
+                            }
+                        }
+                        Err(e) => tracing::error!("Failed to create file watcher: {}", e),
+                    }
+                });
+
+                tokio::spawn(async move {
+                    while let Some(path) = rx.recv().await {
+                        let backend = match weak_self.upgrade() {
+                            Some(b) => b,
+                            None => break,
+                        };
+                        let uri = match Uri::from_file_path(&path) {
+                            Some(uri) => uri,
+                            None => continue,
+                        };
+                        let source = match std::fs::read_to_string(&path) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+                        if let Some((fi, version, to_notify)) =
+                            backend.on_change(TextDocumentItem {
+                                text: &source,
+                                uri,
+                                version: None,
+                            })
+                        {
+                            backend.show_errors(fi, version).await;
+                            for (fi, v) in to_notify.iter() {
+                                backend.show_errors(*fi, *v).await;
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[instrument(skip(self, params))]
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
+        let fi = self.find_fi(uri.clone());
+        if let Some(fi) = fi {
+            self.open_files.insert(fi, ());
+        }
+        if let Some((fi, version, to_notify)) = self.on_change(TextDocumentItem {
+            text: &params.text_document.text,
+            uri,
+            version: Some(params.text_document.version),
+        }) {
+            self.open_files.insert(fi, ());
+            self.show_errors(fi, version).await;
+            for (fi, v) in to_notify.iter() {
+                self.show_errors(*fi, *v).await;
+            }
+            if !to_notify.is_empty() {
+                let _ = self.client.workspace_diagnostic_refresh().await;
+            }
+        }
+
+        tracing::info!(
+            "!! {:?} FINISHED! {:?}",
+            params.text_document.version,
+            params.text_document.uri.to_string()
+        );
+    }
+
+    #[instrument(skip(self, params))]
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        if let Some((fi, version, to_notify)) = self.on_change(TextDocumentItem {
+            text: &params.content_changes[0].text,
+            uri: params.text_document.uri.clone(),
+            version: Some(params.text_document.version),
+        }) {
+            self.show_errors(fi, version).await;
+            for (fi, v) in to_notify.iter() {
+                self.show_errors(*fi, *v).await;
+            }
+            if !to_notify.is_empty() {
+                let _ = self.client.workspace_diagnostic_refresh().await;
+            }
+        }
+
+        tracing::info!(
+            "!! {:?} FINISHED! {:?}",
+            params.text_document.version,
+            params.text_document.uri.to_string()
+        );
+    }
+
+    #[instrument(skip(self))]
+    async fn did_save(&self, _: DidSaveTextDocumentParams) {}
+
+    #[instrument(skip(self))]
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        if let Some(fi) = self
+            .uri_to_fi
+            .try_get(&params.text_document.uri)
+            .try_unwrap()
+        {
+            self.open_files.remove(&*fi);
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let definition = || -> Option<GotoDefinitionResponse> {
+            if let Some(name) = self.resolve_name(
+                &params.text_document_position_params.text_document.uri,
+                params.text_document_position_params.position,
+            ) {
+                let def_at = self.defines.try_get(&name).try_unwrap()?.value().clone();
+                let uri = self
+                    .fi_to_uri
+                    .try_get(&def_at.name.fi()?)
+                    .try_unwrap()?
+                    .clone();
+                Some(GotoDefinitionResponse::Scalar(Location {
+                    uri,
+                    range: span_to_range(&def_at.name),
+                }))
+            } else {
+                let fi = *self
+                    .uri_to_fi
+                    .try_get(&params.text_document_position_params.text_document.uri)
+                    .try_unwrap()?;
+                let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
+                let position = params.text_document_position_params.position;
+                let word_under_cursor =
+                    try_find_word(&source, position.line as usize, position.character as usize)?;
+                if word_under_cursor != "foreign" {
+                    return None;
+                };
+                let mut uri = params
+                    .text_document_position_params
+                    .text_document
+                    .uri
+                    .to_file_path()?;
+                uri.to_mut().set_extension("erl");
+                Some(GotoDefinitionResponse::Scalar(Location {
+                    uri: Uri::from_file_path(uri)?,
+                    range: range((0, 0), (0, 0)),
+                }))
+            }
+        }();
+        Ok(definition)
+    }
+
+    #[instrument(skip(self))]
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let reference_list = || -> Option<Vec<Location>> {
+            let name = self.resolve_name(
+                &params.text_document_position.text_document.uri,
+                params.text_document_position.position,
+            )?;
+            Some(
+                self.references
+                    .try_get(&name.module())
+                    .try_unwrap()?
+                    .get(&name)?
+                    .iter()
+                    .filter_map(|(s, sort): &(ast::Span, nr::Sort)| {
+                        if !sort.is_def_or_ref() {
+                            return None;
+                        }
+                        let uri = self.fi_to_uri.try_get(&s.fi()?).try_unwrap()?;
+                        let range = span_to_range(s);
+
+                        Some(Location::new(uri.clone(), range))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }();
+        Ok(reference_list)
+    }
+
+    #[instrument(skip(self))]
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
+        let mut symbols = Vec::new();
+        for i in self.previouse_defines.iter() {
+            let fi = i.key();
+            let names = i.value();
+            for (Name(scope, ns, n, vis), at) in names.iter() {
+                if *vis != Visibility::Public {
+                    continue;
+                }
+                let n = self.name_(n);
+                let ns = self.name_(ns);
+                if Some(fi) != at.name.fi().as_ref() {
+                    continue;
+                };
+                if !(n.starts_with(&params.query)
+                    || ns.starts_with(&params.query)
+                    || format!("{:?}", scope).starts_with(&params.query))
+                {
+                    continue;
+                };
+                let name = format!("{}.{}", ns, n);
+                #[allow(deprecated)]
+                let out = SymbolInformation {
+                    name,
+                    kind: match scope {
+                        Scope::Kind => SymbolKind::INTERFACE,
+                        Scope::Type if n.starts_with(|c| matches!(c, 'a'..='z' | '_')) => {
+                            SymbolKind::VARIABLE
+                        }
+                        Scope::Type => SymbolKind::INTERFACE,
+                        Scope::Class => SymbolKind::CLASS,
+                        Scope::Term if n.starts_with(|c| matches!(c, 'A'..='Z' | '_')) => {
+                            SymbolKind::CONSTRUCTOR
+                        }
+                        Scope::Term => SymbolKind::FUNCTION,
+                        Scope::Module => SymbolKind::MODULE,
+                        Scope::Namespace => SymbolKind::NAMESPACE,
+                        Scope::Label => SymbolKind::FIELD,
+                    },
+                    tags: None,
+
+                    deprecated: None,
+
+                    location: {
+                        let uri = self.fi_to_uri.try_get(fi).unwrap().clone();
+                        let range = span_to_range(&at.name);
+                        Location::new(uri, range)
+                    },
+
+                    container_name: None,
+                };
+                symbols.push(out);
+            }
+        }
+        Ok(Some(symbols.into()))
+    }
+
+    #[instrument(skip(self))]
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let mut symbols = Vec::new();
+        let fi_inner = if let Some(fi) = self
+            .uri_to_fi
+            .try_get(&params.text_document.uri)
+            .try_unwrap()
+        {
+            *fi
+        } else {
+            return Err(error(line!(), "File not loaded"));
+        };
+        if let Some(names) = self.previouse_defines.try_get(&fi_inner).try_unwrap() {
+            for (Name(scope, _, n, vis), at) in names.iter() {
+                let at = at.name;
+                if *vis != Visibility::Public {
+                    continue;
+                }
+                let fi = if let Some(fi) = at.fi() { fi } else { continue };
+                let name = match self.names.try_get(n).try_unwrap() {
+                    Some(n) => n.clone(),
+                    None => continue,
+                };
+                #[allow(deprecated)]
+                let out = SymbolInformation {
+                    name: name.clone(),
+                    kind: match scope {
+                        Scope::Kind => SymbolKind::INTERFACE,
+                        Scope::Type if name.starts_with(|c| matches!(c, 'a'..='z' | '_')) => {
+                            SymbolKind::VARIABLE
+                        }
+                        Scope::Type => SymbolKind::INTERFACE,
+                        Scope::Class => SymbolKind::CLASS,
+                        Scope::Term if name.starts_with(|c| matches!(c, 'A'..='Z' | '_')) => {
+                            SymbolKind::CONSTRUCTOR
+                        }
+                        Scope::Term => SymbolKind::FUNCTION,
+                        Scope::Module => SymbolKind::MODULE,
+                        Scope::Namespace => SymbolKind::NAMESPACE,
+                        Scope::Label => SymbolKind::FIELD,
+                    },
+                    tags: None,
+                    deprecated: None,
+
+                    location: {
+                        let uri = self.fi_to_uri.try_get(&fi).unwrap().clone();
+                        let range = span_to_range(&at);
+                        Location::new(uri, range)
+                    },
+
+                    container_name: None,
+                };
+                symbols.push(out);
+            }
+        }
+        Ok(Some(DocumentSymbolResponse::Flat(symbols)))
+    }
+
+    #[instrument(skip(self))]
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        tracing::info!("completion..");
+        let completions = || -> Option<Vec<CompletionItem>> {
+            let fi = *self.uri_to_fi.try_get(&uri).try_unwrap()?;
+            let me = *self.fi_to_ud.try_get(&fi).try_unwrap()?;
+            let line = position.line as usize;
+            let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
+            let to_complete =
+                try_find_word(&source, line, position.character as usize)?.to_string();
+            drop(source);
+
+            tracing::info!("completion for \"{:?}\"", to_complete);
+            let maybe_first_letter = to_complete.chars().nth(0);
+
+            let mut out = Vec::new();
+
+            // TODO: If the user has typed anything here - we can get an inference of the kind of
+            // symbol and narrow the search significantly. If we know it's a type we can ignore
+            // terms and vice versa.
+
+            // Imported
+            let (namespace, var) = if let Some(last) = to_complete.rfind('.') {
+                (
+                    Some(ast::Ud::new(to_complete[..last].into())),
+                    to_complete[last + 1..].into(),
+                )
+            } else {
+                (None, to_complete.clone())
+            };
+            if let Some(imports) = self
+                .imports
+                .try_get(&me)
+                .try_unwrap()
+                .and_then(|x| x.get(&namespace).cloned())
+            {
+                for n in imports.iter().flat_map(|x| x.to_names()) {
+                    if n.scope() == Scope::Namespace {
+                        continue;
+                    }
+                    let name = self.name_(&n.name());
+                    if name.starts_with(&var) {
+                        let mut completion = CompletionItem::new_simple(
+                            name.to_string(),
+                            format!("Imported {:?}", n.scope()),
+                        );
+                        completion.documentation =
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: self.get_documentation_for_name(n),
+                            }));
+                        out.push(completion);
+                    }
+                }
+            } else {
+                let maybe_field = to_complete.split(".").last();
+                tracing::info!("completion for field \"{:?}\"", maybe_field);
+                let maybe_first_letter = maybe_field.and_then(|x| x.chars().next());
+                // We're assuming it's a field we're looking at since there's not an imported
+                // namespace with this name.
+                let fields: Vec<_> = self
+                    .references
+                    .try_get(&ast::Ud::zero())
+                    .try_unwrap()?
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        if k.scope() != nr::Scope::Label || v.is_empty() {
+                            None
+                        } else {
+                            Some(*k)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                for n in fields.iter() {
+                    if maybe_first_letter.is_none()
+                        || n.name().starts_with(maybe_first_letter.unwrap())
+                    {
+                        // TODO: If this is nice - and people want more - I can add more info here when
+                        // they know what they want.
+                        let name = self.name_(&n.name());
+                        let mut completion = CompletionItem::new_simple(
+                            name.to_string(),
+                            format!("Define {:?}", n.scope()),
+                        );
+                        completion.documentation =
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: self.get_documentation_for_name(*n),
+                            }));
+                        out.push(completion);
+                    }
+                }
+            }
+
+            if namespace.is_none() {
+                // Locals
+                let lut = self.available_locals.try_get(&fi).try_unwrap()?;
+                let mut cur = lut.lower_bound(Bound::Included(&((0, line), None)));
+                while let Some(((l, h), n)) = cur.peek_next() {
+                    let n = n.expect("This option is only for searching!");
+                    if !(*l <= line && line <= *h) {
+                        break;
+                    }
+
+                    if maybe_first_letter.is_none()
+                        || n.name().starts_with(maybe_first_letter.unwrap())
+                    {
+                        let name = self.name_(&n.name());
+                        let mut completion = CompletionItem::new_simple(
+                            name.to_string(),
+                            format!("Local {:?}", n.scope()),
+                        );
+                        completion.documentation =
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: self.get_documentation_for_name(n),
+                            }));
+                        out.push(completion);
+                    }
+
+                    cur.next();
+                }
+
+                // Defines
+                let defines: Vec<_> = self
+                    .defines
+                    .iter()
+                    .filter_map(|x| {
+                        let k = x.key();
+                        if k.module() != me {
+                            return None;
+                        }
+                        Some(*k)
+                    })
+                    .collect();
+                for n in defines.iter() {
+                    if n.module() != me {
+                        continue;
+                    }
+                    if maybe_first_letter.is_none()
+                        || n.name().starts_with(maybe_first_letter.unwrap())
+                    {
+                        // TODO: If this is nice - and people want more - I can add more info here when
+                        // they know what they want.
+                        let name = self.name_(&n.name());
+                        let mut completion = CompletionItem::new_simple(
+                            name.to_string(),
+                            format!("Define {:?}", n.scope()),
+                        );
+                        completion.documentation =
+                            Some(Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: self.get_documentation_for_name(*n),
+                            }));
+                        out.push(completion);
+                    }
+                }
+            }
+            Some(out)
+        }();
+        Ok(completions.map(CompletionResponse::Array))
+    }
+
+    #[instrument(skip(self))]
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let name = self
+            .resolve_name(
+                &params.text_document_position.text_document.uri,
+                params.text_document_position.position,
+            )
+            .ok_or_else(|| error(line!(), "Failed to resolve name"))?;
+
+        // Disallow renaming of record fields
+        if name.scope() == nr::Scope::Label {
+            return Ok(None);
+        }
+
+        // NOTE: We don't validate the name here - so it is possible to end up in a state where the
+        // codebase doesn't parse. I don't see this as a huge loss - since the edit can be undone.
+        let new_text = params.new_name;
+        let mut edits = HashMap::new();
+        for at in self
+            .references
+            .try_get(&name.1)
+            .try_unwrap()
+            .ok_or_else(|| error(line!(), "Failed to read references"))?
+            .get(&name)
+            .ok_or_else(|| error(line!(), "Unknown name - how did we get here?"))?
+            .iter()
+            .map(|(at, _)| *at)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+        {
+            let uri = self
+                .fi_to_uri
+                .try_get(&if let Some(fi) = at.fi() { fi } else { continue })
+                .try_unwrap()
+                .ok_or_else(|| error(line!(), "Unknown file - how did we get here?"))?
+                .clone();
+            let range = span_to_range(&at);
+            edits.entry(uri).or_insert(Vec::new()).push(TextEdit {
+                range,
+                new_text: new_text.clone(),
+            });
+        }
+        // At least the neovim client is tricky when doing renames - it applies the edits one after
+        // the other. This makes us validate EACH version of the document as the edits are applied.
+        // If we want to keep the bandwith low the edits do make sense - but given the current
+        // state of the LSP this isn't how it works.
+        //
+        // I tried adding a sleep to the sending of messages - but that doesn't really work
+        // apparently.
+        //
+        // At the same time - I can't reasonably assume that all clients work this way. If I did it
+        // could possible be fixed.
+        //
+        // The rust LSP waits a few seconds (or is just really slow).
+
+        tracing::info!(
+            "rename suggested with {:?} edits",
+            edits.values().map(|x| x.len()).collect::<Vec<_>>()
+        );
+
+        Ok(Some(WorkspaceEdit::new(edits)))
+    }
+
+    #[instrument(skip(self))]
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        if let Some((name, range)) =
+            self.resolve_name_and_range(&params.text_document.uri, params.position)
+            && name.scope() != nr::Scope::Label
+        {
+            Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+                range,
+                placeholder: self.name_(&name.name()),
+            }))
+        } else {
+            return Ok(None);
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri.clone();
+        let fi = *or_!(self.uri_to_fi.try_get(&uri).try_unwrap(), {
+            return Err(error(line!(), "File not loaded"));
+        });
+        let me = *or_!(self.fi_to_ud.try_get(&fi).try_unwrap(), {
+            return Err(error(line!(), "File failed to load"));
+        });
+
+        // Extract end_of_imports and immediately drop the modules guard so background
+        // loading is not blocked while we do the (potentially slow) fixable processing.
+        let (end_of_imports, import_decls) = {
+            let qq = self.modules.try_get(&me).try_unwrap();
+            let head = or_!(
+                &or_!(&qq, {
+                    return Err(error(line!(), "Module failed to load"));
+                })
+                .value()
+                .0,
+                {
+                    return Err(error(line!(), "Module failed to load"));
+                }
+            );
+            (
+                head.2
+                    .last()
+                    .map(|x| x.start.lo())
+                    .unwrap_or_else(|| head.4.next_line().lo()),
+                head.2.clone(),
+            )
+            // qq (modules guard) dropped here
+        };
+
+        // Clone fixables and drop the guard immediately. Background loading writes fixables
+        // first, then resolved/defines. Holding this guard blocks goto_definition from seeing
+        // freshly resolved names.
+        let fixables = {
+            let guard = or_!(self.fixables.try_get(&fi).try_unwrap(), {
+                return Err(error(line!(), "Module failed to load"));
+            });
+            guard.value().clone()
+            // guard (fixables read lock) dropped here
+        };
+
+        let mut out = Vec::new();
+
+        let mut delete_all = Vec::new();
+        // Collect per-item unused spans for grouping by import decl.
+        let mut per_item_unused: Vec<ast::Span> = Vec::new();
+        for (_, f) in fixables.iter() {
+            match f {
+                Fixable::DeleteUnusedImport(at) => {
+                    let is_entire_line = matches!(at, ast::Span::Known(_, (_, 0), _));
+                    if is_entire_line {
+                        delete_all.push(span_to_range(&at.and_one_more_char()));
+                    } else {
+                        per_item_unused.push(*at);
+                    }
+                }
+                // Dropping the unused `(..)` from an import is part of "burn all unused imports".
+                Fixable::RemoveUnusedConstructors(at) => {
+                    delete_all.push(span_to_range(at));
+                }
+                _ => (),
+            }
+        }
+        // For per-item deletions, group by import decl and compute
+        // ranges using remove_indices_ranges for correct separator handling.
+        // Also build a map from item span to its proper deletion range
+        // for per-item code actions.
+        let mut per_item_deletion_range: Vec<(ast::Span, Range)> = Vec::new();
+        for decl in import_decls.iter() {
+            let Some(items) = decl.names.as_ref() else {
+                continue;
+            };
+            let all_spans: Vec<ast::Span> = items.iter().map(|i| i.span()).collect();
+            let unused_indices: Vec<usize> = all_spans
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| per_item_unused.contains(s))
+                .map(|(i, _)| i)
+                .collect();
+            if unused_indices.is_empty() {
+                continue;
+            }
+            // For BurnAll: compute ranges assuming all unused items are removed together.
+            delete_all.extend(remove_indices_ranges(&all_spans, &unused_indices, false));
+            // For per-item: compute range for each item removed individually.
+            for &idx in &unused_indices {
+                let r = remove_nth_range(&all_spans, idx, false);
+                per_item_deletion_range.push((all_spans[idx], r));
+            }
+        }
+        // Sort by start position, then merge overlapping/adjacent ranges so the
+        // workspace-edit never contains invalid overlapping TextEdits.
+        delete_all.sort_by_key(|r| (r.start.line, r.start.character));
+        let mut merged: Vec<Range> = Vec::new();
+        for r in delete_all {
+            if let Some(last) = merged.last_mut() {
+                if (r.start.line, r.start.character) <= (last.end.line, last.end.character) {
+                    if (r.end.line, r.end.character) > (last.end.line, last.end.character) {
+                        last.end = r.end;
+                    }
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+        let delete_all = merged;
+        if !delete_all.is_empty() {
+            out.push(CodeAction {
+                title: format!("BurnAllUnusedImport"),
+                kind: Some(CodeActionKind::SOURCE_FIX_ALL),
+                is_preferred: None,
+                edit: Some(WorkspaceEdit::new(
+                    [(
+                        uri.clone(),
+                        delete_all
+                            .into_iter()
+                            .map(|r| TextEdit::new(r, "".into()))
+                            .collect(),
+                    )]
+                    .into(),
+                )),
+                ..CodeAction::default()
+            });
+        }
+
+        for (s, f) in fixables.iter() {
+            if !s.contains((
+                params.range.start.line as usize,
+                params.range.start.character as usize,
+            )) {
+                continue;
+            }
+            match f {
+                Fixable::GuessImports(s, ns, n, at) => {
+                    let imported = or_!(self.imports.try_get(&me).try_unwrap(), { continue })
+                        .value()
+                        .clone();
+
+                    // Detect operators: names that start with a non-alphanumeric, non-underscore char.
+                    // Operators should never be suggested as qualified imports (e.g. `Mod.(+)`).
+                    let is_operator = |name_ud: ast::Ud| -> bool {
+                        self.names
+                            .try_get(&name_ud)
+                            .try_unwrap()
+                            .map(|s| {
+                                let first = s.chars().next().unwrap_or('_');
+                                !char::is_ascii_alphanumeric(&first) && first != '_'
+                            })
+                            .unwrap_or(false)
+                    };
+
+                    // Collect qualified import aliases for each module in this file:
+                    // module_ud -> [alias_ud, ...]
+                    let mut qualified_aliases: BTreeMap<ast::Ud, Vec<ast::Ud>> = BTreeMap::new();
+                    for (alias_opt, exports) in imported.iter() {
+                        let Some(alias) = alias_opt else { continue };
+                        for export in exports.iter() {
+                            for nm in export.to_names() {
+                                let entry = qualified_aliases.entry(nm.module()).or_default();
+                                if !entry.contains(alias) {
+                                    entry.push(*alias);
+                                }
+                            }
+                        }
+                    }
+
+                    // Modules imported unqualified in this file
+                    let unqualified_modules: BTreeSet<ast::Ud> = imported
+                        .iter()
+                        .flat_map(|(alias_opt, exports)| {
+                            if alias_opt.is_some() {
+                                return vec![];
+                            }
+                            exports
+                                .iter()
+                                .flat_map(|e| e.to_names())
+                                .map(|n| n.module())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+
+                    let all_exports: BTreeMap<ast::Ud, Vec<nr::Export>> = self
+                        .exports
+                        .iter()
+                        .map(|x| (*x.key(), x.value().clone()))
+                        .collect();
+
+                    // Scored suggestions: (score, CodeAction).
+                    // Higher score = more relevant. is_preferred mirrors score >= 1.5.
+                    let mut scored: Vec<(f32, CodeAction)> = Vec::new();
+
+                    if *s == Scope::Namespace {
+                        // The user referenced an unknown namespace qualifier.
+                        // Suggest: rename to an existing alias, or add a new qualified import.
+                        let namespace_str = self.name_(n);
+                        let target_alias = ns
+                            .map(|a| self.name_(&a))
+                            .unwrap_or_else(|| namespace_str.clone());
+
+                        // Already-imported qualified aliases that are similar to the typed name
+                        for (alias_opt, _) in imported.iter() {
+                            let Some(alias) = alias_opt else { continue };
+                            let alias_str = self.name_(alias);
+                            let sim = similarity_score(
+                                &alias_str.to_lowercase(),
+                                &namespace_str.to_lowercase(),
+                            );
+                            if sim < 0.4 {
+                                continue;
+                            }
+                            scored.push((
+                                sim + 1.0,
+                                CodeAction {
+                                    title: format!("Use `{}` (already imported)", alias_str),
+                                    kind: Some(CodeActionKind::QUICKFIX),
+                                    is_preferred: Some(true),
+                                    edit: Some(WorkspaceEdit::new(
+                                        [(
+                                            uri.clone(),
+                                            vec![TextEdit::new(range(at.lo(), at.hi()), alias_str)],
+                                        )]
+                                        .into(),
+                                    )),
+                                    ..CodeAction::default()
+                                },
+                            ));
+                        }
+
+                        // Suggest importing any module with a name similar to the typed namespace
+                        for (m, _xs) in all_exports.iter() {
+                            if *m == me {
+                                continue;
+                            }
+                            let module_str = self.name_(m);
+                            let sim = alias_match_score(&module_str, &namespace_str);
+                            if sim <= 0.0 {
+                                continue;
+                            }
+                            let already_imported = qualified_aliases.contains_key(m);
+                            let score = sim + if already_imported { 0.5 } else { 0.0 };
+                            scored.push((
+                                score,
+                                CodeAction {
+                                    title: format!("Import `{}` as `{}`", module_str, target_alias),
+                                    kind: Some(CodeActionKind::QUICKFIX),
+                                    is_preferred: Some(module_str == namespace_str),
+                                    edit: Some(WorkspaceEdit::new(
+                                        [(
+                                            uri.clone(),
+                                            vec![TextEdit::new(
+                                                range(end_of_imports, end_of_imports),
+                                                format!(
+                                                    "import {} as {}\n",
+                                                    module_str, target_alias
+                                                ),
+                                            )],
+                                        )]
+                                        .into(),
+                                    )),
+                                    ..CodeAction::default()
+                                },
+                            ));
+                        }
+                    } else {
+                        // The user referenced an unknown name `n` with scope `s`.
+                        let name_ud = *n;
+                        let operator = is_operator(name_ud);
+
+                        // When the user typed a bare name (no namespace qualifier) and it's not
+                        // an operator, suggest using an already-imported qualified alias.
+                        if ns.is_none() && !operator {
+                            for (alias_opt, exports) in imported.iter() {
+                                let Some(alias) = alias_opt else { continue };
+                                for export in exports.iter() {
+                                    for nm in export.to_names() {
+                                        if nm.name() != name_ud || nm.scope() != *s {
+                                            continue;
+                                        }
+                                        let alias_str = self.name_(alias);
+                                        let name_str = self.name_(&nm.name());
+                                        let module_str = self.name_(&nm.module());
+                                        let usage = format!("{}.{}", alias_str, name_str);
+                                        scored.push((
+                                            2.0,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Use `{}` from `{}` (already imported as `{}`)",
+                                                    usage, module_str, alias_str,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(true),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![TextEdit::new(
+                                                            range(at.lo(), at.hi()),
+                                                            usage,
+                                                        )],
+                                                    )]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        for (m, xs) in all_exports.iter() {
+                            if *m == me {
+                                continue;
+                            }
+                            for export in xs.iter() {
+                                // usage_name: the name as it appears at the call site
+                                // import_name: the name/type used for the import statement
+                                // is_ctor: whether import_name is a type containing a constructor
+                                let (usage_name, import_name, is_ctor): (nr::Name, nr::Name, bool) =
+                                    match export {
+                                        Export::ConstructorsSome(parent, constructors, _)
+                                        | Export::ConstructorsAll(parent, constructors, _) => {
+                                            if parent.name() == name_ud && parent.scope() == *s {
+                                                // The type itself is what's used (e.g. in a type
+                                                // signature) — import just the type, without its
+                                                // constructors. We only pull in constructors when a
+                                                // constructor is actually used (branch below).
+                                                // (PAY-3260)
+                                                (*parent, *parent, false)
+                                            } else if let Some(c) = constructors.iter().find(|c| {
+                                                c.name() == name_ud
+                                                    && c.scope() == *s
+                                                    && c.scope() == Scope::Term
+                                            }) {
+                                                (*c, *parent, true)
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                        Export::Just(name) => {
+                                            if name.name() == name_ud && name.scope() == *s {
+                                                (*name, *name, false)
+                                            } else {
+                                                continue;
+                                            }
+                                        }
+                                    };
+
+                                let module_ud = usage_name.module();
+                                let module_str = self.name_(&module_ud);
+                                let usage_str = self.name_(&usage_name.name());
+                                let import_item = as_import(
+                                    import_name.scope(),
+                                    is_ctor,
+                                    import_name.name(),
+                                    &self.names,
+                                );
+
+                                let already_qualified = qualified_aliases.contains_key(&module_ud);
+                                let already_unqualified = unqualified_modules.contains(&module_ud);
+
+                                // Check if this module is *directly* imported in the current file
+                                // (as opposed to being accessible only via a re-export from another
+                                // module that is imported here). Re-export references live in the
+                                // exporting module's file, not the current file.
+                                let directly_imported = self
+                                    .references
+                                    .try_get(&module_ud)
+                                    .try_unwrap()
+                                    .and_then(|refs| {
+                                        refs.get(&Name(
+                                            Scope::Module,
+                                            module_ud,
+                                            module_ud,
+                                            Visibility::Public,
+                                        ))
+                                        .map(|spans| {
+                                            spans.iter().any(|(span, _)| span.fi() == Some(fi))
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                // A module is directly unqualified only when it's directly imported
+                                // AND not qualified (a qualified import is never in the None key).
+                                let directly_unqualified = directly_imported && !already_qualified;
+
+                                // How similar is this module's name to what the user typed?
+                                // When a namespace qualifier was typed (e.g. `Foo.bar`), use the
+                                // structured alias-match scoring (exact > ends-with > contains >
+                                // PascalCase letter overlap) so that e.g. `Kanon.Table` ranks above
+                                // `Ganon` for qualifier `Kanon`.
+                                // When a bare name was typed (e.g. `bar`), use edit-distance similarity
+                                // against the export name as a weaker hint (e.g. `Map` for `map`).
+                                let module_sim = if let Some(ns_alias) = ns {
+                                    let alias_str = self.name_(ns_alias);
+                                    alias_match_score(&module_str, &alias_str)
+                                } else {
+                                    similarity_score(
+                                        &module_str.to_lowercase(),
+                                        &usage_str.to_lowercase(),
+                                    )
+                                };
+                                let import_bonus = if already_qualified || already_unqualified {
+                                    0.5
+                                } else {
+                                    0.0
+                                };
+
+                                // Suggestion A: Add name to an existing unqualified import.
+                                // Only when the module is directly and solely imported unqualified.
+                                if directly_unqualified && ns.is_none() {
+                                    (|| -> Option<()> {
+                                        let (l, c) = self
+                                            .references
+                                            .try_get(&module_ud)
+                                            .try_unwrap()?
+                                            .get(&Name(
+                                                Scope::Module,
+                                                module_ud,
+                                                module_ud,
+                                                Visibility::Public,
+                                            ))?
+                                            .iter()
+                                            .find_map(|(span, _): &(ast::Span, nr::Sort)| {
+                                                if span.fi() == Some(fi) {
+                                                    Some(*span)
+                                                } else {
+                                                    None
+                                                }
+                                            })?
+                                            .hi();
+                                        let c = c + 2;
+                                        scored.push((
+                                            1.5 + module_sim * 0.5,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Add `{}` to import of `{}`",
+                                                    import_item, module_str,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(true),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![TextEdit::new(
+                                                            range((l, c), (l, c)),
+                                                            format!("{}, ", import_item),
+                                                        )],
+                                                    )]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
+                                        None
+                                    })();
+                                }
+
+                                // Suggestion B: New unqualified import line.
+                                // Only offered for bare-name references not already directly imported unqualified.
+                                if ns.is_none() && !directly_unqualified {
+                                    scored.push((
+                                        0.3 + module_sim * 0.5 + import_bonus,
+                                        CodeAction {
+                                            title: format!(
+                                                "Import `{}` from `{}`",
+                                                import_item, module_str,
+                                            ),
+                                            kind: Some(CodeActionKind::QUICKFIX),
+                                            is_preferred: Some(false),
+                                            edit: Some(WorkspaceEdit::new(
+                                                [(
+                                                    uri.clone(),
+                                                    vec![TextEdit::new(
+                                                        range(end_of_imports, end_of_imports),
+                                                        format!(
+                                                            "import {} ({})\n",
+                                                            module_str, import_item
+                                                        ),
+                                                    )],
+                                                )]
+                                                .into(),
+                                            )),
+                                            ..CodeAction::default()
+                                        },
+                                    ));
+                                }
+
+                                // Suggestion C: Qualified import (not for operators or type operators).
+                                // Preferred over unqualified (higher base score).
+                                // When ns=None, skip if already_qualified — the "use existing alias"
+                                // suggestion (score 2.0) already covers this module.
+                                if !operator {
+                                    if let Some(ns_alias) = ns {
+                                        // User typed `Alias.name` — suggest importing the module as that alias.
+                                        let ns_str = self.name_(ns_alias);
+                                        scored.push((
+                                            module_sim + import_bonus,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Import `{}` as `{}`",
+                                                    module_str, ns_str,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(ns_str == module_str),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![TextEdit::new(
+                                                            range(end_of_imports, end_of_imports),
+                                                            format!(
+                                                                "import {} as {}\n",
+                                                                module_str, ns_str
+                                                            ),
+                                                        )],
+                                                    )]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
+                                    } else if !already_qualified {
+                                        // User typed a bare name — suggest a qualified import using
+                                        // a dotless alias (e.g. Data.Map -> DataMap) and rewrite usage.
+                                        // Alias format:
+                                        // - One dot (two segments) e.g. `Visma.Api` → `VismaApi`
+                                        // - One dot with "Ctx" first e.g. `Ctx.Time` → `TimeCtx`
+                                        // - Multiple dots e.g. `Data.Map.Strict` → `DataMapStrict`
+                                        let alias = {
+                                            let parts: Vec<&str> = module_str.split('.').collect();
+                                            if parts.len() == 2 {
+                                                if parts.get(0) == Some(&"Ctx") {
+                                                    format!("{}{}", parts[1], parts[0])
+                                                } else {
+                                                    format!("{}{}", parts[0], parts[1])
+                                                }
+                                            } else {
+                                                module_str.replace('.', "")
+                                            }
+                                        };
+                                        let qualified_usage = format!("{}.{}", alias, usage_str);
+                                        scored.push((
+                                            0.5 + module_sim * 0.5 + import_bonus,
+                                            CodeAction {
+                                                title: format!(
+                                                    "Import `{}` and use as `{}`",
+                                                    module_str, qualified_usage,
+                                                ),
+                                                kind: Some(CodeActionKind::QUICKFIX),
+                                                is_preferred: Some(already_qualified),
+                                                edit: Some(WorkspaceEdit::new(
+                                                    [(
+                                                        uri.clone(),
+                                                        vec![
+                                                            TextEdit::new(
+                                                                range(
+                                                                    end_of_imports,
+                                                                    end_of_imports,
+                                                                ),
+                                                                format!(
+                                                                    "import {} as {}\n",
+                                                                    module_str, alias
+                                                                ),
+                                                            ),
+                                                            TextEdit::new(
+                                                                range(at.lo(), at.hi()),
+                                                                qualified_usage,
+                                                            ),
+                                                        ],
+                                                    )]
+                                                    .into(),
+                                                )),
+                                                ..CodeAction::default()
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Sort by score descending so the most relevant suggestions appear first,
+                    // then cap to avoid overwhelming the editor with too many choices.
+                    scored.sort_by(|(a, _), (b, _)| {
+                        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    scored.truncate(25);
+                    for (_, action) in scored {
+                        out.push(action);
+                    }
+                }
+                Fixable::RenameWithUnderscore(at) => out.push(CodeAction {
+                    title: "Prefix `_` to mark unused".into(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: None,
+                    edit: Some(WorkspaceEdit::new(
+                        [(
+                            uri.clone(),
+                            vec![TextEdit::new(span_to_range(&at.right_before()), "_".into())],
+                        )]
+                        .into(),
+                    )),
+                    is_preferred: None,
+                    ..CodeAction::default()
+                }),
+                Fixable::Delete(at) => out.push(CodeAction {
+                    title: "Delete".into(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: None,
+                    edit: Some(WorkspaceEdit::new(
+                        [(
+                            uri.clone(),
+                            vec![TextEdit::new(
+                                span_to_range(&at.and_one_more_char()),
+                                "".into(),
+                            )],
+                        )]
+                        .into(),
+                    )),
+                    is_preferred: Some(true),
+                    ..CodeAction::default()
+                }),
+                Fixable::DeleteUnusedImport(at) => {
+                    let deletion_range = per_item_deletion_range
+                        .iter()
+                        .find(|(s, _)| s == at)
+                        .map(|(_, r)| *r)
+                        .unwrap_or_else(|| span_to_range(&at.and_one_more_char()));
+                    out.push(CodeAction {
+                        title: "DeleteUnusedImport".into(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit::new(
+                            [(uri.clone(), vec![TextEdit::new(deletion_range, "".into())])].into(),
+                        )),
+                        is_preferred: Some(true),
+                        ..CodeAction::default()
+                    })
+                }
+                Fixable::ReplaceExpression(expr_span, title, replacement, _) => {
+                    out.push(CodeAction {
+                        title: title.clone(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit::new(
+                            [(
+                                uri.clone(),
+                                vec![TextEdit::new(span_to_range(expr_span), replacement.clone())],
+                            )]
+                            .into(),
+                        )),
+                        is_preferred: Some(true),
+                        ..CodeAction::default()
+                    })
+                }
+                Fixable::RemoveUnusedConstructors(del_span) => out.push(CodeAction {
+                    title: "RemoveUnusedConstructors".into(),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: None,
+                    edit: Some(WorkspaceEdit::new(
+                        [(
+                            uri.clone(),
+                            vec![TextEdit::new(span_to_range(del_span), "".into())],
+                        )]
+                        .into(),
+                    )),
+                    is_preferred: Some(true),
+                    ..CodeAction::default()
+                }),
+                // Warn-only diagnostics have no associated code action.
+                Fixable::Warn(_, _) => {}
+                Fixable::RenameEdits(edits, title, _) => {
+                    let text_edits: Vec<TextEdit> = edits
+                        .iter()
+                        .map(|(span, new_text)| {
+                            TextEdit::new(span_to_range(span), new_text.clone())
+                        })
+                        .collect();
+                    out.push(CodeAction {
+                        title: title.clone(),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: None,
+                        edit: Some(WorkspaceEdit::new([(uri.clone(), text_edits)].into())),
+                        is_preferred: Some(true),
+                        ..CodeAction::default()
+                    })
+                }
+            }
+        }
+        // Offer "Delete unused parameter" for unused function parameters
+        // and "Delete unused record field" for unused record binder fields.
+        if let Some(module_guard) = self.modules.try_get(&me).try_unwrap() {
+            let module = module_guard.value();
+            for (s, f) in fixables.iter() {
+                if !s.contains((
+                    params.range.start.line as usize,
+                    params.range.start.character as usize,
+                )) {
+                    continue;
+                }
+                if let Fixable::RenameWithUnderscore(at) = f {
+                    // Check if this is a simple function parameter.
+                    let param_info = module.1.iter().find_map(|decl| {
+                        if let ast::Decl::Def(name, binders, _) = decl {
+                            binders.iter().enumerate().find_map(|(idx, binder)| {
+                                if binder_is_simple_var(binder) && binder.span().contains(at.lo()) {
+                                    Some((name.0.0, idx))
+                                } else {
+                                    None
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some((func_ud, param_idx)) = param_info {
+                        let mut edits = Vec::new();
+
+                        for decl in module.1.iter() {
+                            match decl {
+                                ast::Decl::Def(name, binders, _)
+                                    if name.0.0 == func_ud && binders.len() > param_idx =>
+                                {
+                                    let source = self.fi_to_source.try_get(&fi).try_unwrap();
+                                    let binder_spans: Vec<_> = binders
+                                        .iter()
+                                        .map(|b| match &source {
+                                            Some(s) => correct_binder_span(b, s.value(), fi),
+                                            None => b.span(),
+                                        })
+                                        .collect();
+                                    edits.push(TextEdit::new(
+                                        remove_nth_range(&binder_spans, param_idx, true),
+                                        "".into(),
+                                    ));
+                                }
+                                ast::Decl::Sig(name, typ) if name.0.0 == func_ud => {
+                                    let types = flatten_arr_chain(typ);
+                                    if param_idx < types.len().saturating_sub(1) {
+                                        let type_spans: Vec<_> =
+                                            types.iter().map(|t| t.span()).collect();
+                                        edits.push(TextEdit::new(
+                                            remove_nth_range(&type_spans, param_idx, false),
+                                            "".into(),
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !edits.is_empty() {
+                            out.push(CodeAction {
+                                title: "Delete unused parameter".into(),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: None,
+                                edit: Some(WorkspaceEdit::new([(uri.clone(), edits)].into())),
+                                is_preferred: Some(true),
+                                ..CodeAction::default()
+                            });
+                        }
+                        continue;
+                    }
+
+                    // Check if this is an unused field inside a record binder.
+                    let record_info = module.1.iter().find_map(|decl| {
+                        if let ast::Decl::Def(name, binders, _) = decl {
+                            binders.iter().enumerate().find_map(|(param_idx, binder)| {
+                                let record_fields = match binder {
+                                    ast::Binder::Record(fields) => fields,
+                                    ast::Binder::Typed(inner, _) => match inner.as_ref() {
+                                        ast::Binder::Record(fields) => fields,
+                                        _ => return None,
+                                    },
+                                    _ => return None,
+                                };
+                                record_fields.iter().find_map(|field| {
+                                    let field_ud = match field {
+                                        ast::RecordLabelBinder::Pun(n) => {
+                                            if n.span().contains(at.lo()) {
+                                                Some(n.0.0)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    };
+                                    field_ud.map(|ud| (name.0.0, param_idx, ud))
+                                })
+                            })
+                        } else {
+                            None
+                        }
+                    });
+
+                    if let Some((func_ud, param_idx, field_ud)) = record_info {
+                        // Check if this is the last field in the record. If so,
+                        // remove the entire parameter and its type arrow instead.
+                        let is_last_field = module.1.iter().any(|decl| {
+                            if let ast::Decl::Def(name, binders, _) = decl {
+                                if name.0.0 != func_ud || binders.len() <= param_idx {
+                                    return false;
+                                }
+                                let fields = match &binders[param_idx] {
+                                    ast::Binder::Record(f) => f,
+                                    ast::Binder::Typed(inner, _) => match inner.as_ref() {
+                                        ast::Binder::Record(f) => f,
+                                        _ => return false,
+                                    },
+                                    _ => return false,
+                                };
+                                fields.len() == 1
+                            } else {
+                                false
+                            }
+                        });
+
+                        let mut edits = Vec::new();
+
+                        for decl in module.1.iter() {
+                            match decl {
+                                ast::Decl::Def(name, binders, _)
+                                    if name.0.0 == func_ud && binders.len() > param_idx =>
+                                {
+                                    if is_last_field {
+                                        let source = self.fi_to_source.try_get(&fi).try_unwrap();
+                                        let binder_spans: Vec<_> = binders
+                                            .iter()
+                                            .map(|b| match &source {
+                                                Some(s) => correct_binder_span(b, s.value(), fi),
+                                                None => b.span(),
+                                            })
+                                            .collect();
+                                        edits.push(TextEdit::new(
+                                            remove_nth_range(&binder_spans, param_idx, true),
+                                            "".into(),
+                                        ));
+                                    } else {
+                                        let record_fields = match &binders[param_idx] {
+                                            ast::Binder::Record(fields) => Some(fields),
+                                            ast::Binder::Typed(inner, _) => match inner.as_ref() {
+                                                ast::Binder::Record(fields) => Some(fields),
+                                                _ => None,
+                                            },
+                                            _ => None,
+                                        };
+                                        if let Some(fields) = record_fields {
+                                            if let Some(idx) = fields.iter().position(|f| {
+                                                matches!(f, ast::RecordLabelBinder::Pun(n) if n.0 .0 == field_ud)
+                                                    || matches!(f, ast::RecordLabelBinder::Field(l, _) if l.0 .0 == field_ud)
+                                            }) {
+                                                let field_spans: Vec<_> = fields.iter().map(|f| f.span()).collect();
+                                                edits.push(TextEdit::new(
+                                                    remove_nth_range(&field_spans, idx, false),
+                                                    "".into(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                ast::Decl::Sig(name, typ) if name.0.0 == func_ud => {
+                                    let types = flatten_arr_chain(typ);
+                                    if param_idx < types.len().saturating_sub(1) {
+                                        if is_last_field {
+                                            let type_spans: Vec<_> =
+                                                types.iter().map(|t| t.span()).collect();
+                                            edits.push(TextEdit::new(
+                                                remove_nth_range(&type_spans, param_idx, false),
+                                                "".into(),
+                                            ));
+                                        } else if let ast::Typ::Record(s_row) = types[param_idx] {
+                                            let row = &s_row.0;
+                                            if let Some(idx) =
+                                                row.0.iter().position(|(l, _)| l.0.0 == field_ud)
+                                            {
+                                                let row_spans: Vec<_> =
+                                                    row.0.iter().map(|f| f.span()).collect();
+                                                edits.push(TextEdit::new(
+                                                    remove_nth_range(&row_spans, idx, false),
+                                                    "".into(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !edits.is_empty() {
+                            let title = if is_last_field {
+                                "Delete unused parameter"
+                            } else {
+                                "Delete unused record field"
+                            };
+                            out.push(CodeAction {
+                                title: title.into(),
+                                kind: Some(CodeActionKind::QUICKFIX),
+                                diagnostics: None,
+                                edit: Some(WorkspaceEdit::new([(uri.clone(), edits)].into())),
+                                is_preferred: Some(true),
+                                ..CodeAction::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // Dedup by title while preserving insertion order (which encodes relevance score),
+        // then stable-sort preferred items to the front without disturbing within-group order.
+        let mut seen_titles = std::collections::HashSet::new();
+        out.retain(|x| seen_titles.insert(x.title.clone()));
+        out.sort_by(|a, b| b.is_preferred.cmp(&a.is_preferred));
+        Ok(Some(out.into_iter().map(|x| x.into()).collect()))
+    }
+
+    #[instrument(skip(self))]
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if let Some(style) = params.settings.get("style").and_then(|v| v.as_str()) {
+            *self.style_mode.write().unwrap() = StyleMode::from_str(style);
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn did_change_workspace_folders(&self, _: DidChangeWorkspaceFoldersParams) {}
+
+    #[instrument(skip(self, params))]
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        for event in params.changes {
+            match event.typ {
+                FileChangeType::CREATED | FileChangeType::CHANGED => {
+                    let uri = event.uri;
+                    let path = match uri.to_file_path() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let source = match std::fs::read_to_string(&path) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if let Some((fi, version, to_notify)) = self.on_change(TextDocumentItem {
+                        text: &source,
+                        uri,
+                        version: None,
+                    }) {
+                        self.show_errors(fi, version).await;
+                        for (fi, v) in to_notify.iter() {
+                            self.show_errors(*fi, *v).await;
+                        }
+                        if !to_notify.is_empty() {
+                            let _ = self.client.workspace_diagnostic_refresh().await;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[instrument(skip(self))]
+    async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
+        if params.command == "load_workspace" {
+            self.client
+                .log_message(MessageType::INFO, "Loading entire workspace...".to_string())
+                .await;
+
+            let folders = self
+                .client
+                .workspace_folders()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            self.load_workspace(folders);
+            self.client
+                .log_message(MessageType::INFO, "Done loading!".to_string())
+                .await;
+        } else {
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("Unkown command: {}", params.command),
+                )
+                .await;
+        }
+        Ok(None)
+    }
+
+    #[instrument(skip(self))]
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let name = or_!(
+            self.resolve_name(
+                &params.text_document_position_params.text_document.uri,
+                params.text_document_position_params.position,
+            ),
+            {
+                return Ok(None);
+            }
+        );
+
+        let target = self.get_documentation_for_name(name);
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: target,
+            }),
+            // This is possible to extract
+            range: None,
+        }))
+    }
+}
+
+/// Score how well `qual` (the alias the user typed) matches `module_str` as an import alias.
+/// Returns a float in (0.0, 1.0] where **higher is better**. Used for ranking qualified suggestions.
+///
+/// Algorithm (adapted from PureScript client-side ranking):
+///   1. Exact match                                         → 1.0
+///   2. Module ends with qual                              → ~0.9999
+///   3. Module contains qual                               → ~0.9998
+///   4. Count PascalCase-initial letters of qual that      → small positive (more = better)
+///      appear anywhere in module name
+fn alias_match_score(module_str: &str, qual_str: &str) -> f32 {
+    if module_str == qual_str {
+        return 1.0;
+    }
+    if module_str.ends_with(qual_str) {
+        return 1.0 - 1e-4;
+    }
+    if module_str.contains(qual_str) {
+        return 1.0 - 2e-4;
+    }
+    // Split qual into PascalCase segments (regex [A-Z][a-z]*) and take the first
+    // character of each. Count how many of those characters appear in the module name.
+    let count = qual_str
+        .chars()
+        .filter(|c| c.is_uppercase())
+        .filter(|c| module_str.contains(*c))
+        .count();
+    count as f32 * 0.01
+}
+
+fn similarity_score(ax: &str, bx: &str) -> f32 {
+    let ax: Vec<_> = ax.chars().collect();
+    let bx: Vec<_> = bx.chars().collect();
+    if ax.is_empty() {
+        return bx.len() as f32;
+    }
+    if bx.is_empty() {
+        return ax.len() as f32;
+    }
+    let mut distances: Vec<Vec<usize>> = Vec::new();
+    for _ in bx.iter().chain([' '].iter()) {
+        distances.push(vec![0; 1 + ax.len()]);
+    }
+
+    for i in 1..=ax.len() {
+        distances[0][i] = i;
+    }
+    for j in 1..=bx.len() {
+        distances[j][0] = j;
+    }
+
+    for (i, a) in ax.iter().enumerate() {
+        for (j, b) in bx.iter().enumerate() {
+            distances[j + 1][i + 1] = (distances[j][i] + (if a != b { 0 } else { 1 }))
+                .min(distances[j][i + 1] + 1)
+                .min(distances[j + 1][i] + 1);
+        }
+    }
+    1.0 - (distances[bx.len() - 1][ax.len() - 1] as f32) / (bx.len().min(ax.len()) as f32)
+}
+
+fn error(code: u32, message: &str) -> Error {
+    let mut err = Error::new(ErrorCode::ServerError(code.into()));
+    err.message = message.to_string().into();
+    err
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum Fixable {
+    GuessImports(nr::Scope, Option<ast::Ud>, ast::Ud, ast::Span),
+    Delete(ast::Span),
+    DeleteUnusedImport(ast::Span),
+    RenameWithUnderscore(ast::Span),
+    /// Replace an expression span with new text. (expr_span, title, replacement, optional_warning)
+    ReplaceExpression(ast::Span, String, String, Option<String>),
+    /// Emit a warning at a span with no associated code action. (span, message)
+    Warn(ast::Span, String),
+    /// Warn and offer a multi-edit code action (e.g. renaming an alias and all
+    /// its usages). (edits, title, message)
+    RenameEdits(Vec<(ast::Span, String)>, String, String),
+    /// Delete the `(..)`/constructor-list region of an import, keeping just the type. (PAY-3260)
+    RemoveUnusedConstructors(ast::Span),
+}
+
+/// Check if a binder is a simple variable (possibly with a type annotation).
+fn binder_is_simple_var(b: &ast::Binder) -> bool {
+    match b {
+        ast::Binder::Var(_) => true,
+        ast::Binder::Typed(inner, _) => binder_is_simple_var(inner),
+        _ => false,
+    }
+}
+
+/// Flatten a Typ::Arr chain into [param0, param1, ..., return_type].
+/// Unwraps top-level Forall, Constrained, and Paren wrappers.
+fn flatten_arr_chain(typ: &ast::Typ) -> Vec<&ast::Typ> {
+    let mut current = typ;
+    loop {
+        match current {
+            ast::Typ::Forall(_, inner) | ast::Typ::Constrained(_, inner) => current = inner,
+            ast::Typ::Paren(_, inner, _) => current = inner,
+            _ => break,
+        }
+    }
+    let mut result = Vec::new();
+    loop {
+        match current {
+            ast::Typ::Arr(left, right) => {
+                result.push(left.as_ref());
+                current = right;
+            }
+            _ => {
+                result.push(current);
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// Correct a binder's span to include `{` and `}` for record binders,
+/// whose derived span only covers the inner fields.
+fn correct_binder_span(binder: &ast::Binder, source: &str, fi: ast::Fi) -> ast::Span {
+    let span = binder.span();
+    let is_record = matches!(binder, ast::Binder::Record(_))
+        || matches!(binder, ast::Binder::Typed(inner, _) if matches!(inner.as_ref(), ast::Binder::Record(_)));
+    if !is_record {
+        return span;
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let (lo_line, lo_col) = span.lo();
+    let (hi_line, hi_col) = span.hi();
+    let brace_lo = lines
+        .get(lo_line)
+        .and_then(|line| line[..lo_col].rfind('{').map(|off| (lo_line, off)));
+    let brace_hi = lines.get(hi_line).and_then(|line| {
+        line[hi_col..]
+            .find('}')
+            .map(|off| (hi_line, hi_col + off + 1))
+    });
+    match (brace_lo, brace_hi) {
+        (Some(lo), Some(hi)) => ast::Span::Known(fi, lo, hi),
+        _ => span,
+    }
+}
+
+/// Compute the Range to delete the `idx`-th item from a spanned list,
+/// eating the separator (comma, arrow, whitespace) between neighbors.
+/// When removing the only item, `only_item_extra_char` extends by one char
+/// (for space-separated lists like binders).
+fn remove_nth_range(spans: &[ast::Span], idx: usize, only_item_extra_char: bool) -> Range {
+    if spans.len() == 1 {
+        if only_item_extra_char {
+            span_to_range(&spans[0].and_one_more_char())
+        } else {
+            span_to_range(&spans[0])
+        }
+    } else if idx < spans.len() - 1 {
+        // First or middle item: delete from its start to the next item's start (eats trailing separator).
+        range(spans[idx].lo(), spans[idx + 1].lo())
+    } else {
+        // Last item: delete from previous item's end to this item's end (eats leading separator).
+        range(spans[idx - 1].hi(), spans[idx].hi())
+    }
+}
+
+/// Compute deletion Ranges for removing multiple items from a spanned list.
+/// Uses the kept items as anchors so separators are handled correctly even
+/// when adjacent items are all removed.
+fn remove_indices_ranges(
+    spans: &[ast::Span],
+    remove: &[usize],
+    only_item_extra_char: bool,
+) -> Vec<Range> {
+    if remove.is_empty() {
+        return Vec::new();
+    }
+    // Kept items in their original order.
+    let kept: Vec<usize> = (0..spans.len()).filter(|i| !remove.contains(i)).collect();
+    // Remove each item one-at-a-time from a virtual list that only
+    // contains the kept items + that one item.
+    remove
+        .iter()
+        .map(|&idx| {
+            let mut virtual_list: Vec<ast::Span> = kept.iter().map(|&i| spans[i]).collect();
+            let insert_pos = kept.iter().filter(|&&k| k < idx).count();
+            virtual_list.insert(insert_pos, spans[idx]);
+            remove_nth_range(&virtual_list, insert_pos, only_item_extra_char)
+        })
+        .collect()
+}
+
+fn create_error(
+    span: ast::Span,
+    code: String,
+    message: String,
+    related: Vec<(String, Location)>,
+) -> tower_lsp_server::ls_types::Diagnostic {
+    let range = Range::new(pos_from_tup(span.lo()), pos_from_tup(span.hi()));
+    Diagnostic::new(
+        range,
+        Some(DiagnosticSeverity::ERROR),
+        Some(NumberOrString::String(code)),
+        Some("hemlis".into()),
+        message,
+        {
+            let related: Vec<_> = related
+                .into_iter()
+                .map(|(message, location)| DiagnosticRelatedInformation { message, location })
+                .collect();
+            if related.is_empty() {
+                None
+            } else {
+                Some(related)
+            }
+        },
+        None,
+    )
+}
+
+fn create_warning(
+    span: ast::Span,
+    code: String,
+    message: String,
+    related: Vec<(String, Location)>,
+) -> tower_lsp_server::ls_types::Diagnostic {
+    let range = Range::new(pos_from_tup(span.lo()), pos_from_tup(span.hi()));
+    Diagnostic::new(
+        range,
+        Some(DiagnosticSeverity::WARNING),
+        Some(NumberOrString::String(code)),
+        Some("hemlis".into()),
+        message,
+        {
+            let related: Vec<_> = related
+                .into_iter()
+                .map(|(message, location)| DiagnosticRelatedInformation { message, location })
+                .collect();
+            if related.is_empty() {
+                None
+            } else {
+                Some(related)
+            }
+        },
+        None,
+    )
+}
+
+fn nrerror_turn_into_fixables(error: &NRerrors) -> Vec<(ast::Span, Fixable)> {
+    match error {
+        NRerrors::Unknown(scope, ns, n, s) => {
+            vec![(*s, Fixable::GuessImports(*scope, *ns, *n, *s))]
+        }
+        NRerrors::CannotImportSelf(s) => {
+            vec![(*s, Fixable::Delete(*s))]
+        }
+
+        NRerrors::NameConflict(_, _)
+        | NRerrors::MultipleDefinitions(_, _, _)
+        | NRerrors::NotAConstructor(_, _)
+        | NRerrors::NoConstructors(_, _)
+        | NRerrors::NotExportedOrDoesNotExist(_, _, _, _)
+        | NRerrors::CouldNotFindImport(_, _) => Vec::new(),
+
+        NRerrors::UnusedLocal(_, s) => {
+            vec![(*s, Fixable::RenameWithUnderscore(*s))]
+        }
+
+        NRerrors::ImportDoesNothing(_, s) => {
+            vec![(
+                s.span(),
+                Fixable::DeleteUnusedImport(s.span().entire_line()),
+            )]
+        }
+
+        NRerrors::UnusedImport(_, _, s)
+        | NRerrors::UnusedImportedConstructor(_, s)
+        | NRerrors::UnusedImportTypeAndConstructor(_, _, s) => {
+            vec![(*s, Fixable::DeleteUnusedImport(*s))]
+        }
+
+        // `import M (Type(..))` where only the type is used: offer to drop the constructor list by
+        // deleting the `(..)` region. Anchored at the type name. (PAY-3260)
+        NRerrors::UnusedImportedConstructorsAll(_, name_span, del_span) => {
+            vec![(*name_span, Fixable::RemoveUnusedConstructors(*del_span))]
+        }
+
+        NRerrors::UnusedImportQualified(_, s) | NRerrors::UnusedImportUnqualified(_, s) => {
+            vec![(*s, Fixable::DeleteUnusedImport(s.entire_line()))]
+        }
+
+        NRerrors::UnusedDefinition(n, s) if n.scope() == nr::Scope::Namespace => {
+            vec![(
+                s.name.entire_line(),
+                Fixable::DeleteUnusedImport(s.name.entire_line()),
+            )]
+        }
+
+        NRerrors::UnusedDefinition(_, _) => Vec::new(),
+        NRerrors::UnusedConstructor(_, _) => Vec::new(),
+        // Unsure about this
+        // NRerrors::UnusedDefinition(_, s) => {
+        //     vec![(
+        //         s.span().entire_line(),
+        //         Fixable::DeleteUnusedImport(s.span()),
+        //     )]
+        // }
+    }
+}
+
+fn format_name(ns: Option<ast::Ud>, n: ast::Ud, names: &DashMap<ast::Ud, String>) -> String {
+    match (
+        names
+            .try_get(&ns.unwrap_or(ast::Ud(0, '_')))
+            .try_unwrap()
+            .map(|x| x.clone()),
+        names.try_get(&n).try_unwrap().map(|x| x.clone()),
+    ) {
+        (None, Some(name)) => name,
+        (Some(ns), Some(name)) => format!("{}.{}", ns, name),
+        // This case is reached in practice due to racey-ness
+        (_, _) => "?".into(),
+    }
+}
+
+fn as_import(
+    scope: nr::Scope,
+    is_constructor: bool,
+    name: ast::Ud,
+    names: &DashMap<ast::Ud, String>,
+) -> String {
+    assert!(!is_constructor || scope == nr::Scope::Type);
+    let name = if let Some(name) = names.try_get(&name).try_unwrap() {
+        name.value().clone()
+    } else {
+        "?".into()
+    };
+    let first = name.chars().next().unwrap();
+    let is_identifier = char::is_ascii_alphanumeric(&first) || first == '_';
+    match scope {
+        _ if is_constructor => format!("{}(..)", name),
+
+        Scope::Kind | Scope::Type if is_identifier => {
+            format!("{}", name)
+        }
+        Scope::Kind | Scope::Type => {
+            format!("type ({})", name)
+        }
+        Scope::Class => format!("class {}", name),
+        Scope::Namespace | Scope::Module => format!("module {}", name),
+
+        Scope::Term if is_identifier => format!("{}", name),
+        Scope::Term => format!("({})", name),
+        Scope::Label => "".to_string(),
+    }
+}
+
+pub fn nrerror_turn_into_diagnostic(
+    error: NRerrors,
+    names: &DashMap<ast::Ud, String>,
+) -> tower_lsp_server::ls_types::Diagnostic {
+    match error {
+        NRerrors::Unknown(scope, ns, n, s) => create_error(
+            s,
+            "Unknown".into(),
+            format!(
+                "{:?} {}\nFailed to resolve",
+                scope,
+                format_name(ns, n, names)
+            ),
+            Vec::new(),
+        ),
+        NRerrors::NameConflict(ns, s) => create_error(
+            s,
+            "NameConflict".into(),
+            format!(
+                "This name is imported from {} different modules\n{}",
+                ns.len(),
+                ns.iter()
+                    .map(|Name(s, m, n, x)| {
+                        format!("{:?} {} {:?}", s, format_name(Some(*m), *n, names), x,)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            Vec::new(),
+        ),
+        NRerrors::MultipleDefinitions(Name(scope, _m, i, _), _first, second) => create_error(
+            second,
+            "MultipleDefinitions".into(),
+            format!(
+                "{:?} {:?} is defined multiple times",
+                scope,
+                names
+                    .try_get(&i)
+                    .try_unwrap()
+                    .map(|x| x.clone())
+                    .unwrap_or_else(|| "?".into())
+            ),
+            Vec::new(),
+        ),
+        NRerrors::NotAConstructor(d, m) => create_error(
+            m.0.1,
+            "NotAConstructor".into(),
+            format!(
+                "{} does not have a constructors {}",
+                names
+                    .try_get(&d.2)
+                    .try_unwrap()
+                    .map(|x| x.clone())
+                    .unwrap_or_else(|| "?".into()),
+                names
+                    .try_get(&m.0.0)
+                    .try_unwrap()
+                    .map(|x| x.clone())
+                    .unwrap_or_else(|| "?".into())
+            ),
+            Vec::new(),
+        ),
+        NRerrors::NoConstructors(m, s) => create_error(
+            s,
+            "NoConstructors".into(),
+            format!(
+                "{} does not have constructors",
+                names
+                    .try_get(&m.2)
+                    .try_unwrap()
+                    .map(|x| x.clone())
+                    .unwrap_or_else(|| "?".into()),
+            ),
+            Vec::new(),
+        ),
+        NRerrors::NotExportedOrDoesNotExist(m, scope, ud, s) => create_error(
+            s,
+            "NotExportedOrDoesNotExist".into(),
+            format!(
+                "{:?} {} is not exported or does not exist",
+                scope,
+                format_name(Some(m), ud, names),
+            ),
+            Vec::new(),
+        ),
+        NRerrors::CannotImportSelf(s) => create_error(
+            s,
+            "CannotImportSelf".into(),
+            "A module cannot import itself".to_string(),
+            Vec::new(),
+        ),
+        NRerrors::CouldNotFindImport(n, s) => create_error(
+            s,
+            "CouldNotFindImport".into(),
+            format!(
+                "Could not find the import {}",
+                names
+                    .try_get(&n)
+                    .try_unwrap()
+                    .map(|x| x.clone())
+                    .unwrap_or_else(|| "?".into()),
+            ),
+            Vec::new(),
+        ),
+
+        NRerrors::UnusedImport(scope, ud, s) => create_warning(
+            s,
+            "UnusedImport".into(),
+            format!(
+                "Import of {:?} {} is unused",
+                scope,
+                format_name(None, ud, names),
+            ),
+            Vec::new(),
+        ),
+        NRerrors::UnusedImportQualified(ud, s) => create_warning(
+            s,
+            "UnusedImportQualified".into(),
+            format!(
+                "The qualified import {} is unused",
+                format_name(None, ud, names),
+            ),
+            Vec::new(),
+        ),
+        NRerrors::UnusedImportUnqualified(ud, s) => create_warning(
+            s,
+            "UnusedImportUnqualified".into(),
+            format!(
+                "The unqualified import {} is unused",
+                format_name(None, ud, names),
+            ),
+            Vec::new(),
+        ),
+        NRerrors::UnusedImportedConstructor(ud, s) => create_warning(
+            s,
+            "UnusedImportedConstructor".into(),
+            format!(
+                "The import constructor {} is unused",
+                format_name(None, ud, names),
+            ),
+            Vec::new(),
+        ),
+
+        NRerrors::UnusedImportTypeAndConstructor(ud, _, s) => create_warning(
+            s,
+            "UnusedImportTypeAndConstructor".into(),
+            format!(
+                "Both type and constructors for {} are unused",
+                format_name(None, ud, names),
+            ),
+            Vec::new(),
+        ),
+
+        NRerrors::UnusedImportedConstructorsAll(ud, name_s, _) => create_warning(
+            name_s,
+            "UnusedImportedConstructorsAll".into(),
+            format!(
+                "The constructors of {} are imported but never used",
+                format_name(None, ud, names),
+            ),
+            Vec::new(),
+        ),
+
+        NRerrors::UnusedLocal(name, s) => create_warning(
+            s,
+            "UnusedLocal".into(),
+            format!(
+                "Local {:?} {} is unused",
+                name.scope(),
+                format_name(None, name.name(), names),
+            ),
+            Vec::new(),
+        ),
+
+        NRerrors::UnusedDefinition(name, s) if name.scope() == Scope::Namespace => create_warning(
+            s.span().entire_line(),
+            "UnusedDefinition".into(),
+            format!(
+                "Namespace {} is unused",
+                format_name(None, name.name(), names),
+            ),
+            Vec::new(),
+        ),
+        NRerrors::UnusedConstructor(u, s) => create_warning(
+            s,
+            "UnusedDefinition".into(),
+            format!(
+                "Constructor {} can be safely removed",
+                format_name(None, u.name(), names)
+            ),
+            Vec::new(),
+        ),
+
+        NRerrors::UnusedDefinition(name, s) => create_warning(
+            s.name,
+            "UnusedDefinition".into(),
+            format!(
+                "Definition {:?} {} is unused",
+                name.scope(),
+                format_name(None, name.name(), names),
+            ),
+            Vec::new(),
+        ),
+        NRerrors::ImportDoesNothing(u, s) => create_warning(
+            s,
+            "ImportDoesNothing".into(),
+            format!(
+                "Import {} can be safely removed",
+                format_name(None, u, names)
+            ),
+            Vec::new(),
+        ),
+    }
+}
+
+#[allow(unused)]
+#[derive(Debug, Deserialize, Serialize)]
+struct InlayHintParams {
+    path: String,
+}
+
+#[allow(unused)]
+enum CustomNotification {}
+impl Notification for CustomNotification {
+    type Params = InlayHintParams;
+    const METHOD: &'static str = "custom/notification";
+}
+
+#[derive(Debug)]
+struct TextDocumentItem<'a> {
+    uri: Uri,
+    text: &'a str,
+    version: Option<i32>,
+}
+
+impl Backend {
+    fn name_(&self, ud: &ast::Ud) -> String {
+        self.name(ud).unwrap_or_else(|| "?".into())
+    }
+
+    fn name(&self, ud: &ast::Ud) -> Option<String> {
+        Some(self.names.try_get(ud).try_unwrap()?.value().clone())
+    }
+
+    #[instrument(skip(self))]
+    fn load_workspace(&self, folders: Vec<WorkspaceFolder>) -> Option<()> {
+        tracing::info!("Load start");
+
+        for folder in folders {
+            use glob::glob;
+            let deps = glob(&format!(
+                "{}/lib/**/*.purs",
+                folder.uri.to_string().strip_prefix("file://")?
+            ))
+            .ok()?
+            .collect::<Vec<_>>()
+            .par_iter()
+            .filter_map(|path| {
+                let path = path.as_ref().ok()?;
+                let x = (|| {
+                    let source = std::fs::read_to_string(path.clone()).ok()?;
+                    let uri = Uri::from_str(&format!(
+                        "file://{}",
+                        &path.clone().into_os_string().into_string().ok()?
+                    ))
+                    .ok()?;
+                    let fi = loop {
+                        if let Some(fi) = self.find_fi(uri.clone()) {
+                            break fi;
+                        }
+                        tracing::error!("FAILED TO GENERATE FI");
+                    };
+                    self.fi_to_source.insert(fi, source.to_string());
+                    self.fi_to_uri.insert(fi, uri.clone());
+                    self.fi_to_version.insert(fi, None);
+                    let (m, fi) = self.parse(fi, &source);
+                    let m = m?;
+                    let (me, imports) = {
+                        let header = m.0.clone()?;
+                        let me = header.0.0.0;
+                        (
+                            me,
+                            header.2.iter().map(|x| x.from.0.0).collect::<BTreeSet<_>>(),
+                        )
+                    };
+                    self.modules.insert(me, m.clone());
+                    self.fi_to_ud.insert(fi, me);
+                    self.ud_to_fi.insert(me, fi);
+                    Some((me, fi, imports, m))
+                })();
+                if x.is_none() {
+                    tracing::error!(
+                        "FAILED: {:?}",
+                        &path.clone().into_os_string().into_string().ok()?
+                    );
+                }
+                x
+            })
+            .collect::<Vec<_>>();
+            tracing::info!("=========");
+
+            // NOTE: Not adding them to the name lookup
+            fn h(s: &'static str) -> ast::Ud {
+                ast::Ud::new(s)
+            }
+
+            let mut done: BTreeSet<_> = [
+                h("Prim.Row"),
+                h("Prim.Ordering"),
+                h("Prim.RowList"),
+                h("Prim.TypeError"),
+                h("Prim.Boolean"),
+                h("Prim.Coerce"),
+                h("Prim.Symbol"),
+                h("Prim.Int"),
+            ]
+            .into();
+            loop {
+                let todo: Vec<_> = deps
+                    .iter()
+                    .filter(|(m, _, deps, _)| (!done.contains(m)) && deps.is_subset(&done))
+                    .collect();
+                if todo.is_empty() {
+                    let left: Vec<_> = deps
+                        .iter()
+                        .filter(|(m, _, _, _)| !done.contains(m))
+                        .collect();
+                    if !left.is_empty() {
+                        tracing::warn!(
+                            "{} modules have unresolvable dependencies (external packages not in lib/); resolving with partial information",
+                            left.len()
+                        );
+                        // Resolve them anyway so that goto-definition works for names
+                        // defined in these modules, even if some of their imports are unknown.
+                        left.par_iter().for_each(|(_, fi, _, m)| {
+                            self.resolve_module(m, *fi, None);
+                        });
+                    }
+                    break;
+                }
+                todo.par_iter().for_each(|(_, fi, _, m)| {
+                    self.resolve_module(m, *fi, None);
+                });
+                done.append(&mut todo.into_iter().map(|(me, _, _, _)| *me).collect());
+            }
+        }
+        tracing::info!("LOAD_WORKSPACE - DONE");
+        Some(())
+    }
+
+    #[instrument(skip(self, m))]
+    fn resolve_module(
+        &self,
+        m: &ast::Module,
+        fi: ast::Fi,
+        version: Option<i32>,
+    ) -> Option<(bool, ast::Ud)> {
+        let me = m.0.as_ref()?.0.0.0;
+        let mut n = nr::N::new(me, &self.exports);
+        nr::resolve_names(&mut n, self.prim, m);
+
+        let nr::N {
+            me,
+            errors,
+            resolved,
+            references,
+            defines,
+            global_usages,
+            exports,
+            ..
+        } = n;
+
+        self.fixables.insert(
+            fi,
+            errors
+                .iter()
+                .flat_map(nrerror_turn_into_fixables)
+                .chain({
+                    let run_style = match *self.style_mode.read().unwrap() {
+                        StyleMode::Off => false,
+                        StyleMode::OpenFilesOnly => self.open_files.contains_key(&fi),
+                        StyleMode::AllFiles => true,
+                    };
+                    if run_style {
+                        self.fi_to_source
+                            .try_get(&fi)
+                            .try_unwrap()
+                            .map(|source| {
+                                style::check_module(m, source.value(), fi)
+                                    .into_iter()
+                                    .map(|sd| {
+                                        let fixable = match sd.action {
+                                            style::StyleAction::Warn { message } => {
+                                                Fixable::Warn(sd.expr_span, message)
+                                            }
+                                            style::StyleAction::Fix { title, replacement } => {
+                                                Fixable::ReplaceExpression(
+                                                    sd.expr_span,
+                                                    title,
+                                                    replacement,
+                                                    None,
+                                                )
+                                            }
+                                            style::StyleAction::WarnAndFix {
+                                                message,
+                                                title,
+                                                replacement,
+                                            } => Fixable::ReplaceExpression(
+                                                sd.expr_span,
+                                                title,
+                                                replacement,
+                                                Some(message),
+                                            ),
+                                            style::StyleAction::WarnAndRename {
+                                                message,
+                                                title,
+                                                edits,
+                                            } => Fixable::RenameEdits(edits, title, message),
+                                        };
+                                        (sd.cursor_span, fixable)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        self.name_resolution_errors.insert(
+            fi,
+            errors
+                .into_iter()
+                .map(|x| nrerror_turn_into_diagnostic(x, &self.names))
+                .collect::<Vec<_>>(),
+        );
+
+        self.resolved.insert(me, resolved);
+
+        {
+            let mut us = self.references.entry(me).or_insert(BTreeMap::new());
+            for (k, v) in us.iter_mut() {
+                v.retain(|(x, _)| x.fi() != Some(fi));
+                v.append(&mut references.get(k).cloned().unwrap_or_default());
+            }
+            for (k, v) in references.into_iter() {
+                if us.contains_key(&k) {
+                    continue;
+                }
+                assert!(us.insert(k, v).is_none());
+            }
+        }
+
+        {
+            let defined_scopes = defines
+                .iter()
+                .filter_map(|(a, spans)| spans.body.iter().map(|x| (x.lines(), Some(*a))).min())
+                .collect::<BTreeSet<_>>();
+            self.available_locals.insert(fi, defined_scopes);
+        }
+
+        {
+            let new = defines.into_iter().collect::<BTreeSet<_>>();
+            let old = self
+                .previouse_defines
+                .insert(fi, new.clone())
+                .unwrap_or_default();
+
+            // Technically, we only need to remove the names which are not just deleted and not
+            // moved. But this is easier to reason about.
+            for (name, _) in old.difference(&new) {
+                self.defines.remove(name);
+            }
+            for (name, pos) in new.difference(&old) {
+                self.defines.insert(*name, pos.clone());
+            }
+        }
+
+        {
+            let new = global_usages
+                .into_iter()
+                .flat_map(|(name, xx)| xx.into_iter().map(move |(pos, sort)| (name, pos, sort)))
+                .collect::<BTreeSet<_>>();
+            let old = self
+                .previouse_global_usages
+                .insert(fi, new.clone())
+                .unwrap_or_default();
+            for (name, pos, sort) in old.difference(&new) {
+                if let Some(mut e) = self.references.get_mut(&name.1) {
+                    if let Some(e) = e.get_mut(name) {
+                        e.remove(&(*pos, *sort));
+                    }
+                }
+            }
+
+            for (name, pos, sort) in new.difference(&old) {
+                let mut e = self.references.entry(name.1).or_insert(BTreeMap::new());
+                e.entry(*name)
+                    .or_insert(BTreeSet::new())
+                    .insert((*pos, *sort));
+            }
+        }
+
+        let exports_changed = {
+            let new_hash = hash_exports(&exports);
+            let exports_changed = if let Some(old) = self.exports.insert(me, exports) {
+                new_hash != hash_exports(&old)
+            } else {
+                true
+            };
+            tracing::info!(
+                "exports_changed={:?} {:?} {:?}",
+                exports_changed,
+                fi,
+                new_hash
+            );
+            exports_changed
+        };
+
+        {
+            let new_imports: BTreeMap<_, _> = n
+                .imports
+                .into_iter()
+                .map(|(k, v)| (k, v.into_iter().flat_map(|(_, x)| x).collect::<Vec<_>>()))
+                .collect();
+            let old_imports = self
+                .imports
+                .insert(me, new_imports.clone())
+                .unwrap_or_else(BTreeMap::new);
+            let new_imports = new_imports
+                .values()
+                .flat_map(|x| {
+                    x.iter()
+                        .flat_map(|x| x.to_names().into_iter().map(|x| x.module()))
+                })
+                .collect::<BTreeSet<ast::Ud>>();
+            let old_imports = old_imports
+                .values()
+                .flat_map(|x| {
+                    x.iter()
+                        .flat_map(|x| x.to_names().into_iter().map(|x| x.module()))
+                })
+                .collect::<BTreeSet<ast::Ud>>();
+            for x in old_imports.difference(&new_imports) {
+                self.importers
+                    .entry(*x)
+                    .or_insert(BTreeSet::new())
+                    .remove(&me);
+            }
+            for x in new_imports.difference(&old_imports) {
+                self.importers
+                    .entry(*x)
+                    .or_insert(BTreeSet::new())
+                    .insert(me);
+            }
+        }
+        Some((exports_changed, n.me))
+    }
+
+    #[instrument(skip(self))]
+    fn resolve_cascading(
+        &self,
+        me: ast::Ud,
+        fi: ast::Fi,
+        version: Option<i32>,
+    ) -> Vec<(ast::Fi, Option<i32>)> {
+        // TODO: This can be way way smarter, currently it only runs on changed exports.
+        // Some exteions include: Lineage tracking - saying letting me know what parts actually
+        // changed.
+        let name = Name(Scope::Module, me, me, Visibility::Public);
+        let mut to_notify = Vec::new();
+        let mut checked = BTreeSet::new();
+        let mut to_check: BTreeSet<ast::Ud> = self
+            .importers
+            .try_get(&me)
+            .try_unwrap()
+            .iter()
+            .flat_map(|x| x.iter())
+            .copied()
+            .collect();
+        let mut size_last_iter = 0;
+        loop {
+            if size_last_iter == to_check.len() {
+                break;
+            }
+            tracing::info!("CASCADE ITER {:?} {:?}", size_last_iter, to_check.len());
+            size_last_iter = to_check.len();
+            let done = to_check
+                .difference(&checked)
+                .collect::<Vec<_>>()
+                .par_iter()
+                .filter_map(|x| {
+                    let m = &*self.modules.try_get(x).try_unwrap()?;
+                    let fi = *self.ud_to_fi.try_get(x).try_unwrap()?;
+                    let version = *self.fi_to_version.try_get(&fi).try_unwrap()?;
+                    tracing::info!("RESOLVING {:?} {}", x, to_check.len());
+                    let _ = self.resolve_module(m, fi, version);
+                    Some((
+                        **x,
+                        if self
+                            .exports
+                            .try_get(x)
+                            .try_unwrap()
+                            .map(|ex| ex.iter().any(|x| x.contains(name)))
+                            .unwrap_or(false)
+                        {
+                            tracing::info!("REEXPORT {:?} {}", x, to_check.len());
+                            // It's a re-export which means we need to check everything that imports this as well!
+                            self.importers
+                                .try_get(x)
+                                .try_unwrap()
+                                .iter()
+                                .flat_map(|x| x.iter().copied())
+                                .collect::<BTreeSet<_>>()
+                        } else {
+                            BTreeSet::new()
+                        },
+                        fi,
+                        version,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for (x, mut extra, fi, version) in done.into_iter() {
+                tracing::info!("DONE CHECK {:?}", x);
+                checked.insert(x);
+                to_check.append(&mut extra);
+                to_notify.push((fi, version));
+            }
+        }
+        to_notify
+    }
+
+    #[instrument(skip(self))]
+    async fn show_errors(&self, fi: ast::Fi, version: Option<i32>) {
+        if self.got_refresh(fi, version) {
+            return;
+        }
+        let uri = if let Some(uri) = self.fi_to_uri.try_get(&fi).try_unwrap() {
+            uri.value().clone()
+        } else {
+            return;
+        };
+
+        let se = if let Some(x) = self.syntax_errors.try_get(&fi).try_unwrap() {
+            x.value().clone()
+        } else {
+            Vec::new()
+        };
+        let re = if let Some(x) = self.name_resolution_errors.try_get(&fi).try_unwrap() {
+            x.value().clone()
+        } else {
+            Vec::new()
+        };
+        let sty = if let Some(x) = self.fixables.try_get(&fi).try_unwrap() {
+            x.value()
+                .iter()
+                .filter_map(|(anchor_span, f)| match f {
+                    // Anchor the warning on the cursor span (e.g. just the
+                    // operator), which may be narrower than the replacement range.
+                    Fixable::ReplaceExpression(_, _, _, message) => message.as_ref().map(|msg| {
+                        create_warning(*anchor_span, "style".into(), msg.clone(), vec![])
+                    }),
+                    Fixable::Warn(_, message) => Some(create_warning(
+                        *anchor_span,
+                        "style".into(),
+                        message.clone(),
+                        vec![],
+                    )),
+                    Fixable::RenameEdits(_, _, message) => Some(create_warning(
+                        *anchor_span,
+                        "style".into(),
+                        message.clone(),
+                        vec![],
+                    )),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let v = if let Some(v) = self.fi_to_version.try_get(&fi).try_unwrap() {
+            *v
+        } else {
+            None
+        };
+        // tracing::info!("PRESENTING DIAGNOSTICS {:?}", uri.to_string());
+        self.client
+            .publish_diagnostics(uri.clone(), [se, re, sty].concat(), v)
+            .await
+    }
+
+    #[instrument(skip(self, source))]
+    fn parse(&self, fi: ast::Fi, source: &'_ str) -> (Option<ast::Module>, ast::Fi) {
+        let l = lexer::lex(source, fi);
+        let mut p = parser::P::new(&l, &self.names);
+        let m = parser::module(&mut p);
+        self.syntax_errors.insert(
+            fi,
+            p.errors
+                .into_iter()
+                .map(|err| {
+                    let message = match err {
+                        parser::Serror::Info(_, s) => format!("Info: {}", s),
+                        parser::Serror::Unexpected(_, t, s) => format!("Unexpected {:?}: {}", t, s),
+                        parser::Serror::NotSimpleTypeVarBinding(_) => {
+                            "Not a simple type-var binding".to_string()
+                        }
+                        parser::Serror::NotAConstraint(_) => "Not a constraint".to_string(),
+                        parser::Serror::NotAtEOF(_, _) => "Not at end of file".to_string(),
+                        parser::Serror::FailedToParseDecl(_, _, _, _) => {
+                            "Failed to parse this declaration".to_string()
+                        }
+                    };
+                    let span = err.span();
+                    create_error(span, "Syntax".into(), message, Vec::new())
+                })
+                .collect::<Vec<_>>(),
+        );
+        (m, fi)
+    }
+
+    #[instrument(skip(self))]
+    fn find_fi(&self, uri: Uri) -> Option<ast::Fi> {
+        match self.uri_to_fi.try_entry(uri.clone()) {
+            Some(dashmap::Entry::Occupied(v)) => Some(*v.get()),
+            Some(dashmap::Entry::Vacant(v)) => {
+                let fi = ast::Fi(sungod::Ra::ggen::<usize>());
+                v.insert(fi);
+                Some(fi)
+            }
+            None => None,
+        }
+    }
+
+    #[instrument(skip(self, params))]
+    fn on_change(
+        &self,
+        params: TextDocumentItem<'_>,
+    ) -> Option<(
+        ast::Fi,
+        std::option::Option<i32>,
+        Vec<(ast::Fi, std::option::Option<i32>)>,
+    )> {
+        if !self.has_started.try_read().map(|x| *x).unwrap_or(false) {
+            tracing::error!("Aborting since not started");
+            return None;
+        }
+
+        let uri = params.uri.clone();
+        let source = params.text;
+        let version = params.version;
+
+        let fi = loop {
+            if let Some(fi) = self.find_fi(uri.clone()) {
+                break fi;
+            }
+            tracing::error!("FAILED TO GENERATE FI");
+        };
+
+        // TODO: How to handle two files with the same module name?
+        match self.fi_to_version.try_entry(fi) {
+            Some(dashmap::Entry::Occupied(mut o)) => {
+                if o.get().is_some() && o.get() > &version {
+                    return None;
+                }
+                o.insert(version);
+            }
+            Some(dashmap::Entry::Vacant(v)) => {
+                v.insert(version);
+            }
+            None => return None,
+        }
+        sleep(Duration::from_millis(1));
+        let lock = self.locked.write().unwrap();
+        if self.got_refresh(fi, version) {
+            tracing::info!("!! {:?} ABORTED {:?}", version, uri.to_string());
+            return None;
+        }
+        tracing::info!("!! {:?} GOT LOCK {:?}", version, uri.to_string());
+
+        // I have to copy it! :(
+        self.fi_to_source.insert(fi, source.to_string());
+        tracing::info!("!! {:?} A {:?}", version, uri.to_string());
+        self.fi_to_uri.insert(fi, uri.clone());
+        tracing::info!("!! {:?} B {:?}", version, uri.to_string());
+        let (m, fi) = self.parse(fi, source);
+
+        tracing::info!("!! {:?} PARSING DONE {:?}", version, uri.to_string());
+
+        // TODO: We could exit earlier if we have the same syntactical structure here
+        let to_notify = if let Some(m) = m {
+            tracing::info!("!! {:?} PRE RESOLVE {:?}", version, uri.to_string());
+            if let Some((exports_changed, me)) = self.resolve_module(&m, fi, version) {
+                // If the module name changed (e.g. user is typing a new name),
+                // clean up stale entries keyed by the old Ud.
+                if let Some(old_me) = self.fi_to_ud.get(&fi) {
+                    let old_me = *old_me;
+                    if old_me != me {
+                        self.modules.remove(&old_me);
+                        self.ud_to_fi.remove(&old_me);
+                        self.exports.remove(&old_me);
+                        self.resolved.remove(&old_me);
+                        self.imports.remove(&old_me);
+                        self.importers.remove(&old_me);
+                        self.references.remove(&old_me);
+                    }
+                }
+                self.modules.insert(me, m);
+                tracing::info!("!! {:?} H {:?}", version, uri.to_string());
+                self.fi_to_ud.insert(fi, me);
+                tracing::info!("!! {:?} I {:?}", version, uri.to_string());
+                self.ud_to_fi.insert(me, fi);
+                tracing::info!("!! {:?} J {:?}", version, uri.to_string());
+
+                if exports_changed {
+                    tracing::info!("CASCADE CHANGE - START");
+                    let to_notify = self.resolve_cascading(me, fi, version);
+                    tracing::info!("CASCADE CHANGE - END");
+                    to_notify
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        tracing::info!("!! {:?} DROP LOCK {:?}", version, uri.to_string());
+        drop(lock);
+        Some((fi, version, to_notify))
+    }
+}
+
+fn hash_exports(exports: &[Export]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    exports.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn pos_from_tup((line, col): ast::Pos) -> Position {
+    Position::new(
+        line.try_into().unwrap_or(u32::MAX),
+        col.try_into().unwrap_or(u32::MAX),
+    )
+}
+
+#[tokio::main]
+async fn main() {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let mut logging = true;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--no-log" => {
+                logging = false;
+            }
+            "--version" | "-v" => {
+                eprintln!("{}", hemlis_lib::version());
+                std::process::exit(0);
+            }
+            x => {
+                eprintln!("Unknown arg: {}", x);
+                std::process::exit(1);
+            }
+        }
+    }
+    if logging {
+        let log_file_path =
+            std::env::temp_dir().join(format!("hemlis-{}.log", chrono::Local::now().to_rfc3339()));
+        let log_file = File::create(&log_file_path).unwrap();
+        eprintln!("Logging to {:?}", log_file_path);
+
+        let layer = json_subscriber::layer()
+            .with_file(true)
+            .with_line_number(true)
+            .with_thread_ids(true)
+            .with_level(true)
+            .with_writer(log_file)
+            .with_filter(tracing::level_filters::LevelFilter::TRACE)
+            .with_filter(FilterFn::new(|x| x.target() != "tower_lsp_server::codec"));
+
+        std::panic::set_hook(Box::new(|panic| {
+            if let Some(location) = panic.location() {
+                tracing::error!(
+                    message= %panic,
+                    panic.file = location.file(),
+                    panic.line = location.line(),
+                    panic.column = location.column(),
+                );
+            } else {
+                tracing::error!(message= %panic);
+            }
+        }));
+
+        tracing_subscriber::registry().with(layer).init();
+    } else {
+        eprintln!("Logging is disabled");
+    }
+
+    tracing::info!("{}", hemlis_lib::version());
+
+    let (exports, prim, names) = hemlis_lib::build_builtins();
+
+    let (service, socket) = LspService::build(|client| Backend {
+        client,
+
+        locked: ().into(),
+        has_started: false.into(),
+        prim,
+        names,
+
+        fi_to_uri: DashMap::new(),
+        fi_to_ud: DashMap::new(),
+        fi_to_source: DashMap::new(),
+        ud_to_fi: DashMap::new(),
+        uri_to_fi: DashMap::new(),
+        fi_to_version: DashMap::new(),
+
+        importers: DashMap::new(),
+        imports: DashMap::new(),
+
+        available_locals: DashMap::new(),
+
+        previouse_defines: DashMap::new(),
+        previouse_global_usages: DashMap::new(),
+
+        exports,
+        modules: DashMap::new(),
+        resolved: DashMap::new(),
+        defines: DashMap::new(),
+        references: DashMap::new(),
+
+        syntax_errors: DashMap::new(),
+        name_resolution_errors: DashMap::new(),
+        fixables: DashMap::new(),
+        open_files: DashMap::new(),
+
+        client_watch_dynamic_registration: std::sync::OnceLock::new(),
+        style_mode: RwLock::new(StyleMode::default()),
+    })
+    .finish();
+
+    Server::new(stdin, stdout, socket).serve(service).await;
 }

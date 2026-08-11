@@ -22,7 +22,6 @@
     in {
       packages.x86_64-linux.default = (craneLib.overrideToolchain toolchain).buildPackage {
         src = ./.;
-        cargoExtraArgs = "-p hemlis-language-server";
         doCheck = false;
       };
       devShells.x86_64-linux.default = pkgs.mkShell {

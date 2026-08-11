@@ -50,7 +50,7 @@ jobs:
           command: "build"
           target: ${{ matrix.platform.target }}
           toolchain: ${{ matrix.toolchain }}
-          args: "--locked --release --package=hemlis-language-server"
+          args: "--locked --release"
           strip: true
       - name: Rename binary (linux and macos)
         run: tar -cavf target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }} target/${{ matrix.platform.target }}/release/hemlis*
