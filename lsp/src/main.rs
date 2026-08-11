@@ -2782,6 +2782,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn style_keep_parens_negation_of_op() {
+        // a * -(b / c) — removing parens gives a * -b / c = a * (-b) / c, changing the meaning.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = a * -(b / c)
+                         ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_keep_parens_negation_of_op_bare() {
+        // -(b / c) — the negation applies to the whole quotient; -b / c = (-b) / c differs.
+        assert_no_code_action(indoc! {"
+                module Test where
+
+                f = -(b / c)
+                     ^ Remove unnecessary parenthesis
+            "})
+        .await;
+    }
+
+    #[tokio::test]
     async fn style_keep_parens_app_in_op() {
         // (g a) + c — app inside op, keep parens
         assert_no_code_action(indoc! {"

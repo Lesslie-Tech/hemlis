@@ -225,7 +225,10 @@ fn rule_confusing_map_operator(expr: &ast::Expr, source: &str, out: &mut Vec<Sty
         return;
     };
     let op_ud = (qop.1).0 .0;
-    let Some(mo) = CONFUSING_MAP_OPS.iter().find(|mo| op_ud == Ud::new(mo.from)) else {
+    let Some(mo) = CONFUSING_MAP_OPS
+        .iter()
+        .find(|mo| op_ud == Ud::new(mo.from))
+    else {
         return;
     };
 
@@ -512,8 +515,7 @@ fn rule_unnecessary_parens(
         };
         // "Whole expression in its context" removal is unsafe for an open expression that isn't in
         // tail position: it would extend right and swallow the following token. (PAY-3322)
-        let whole_expr_removable =
-            !inside_app_or_op && (tail_ok || !is_open_expr(inner));
+        let whole_expr_removable = !inside_app_or_op && (tail_ok || !is_open_expr(inner));
         let removable = matches!(inner.as_ref(), ast::Expr::Paren(..))
             || is_atom(inner)
             || whole_expr_removable
@@ -624,9 +626,15 @@ fn rule_if_to_case(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic
     let is_long_if = !is_multiline && if_length > 120;
 
     let (cursor_span, message) = if is_multiline {
-        (expr.span(), Some("Prefer `case` over multiline `if`".to_string()))
+        (
+            expr.span(),
+            Some("Prefer `case` over multiline `if`".to_string()),
+        )
     } else if is_long_if {
-        (expr.span(), Some("Line exceeds 120 chars; prefer `case` over long `if`".to_string()))
+        (
+            expr.span(),
+            Some("Line exceeds 120 chars; prefer `case` over long `if`".to_string()),
+        )
     } else {
         (*kw_span, None)
     };
@@ -704,7 +712,7 @@ fn rule_unqualified_pure(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
 }
 
 // ---------------------------------------------------------------------------
-// PAY-3689: warn on qualified `Just` / `Left` / `Right`
+// PAY-3689: warn on qualified `Just` / `Nothing` / `Left` / `Right`
 // ---------------------------------------------------------------------------
 
 /// Constructors that should be used unqualified, matched textually on the
@@ -793,7 +801,9 @@ fn rule_import_exact_name(
         cursor_span: alias_span,
         expr_span: alias_span,
         action: StyleAction::Warn {
-            message: format!("Import `{from_text}` as `{from_text}` or `{first}`, not `{alias_text}`"),
+            message: format!(
+                "Import `{from_text}` as `{from_text}` or `{first}`, not `{alias_text}`"
+            ),
         },
     });
 }
@@ -1050,7 +1060,10 @@ impl<'a> StyleChecker<'a> {
                 self.check_expr(o);
                 self.check_expr_ctx(b, true, None, true);
             }
-            ast::Expr::Negate(e) => self.check_expr(e),
+            // `-<e>`: the negation binds to `<e>`, so parens around an operator expression must
+            // be kept (e.g. `-(b / c)` ≠ `-b / c`). Treat it like an operand position so only
+            // atoms may have their parens dropped.
+            ast::Expr::Negate(e) => self.check_expr_ctx(e, true, None, true),
             ast::Expr::App(a, b) => {
                 self.check_expr_ctx(a, true, None, true);
                 self.check_expr_ctx(b, true, None, true);
