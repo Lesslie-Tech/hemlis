@@ -35,6 +35,7 @@
           nil
           bash
           github-copilot-cli
+          opencode
           nodejs
         ];
       };
