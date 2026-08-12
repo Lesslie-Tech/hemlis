@@ -2698,6 +2698,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn style_remove_parens_lambda_in_nonlast_record_field() {
+        // A parenthesized lambda in a non-final record field. The `,` delimits the field, so the
+        // lambda cannot right-extend to swallow it: the parens are removable even though the field
+        // is not the last one. (Regression: the case-guard tail logic was over-applied here.)
+        assert_code_action(
+            indoc! {r#"
+                module Test where
+
+                f =
+                  { "a": (\_ -> 1)
+                         ^ Remove unnecessary parenthesis
+                  , "b": (\_ -> 2)
+                  }
+            "#},
+            indoc! {r#"
+                module Test where
+
+                f =
+                  { "a": \_ -> 1
+                  , "b": (\_ -> 2)
+                  }
+            "#},
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn style_keep_parens_app_in_app_func() {
         // (f a) b — parens might be needed (partial application, etc.)
         assert_no_code_action(indoc! {"

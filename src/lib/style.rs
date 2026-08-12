@@ -1123,27 +1123,20 @@ impl<'a> StyleChecker<'a> {
                 }
             }
             ast::Expr::Array(_, es, _) => {
-                // Only the final element is in tail position (delimited by `]`); any earlier
-                // element is followed by `,`.
-                let last = es.len().saturating_sub(1);
-                for (i, e) in es.iter().enumerate() {
-                    if i == last {
-                        self.check_expr(e);
-                    } else {
-                        self.check_expr_nontail(e);
-                    }
+                // Every element is delimited by `,` or the closing `]`; a comma always terminates
+                // the element's expression (verified: even `case`/`do` don't swallow it), so an
+                // open expression here cannot right-extend. All elements are effectively tail.
+                for e in es {
+                    self.check_expr(e);
                 }
             }
             ast::Expr::Record(_, fields, _) => {
-                // Only a field that nothing follows is in tail position (delimited by `}`).
-                let last = fields.len().saturating_sub(1);
-                for (i, field) in fields.iter().enumerate() {
+                // Every field value is delimited by `,` or the closing `}`, so — like array
+                // elements — an open expression cannot right-extend past the delimiter. All fields
+                // are effectively tail.
+                for field in fields {
                     if let ast::RecordLabelExpr::Field(_, e) = field {
-                        if i == last {
-                            self.check_expr(e);
-                        } else {
-                            self.check_expr_nontail(e);
-                        }
+                        self.check_expr(e);
                     }
                 }
             }
