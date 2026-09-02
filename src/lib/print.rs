@@ -96,6 +96,16 @@ impl<'s> Printer<'s> {
         self.lit(x);
     }
 
+    /// A qualifier used on its own (not immediately followed by the name it
+    /// qualifies, e.g. `A.` before `do`/`ado`). The parser's `Qual` span
+    /// deliberately excludes the trailing `.` (so that merging it with a
+    /// following name's span still yields the right text), so a bare `Qual`
+    /// needs the dot added back explicitly.
+    fn print_qual(&mut self, q: &Qual) {
+        self.lit(q);
+        self.raw(".");
+    }
+
     // -- comments -------------------------------------------------------
 
     /// Emit every pending comment that starts strictly before `line`, each on
@@ -357,16 +367,337 @@ impl<'s> Printer<'s> {
                     self.raw(" ");
                     self.print_binder(b);
                 }
-                match ge {
-                    GuardedExpr::Unconditional(e) => {
-                        self.raw(" = ");
-                        self.print_expr(e);
+                self.print_guarded_expr(ge, " = ");
+            }
+
+            Decl::DataKind(name, kind) => {
+                self.raw("data ");
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(kind);
+            }
+            Decl::Data(name, vars, ctors) => {
+                self.raw("data ");
+                self.lit(name);
+                for v in vars {
+                    self.raw(" ");
+                    self.print_typ_var_binding(v);
+                }
+                if ctors.is_empty() {
+                    return;
+                }
+                let multiline = ctors.len() > 1
+                    && Self::is_multiline(ctors[0].span(), ctors[ctors.len() - 1].span());
+                self.indent_in();
+                for (i, (cname, cargs)) in ctors.iter().enumerate() {
+                    if multiline {
+                        self.newline();
+                    } else {
+                        self.raw(" ");
                     }
-                    GuardedExpr::Guarded(_) => self.raw_fallback(ge),
+                    self.raw(if i == 0 { "= " } else { "| " });
+                    self.lit(cname);
+                    for a in cargs {
+                        self.raw(" ");
+                        self.print_typ(a);
+                    }
+                }
+                self.indent_out();
+            }
+
+            Decl::TypeKind(name, kind) => {
+                self.raw("type ");
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(kind);
+            }
+            Decl::Type(name, vars, typ) => {
+                self.raw("type ");
+                self.lit(name);
+                for v in vars {
+                    self.raw(" ");
+                    self.print_typ_var_binding(v);
+                }
+                self.raw(" = ");
+                self.print_typ(typ);
+            }
+
+            Decl::NewTypeKind(name, kind) => {
+                self.raw("newtype ");
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(kind);
+            }
+            Decl::NewType(name, vars, ctor, typ) => {
+                self.raw("newtype ");
+                self.lit(name);
+                for v in vars {
+                    self.raw(" ");
+                    self.print_typ_var_binding(v);
+                }
+                self.raw(" = ");
+                self.lit(ctor);
+                self.raw(" ");
+                self.print_typ(typ);
+            }
+
+            Decl::ClassKind(name, kind) => {
+                self.raw("class ");
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(kind);
+            }
+            Decl::Class(constraints, name, vars, fundeps, members) => {
+                self.raw("class ");
+                if let Some(cs) = constraints {
+                    self.print_constraint_list(cs);
+                    self.raw(" <= ");
+                }
+                self.lit(name);
+                for v in vars {
+                    self.raw(" ");
+                    self.print_typ_var_binding(v);
+                }
+                if let Some(fds) = fundeps {
+                    self.raw(" | ");
+                    for (i, fd) in fds.iter().enumerate() {
+                        if i > 0 {
+                            self.raw(", ");
+                        }
+                        self.print_fun_dep(fd);
+                    }
+                }
+                if !members.is_empty() {
+                    self.raw(" where");
+                    self.indent_in();
+                    for m in members {
+                        self.newline();
+                        self.print_class_member(m);
+                    }
+                    self.indent_out();
                 }
             }
-            _ => self.raw_fallback(d),
+
+            Decl::Instance(is_else, head, bindings) => {
+                if *is_else {
+                    self.raw("else ");
+                }
+                self.raw("instance ");
+                self.print_inst_head(head);
+                if !bindings.is_empty() {
+                    self.raw(" where");
+                    self.indent_in();
+                    for b in bindings {
+                        self.newline();
+                        self.print_inst_binding(b);
+                    }
+                    self.indent_out();
+                }
+            }
+            Decl::Derive(is_newtype, head) => {
+                self.raw("derive ");
+                if *is_newtype {
+                    self.raw("newtype ");
+                }
+                self.raw("instance ");
+                self.print_inst_head(head);
+            }
+
+            Decl::Foreign(name, typ) => {
+                self.raw("foreign import ");
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(typ);
+            }
+            Decl::ForeignData(name, typ) => {
+                self.raw("foreign import data ");
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(typ);
+            }
+
+            Decl::Role(name, roles) => {
+                self.raw("type role ");
+                self.lit(name);
+                for r in roles {
+                    self.raw(" ");
+                    self.raw(match r.0 {
+                        Role::Nominal => "nominal",
+                        Role::Representational => "representational",
+                        Role::Phantom => "phantom",
+                    });
+                }
+            }
+
+            Decl::Fixity(side, num, e, op) => {
+                self.print_fixity_side(side);
+                self.raw(" ");
+                self.lit(num);
+                self.raw(" ");
+                self.print_expr(e);
+                self.raw(" as ");
+                self.lit(op);
+            }
+            Decl::FixityTyp(side, num, t, op) => {
+                self.print_fixity_side(side);
+                self.raw(" ");
+                self.lit(num);
+                self.raw(" type ");
+                self.print_typ(t);
+                self.raw(" as ");
+                self.lit(op);
+            }
         }
+    }
+
+    fn print_fixity_side(&mut self, s: &S<FixitySide>) {
+        self.raw(match s.0 {
+            FixitySide::L => "infixl",
+            FixitySide::R => "infixr",
+            FixitySide::C => "infix",
+        });
+    }
+
+    fn print_constraint_list(&mut self, cs: &[Constraint]) {
+        if cs.len() == 1 {
+            self.print_constraint(&cs[0]);
+        } else {
+            self.raw("(");
+            for (i, c) in cs.iter().enumerate() {
+                if i > 0 {
+                    self.raw(", ");
+                }
+                self.print_constraint(c);
+            }
+            self.raw(")");
+        }
+    }
+
+    fn print_fun_dep(&mut self, fd: &FunDep) {
+        let FunDep(lhs, rhs) = fd;
+        for (i, n) in lhs.iter().enumerate() {
+            if i > 0 {
+                self.raw(" ");
+            }
+            self.lit(n);
+        }
+        self.raw(" -> ");
+        for (i, n) in rhs.iter().enumerate() {
+            if i > 0 {
+                self.raw(" ");
+            }
+            self.lit(n);
+        }
+    }
+
+    fn print_class_member(&mut self, m: &ClassMember) {
+        let ClassMember(name, typ) = m;
+        self.lit(name);
+        self.raw(" :: ");
+        self.print_typ(typ);
+    }
+
+    fn print_inst_head(&mut self, h: &InstHead) {
+        let InstHead(constraints, name, args) = h;
+        if let Some(cs) = constraints {
+            self.print_constraint_list(cs);
+            self.raw(" => ");
+        }
+        self.lit(name);
+        for a in args {
+            self.raw(" ");
+            self.print_typ(a);
+        }
+    }
+
+    fn print_inst_binding(&mut self, b: &InstBinding) {
+        match b {
+            InstBinding::Sig(name, typ) => {
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(typ);
+            }
+            InstBinding::Def(name, binders, ge) => {
+                self.lit(name);
+                for b in binders {
+                    self.raw(" ");
+                    self.print_binder(b);
+                }
+                self.print_guarded_expr(ge, " = ");
+            }
+        }
+    }
+
+    // -- guards --------------------------------------------------------
+
+    fn print_guarded_expr(&mut self, ge: &GuardedExpr, arrow: &str) {
+        match ge {
+            GuardedExpr::Unconditional(e) => {
+                self.raw(arrow);
+                self.print_expr(e);
+            }
+            GuardedExpr::Guarded(clauses) => {
+                self.indent_in();
+                for (guards, e) in clauses {
+                    self.newline();
+                    self.raw("| ");
+                    for (i, g) in guards.iter().enumerate() {
+                        if i > 0 {
+                            self.raw(", ");
+                        }
+                        self.print_guard(g);
+                    }
+                    self.raw(arrow);
+                    self.print_expr(e);
+                }
+                self.indent_out();
+            }
+        }
+    }
+
+    fn print_guard(&mut self, g: &Guard) {
+        match g {
+            Guard::Expr(e) => self.print_expr(e),
+            Guard::Binder(b, e) => {
+                self.print_binder(b);
+                self.raw(" <- ");
+                self.print_expr(e);
+            }
+        }
+    }
+
+    // -- let bindings ----------------------------------------------------
+
+    fn print_let_binding(&mut self, lb: &LetBinding) {
+        match lb {
+            LetBinding::Sig(name, typ) => {
+                self.lit(name);
+                self.raw(" :: ");
+                self.print_typ(typ);
+            }
+            LetBinding::Name(name, binders, ge) => {
+                self.lit(name);
+                for b in binders {
+                    self.raw(" ");
+                    self.print_binder(b);
+                }
+                self.print_guarded_expr(ge, " = ");
+            }
+            LetBinding::Pattern(b, e) => {
+                self.print_binder(b);
+                self.raw(" = ");
+                self.print_expr(e);
+            }
+        }
+    }
+
+    fn print_let_bindings(&mut self, bindings: &[LetBinding]) {
+        self.indent_in();
+        for b in bindings {
+            self.newline();
+            self.print_let_binding(b);
+        }
+        self.indent_out();
     }
 
     // -- binders -------------------------------------------------------
@@ -408,7 +739,34 @@ impl<'s> Printer<'s> {
             Binder::Array(items) => {
                 self.list("[", "]", false, items, |x| x.span(), |p, x| p.print_binder(x));
             }
-            _ => self.raw_fallback(b),
+            Binder::Record(fields) => {
+                self.list(
+                    "{",
+                    "}",
+                    true,
+                    fields,
+                    |x| x.span(),
+                    |p, x| p.print_record_label_binder(x),
+                );
+            }
+            Binder::Op(l, op, r) => {
+                self.print_binder(l);
+                self.raw(" ");
+                self.lit(op);
+                self.raw(" ");
+                self.print_binder(r);
+            }
+        }
+    }
+
+    fn print_record_label_binder(&mut self, f: &RecordLabelBinder) {
+        match f {
+            RecordLabelBinder::Pun(n) => self.lit(n),
+            RecordLabelBinder::Field(l, b) => {
+                self.lit(l);
+                self.raw(": ");
+                self.print_binder(b);
+            }
         }
     }
 
@@ -422,10 +780,13 @@ impl<'s> Printer<'s> {
             Typ::Symbol(s) => self.lit(s),
             Typ::Str(s) => self.lit(s),
             Typ::Int(neg, i) => {
+                // Typ::Int stores a parsed i64 rather than interned source text (unlike most
+                // literals), and the parser's span for the negative case covers only the `-`
+                // token, not the digits - so print the value directly instead of slicing source.
                 if *neg {
                     self.raw("-");
                 }
-                self.lit(i);
+                self.raw(&i.0 .0.to_string());
             }
             Typ::Hole(h) => self.lit(h),
             Typ::Paren(_, inner, _) => {
@@ -484,16 +845,23 @@ impl<'s> Printer<'s> {
     }
 
     fn print_typ_var_binding(&mut self, v: &TypVarBinding) {
-        let TypVarBinding(name, kind, paren) = v;
-        if *paren {
+        // The third field is the `@` visible-type-application marker, not "wrap in
+        // parens" - parens are only syntactically required when there's a kind
+        // annotation (`forall (a :: Type).`), so that's what drives them here.
+        let TypVarBinding(name, kind, is_at) = v;
+        let needs_parens = kind.is_some();
+        if needs_parens {
             self.raw("(");
+        }
+        if *is_at {
+            self.raw("@");
         }
         self.lit(name);
         if let Some(k) = kind {
             self.raw(" :: ");
             self.print_typ(k);
         }
-        if *paren {
+        if needs_parens {
             self.raw(")");
         }
     }
@@ -638,7 +1006,133 @@ impl<'s> Printer<'s> {
                     self.print_expr(else_e);
                 }
             }
-            _ => self.raw_fallback(e),
+            Expr::Infix(l, op, r) => {
+                self.print_expr(l);
+                self.raw(" `");
+                self.print_expr(op);
+                self.raw("` ");
+                self.print_expr(r);
+            }
+            Expr::Update(target, _, updates, _) => {
+                self.print_expr(target);
+                self.raw(" ");
+                self.list(
+                    "{",
+                    "}",
+                    true,
+                    updates,
+                    |x| x.span(),
+                    |p, x| p.print_record_update(x),
+                );
+            }
+            Expr::Do(qual, _, stmts) => {
+                if let Some(q) = qual {
+                    self.print_qual(q);
+                }
+                self.raw("do");
+                self.indent_in();
+                for s in stmts {
+                    self.newline();
+                    self.print_do_stmt(s);
+                }
+                self.indent_out();
+            }
+            Expr::Ado(qual, _, stmts, result) => {
+                if let Some(q) = qual {
+                    self.print_qual(q);
+                }
+                self.raw("ado");
+                self.indent_in();
+                for s in stmts {
+                    self.newline();
+                    self.print_do_stmt(s);
+                }
+                self.newline();
+                self.raw("in ");
+                self.print_expr(result);
+                self.indent_out();
+            }
+            Expr::Let(_, bindings, body) => {
+                self.raw("let");
+                self.print_let_bindings(bindings);
+                self.newline();
+                self.raw("in ");
+                self.print_expr(body);
+            }
+            Expr::Where(_, body, bindings) => {
+                self.print_expr(body);
+                self.indent_in();
+                self.newline();
+                self.raw("where");
+                self.print_let_bindings(bindings);
+                self.indent_out();
+            }
+            Expr::Case(_, scrutinees, branches) => {
+                self.raw("case ");
+                for (i, s) in scrutinees.iter().enumerate() {
+                    if i > 0 {
+                        self.raw(", ");
+                    }
+                    self.print_expr(s);
+                }
+                self.raw(" of");
+                self.indent_in();
+                for b in branches {
+                    self.newline();
+                    self.print_case_branch(b);
+                }
+                self.indent_out();
+            }
+
+            Expr::Error(_) => self.raw_fallback(e),
+        }
+    }
+
+    fn print_do_stmt(&mut self, s: &DoStmt) {
+        match s {
+            DoStmt::Stmt(None, e) => self.print_expr(e),
+            DoStmt::Stmt(Some(b), e) => {
+                self.print_binder(b);
+                self.raw(" <- ");
+                self.print_expr(e);
+            }
+            DoStmt::Let(bindings) => {
+                self.raw("let");
+                self.print_let_bindings(bindings);
+            }
+        }
+    }
+
+    fn print_case_branch(&mut self, b: &CaseBranch) {
+        let CaseBranch(binders, ge) = b;
+        for (i, bd) in binders.iter().enumerate() {
+            if i > 0 {
+                self.raw(", ");
+            }
+            self.print_binder(bd);
+        }
+        self.print_guarded_expr(ge, " -> ");
+    }
+
+    fn print_record_update(&mut self, u: &RecordUpdate) {
+        match u {
+            RecordUpdate::Leaf(l, e) => {
+                self.lit(l);
+                self.raw(" = ");
+                self.print_expr(e);
+            }
+            RecordUpdate::Branch(l, updates) => {
+                self.lit(l);
+                self.raw(" ");
+                self.list(
+                    "{",
+                    "}",
+                    true,
+                    updates,
+                    |x| x.span(),
+                    |p, x| p.print_record_update(x),
+                );
+            }
         }
     }
 
@@ -758,9 +1252,178 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_construct_falls_back_to_source_and_does_not_panic() {
-        let src = "module Foo where\n\nfoo = case 1 of\n  x -> x\n";
+    fn case_of_with_multiple_branches() {
+        let src = "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n";
         let out = fmt(src);
-        assert!(out.contains("case 1 of"), "fallback dropped content: {:?}", out);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn guarded_def() {
+        let src = "module Foo where\n\nfoo x\n  | x > 0 = 1\n  | otherwise = 0\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo x\n  | x > 0 = 1\n  | otherwise = 0\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn do_notation() {
+        let src = "module Foo where\n\nfoo = do\n  x <- bar\n  pure x\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo = do\n  x <- bar\n  pure x\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn let_in() {
+        let src = "module Foo where\n\nfoo = let x = 1 in x\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo = let\n  x = 1\nin x\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn where_clause() {
+        let src = "module Foo where\n\nfoo = result where\n  result = 1\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo = result\n  where\n    result = 1\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn record_update_and_infix() {
+        let src = "module Foo where\n\nfoo = r { a = 1 }\nbar = 1 `add` 2\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo = r { a = 1 }\n\nbar = 1 `add` 2\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn data_flat_and_multiline() {
+        let src = "module Foo where\n\ndata Flat = A | B Int\n\ndata Tall\n  = C\n  | D String\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\n\ndata Flat = A | B Int\n\ndata Tall\n  = C\n  | D String\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn type_newtype_class_instance() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "type Id a = a\n\n",
+            "newtype Wrap = Wrap Int\n\n",
+            "class Show a where\n  show :: a -> String\n\n",
+            "instance Show Int where\n  show x = \"int\"\n\n",
+            "derive instance Eq Wrap\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn foreign_and_fixity_and_role() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "foreign import unsafeCoerce :: forall a b. a -> b\n\n",
+            "infixl 5 add as +++\n\n",
+            "type role Foo nominal representational\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn qualified_do_and_ado_keep_the_dot() {
+        let src = "module Foo where\n\na = A.do\n  x <- A.a\n  pure x\n";
+        let out = fmt(src);
+        assert!(out.contains("A.do"), "qualifier dot lost: {:?}", out);
+        assert!(!out.contains("Ado") && !out.contains("Adodo"), "garbled qualifier: {:?}", out);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn negative_typ_int_keeps_the_digits() {
+        let src = "module Foo where\n\na :: -1\na = 1\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\na :: -1\na = 1\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn visible_forall_binder_without_kind_has_no_parens() {
+        let src = "module Foo where\n\nreadJSON :: forall @a. Array a\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nreadJSON :: forall @a. Array a\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn kinded_forall_binder_keeps_parens() {
+        let src = "module Foo where\n\nfoo :: forall (a :: Type). a\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo :: forall (a :: Type). a\n");
+        assert_idempotent(src);
+    }
+
+    fn purs_files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                purs_files_under(&path, out);
+            } else if path.extension().is_some_and(|e| e == "purs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Real-world-ish fixtures under tests/golden should format idempotently. Fixtures
+    /// whose source doesn't already parse cleanly are skipped - some deliberately
+    /// exercise parser error recovery rather than being formattable programs.
+    #[test]
+    fn golden_fixtures_format_idempotently() {
+        let mut files = Vec::new();
+        purs_files_under(std::path::Path::new("tests/golden"), &mut files);
+        assert!(!files.is_empty(), "expected to find golden .purs fixtures");
+
+        let mut checked = 0;
+        for path in files {
+            let src = std::fs::read_to_string(&path).unwrap();
+            let (toks, comments) = lexer::lex(&src, Fi(0));
+            let names = DashMap::new();
+            let mut p = parser::P::new(&toks, &names);
+            let Some(m) = parser::module(&mut p) else {
+                continue;
+            };
+            if !p.errors.is_empty() {
+                continue;
+            }
+
+            checked += 1;
+            let once = super::print_module(&src, &m, &comments);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "not idempotent for {:?}", path);
+        }
+        assert!(
+            checked > 10,
+            "expected to actually check a good number of golden fixtures, only checked {checked}"
+        );
     }
 }
