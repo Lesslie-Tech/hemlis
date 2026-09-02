@@ -274,14 +274,30 @@ fn lex_comments(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
     let mut comments = Vec::new();
 
     for (t, s) in Token::lexer(content).spanned() {
-        let line_after = line + content[scanned_to..s.end].matches('\n').count();
+        let token_start = scanned_to;
+        let line_after = line + content[token_start..s.end].matches('\n').count();
         scanned_to = s.end;
+
+        // See the matching comment in lex_tokens: a multi-line block comment needs
+        // its own last line's start computed directly, since no separate Indent
+        // token exists for the lines inside it.
+        let start_indent = indent;
+        let end_indent = if line_after != line {
+            let last_nl = content[token_start..s.end].rfind('\n').unwrap();
+            let new_indent = token_start + last_nl + 1;
+            indent = new_indent;
+            new_indent
+        } else {
+            indent
+        };
+
         match &t {
             Ok(Token::Indent(at)) => {
                 indent = s.end.saturating_sub(*at);
             }
             Ok(Token::LineComment(_) | Token::BlockComment(_)) => {
-                let span = Span::Known(fi, (line, s.start - indent), (line_after, s.end - indent));
+                let span =
+                    Span::Known(fi, (line, s.start - start_indent), (line_after, s.end - end_indent));
                 comments.push((t, span));
             }
             _ => {}
@@ -326,10 +342,30 @@ fn lex_tokens(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
     let mut scanned_to = 0;
     let mut line = 0;
     for (i, (t, s)) in toks.iter().enumerate() {
-        let line_after = line + content[scanned_to..s.end].matches('\n').count();
+        let token_start = scanned_to;
+        let line_after = line + content[token_start..s.end].matches('\n').count();
         scanned_to = s.end;
 
-        let span = Span::Known(fi, (line, s.start - indent), (line_after, s.end - indent));
+        // Most tokens are single-line, so `indent` (the byte offset of the start of
+        // the current line) is already correct for both endpoints. A token that
+        // itself contains embedded newlines - a multi-line raw string or block
+        // comment, which the lexer consumes as one token without emitting separate
+        // Indent tokens for the lines inside it - needs its own last line's start
+        // computed directly here, and `indent` brought forward so whatever token
+        // comes right after it also gets the right column. `rfind` searches the
+        // same [token_start..s.end) range used above to detect multi-line-ness
+        // (which can include skipped whitespace before the token itself starts).
+        let start_indent = indent;
+        let end_indent = if line_after != line {
+            let last_nl = content[token_start..s.end].rfind('\n').unwrap();
+            let new_indent = token_start + last_nl + 1;
+            indent = new_indent;
+            new_indent
+        } else {
+            indent
+        };
+
+        let span = Span::Known(fi, (line, s.start - start_indent), (line_after, s.end - end_indent));
         match t {
             Ok(Token::Indent(at)) => {
                 // We need to know the indentation of every token - even if there are tokens before it.
@@ -346,7 +382,7 @@ fn lex_tokens(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
                 // println!("{:?} {:?}", tt, state);
                 let mut c = C {
                     t: *tt,
-                    at: (s.start - indent, line),
+                    at: (s.start - start_indent, line),
                     next,
                     s: span,
                     state,

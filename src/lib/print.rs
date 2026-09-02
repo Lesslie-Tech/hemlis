@@ -33,6 +33,29 @@ struct Printer<'s> {
     comment_idx: usize,
     out: String,
     indent: usize,
+    /// Set while printing the type of a signature that's already been decided to
+    /// print expanded (see `print_sig_typ`). A forall/constraint/arrow chain is
+    /// typically nested several layers deep (`Forall(Constrained(Arr(Arr(...))))`) -
+    /// without this, each layer would indent again on top of the last, producing a
+    /// staircase instead of every `.`/`=>`/`->` breaking to the same indent level.
+    in_broken_sig: bool,
+}
+
+/// One or more source `ImportDecl`s for the same (module, alias, hiding-ness),
+/// merged together - see `Printer::print_imports`.
+struct MergedImport {
+    from: MName,
+    to: Option<MName>,
+    is_hiding: bool,
+    hiding: Vec<Import>,
+    names: Option<Vec<Import>>,
+    is_bare: bool,
+    /// True once a second source ImportDecl has been folded into this one - at
+    /// that point "was this originally written expanded" no longer means anything
+    /// (the merged items may come from lines that aren't even adjacent), so the
+    /// merged name list is always printed flat rather than inheriting a stale
+    /// multiline decision from whichever contributing decl happened to be first.
+    merged: bool,
 }
 
 impl<'s> Printer<'s> {
@@ -43,6 +66,7 @@ impl<'s> Printer<'s> {
             comment_idx: 0,
             out: String::new(),
             indent: 0,
+            in_broken_sig: false,
         }
     }
 
@@ -52,10 +76,28 @@ impl<'s> Printer<'s> {
         self.out.push_str(s);
     }
 
+    /// Break to a new line at the current indent. If we're already at the start
+    /// of one (nothing but indent spaces written since the last '\n' - typically
+    /// because an outer construct just broke here too, and what it's printing
+    /// next is itself something that always opens with its own break), this
+    /// reuses that line instead of leaving a blank one: two `newline()` calls in a
+    /// row with no content between them never inserts a blank line by accident.
+    /// A deliberate blank-line separator is always written directly as `raw("\n")`
+    /// and is unaffected by this.
     fn newline(&mut self) {
-        while self.out.ends_with(' ') {
-            self.out.pop();
+        let trimmed_len = self.out.trim_end_matches(' ').len();
+        if trimmed_len == 0 || self.out[..trimmed_len].ends_with('\n') {
+            // Already at the start of a line (possibly with indent already
+            // written by an earlier newline() call with nothing printed since -
+            // typically because whatever we're about to print also always opens
+            // with its own break). Leave it exactly as-is: re-indenting to
+            // whatever level we're at *now* would let an inner construct's own
+            // indent_in() retroactively re-indent a line an outer context already
+            // started, which is wrong - the outer context owns this line's
+            // margin, not whichever construct happens to share it.
+            return;
         }
+        self.out.truncate(trimmed_len);
         self.out.push('\n');
         for _ in 0..self.indent * INDENT {
             self.out.push(' ');
@@ -139,16 +181,50 @@ impl<'s> Printer<'s> {
 
     // -- lists ---------------------------------------------------------
 
-    /// True if the span of the first and last item don't share a source line -
-    /// i.e. the user originally wrote this list expanded across lines.
-    fn is_multiline(first: Span, last: Span) -> bool {
-        first.lo().0 != last.hi().0
+    /// True if there's a source line break between the end of `a` and the start
+    /// of `b` - i.e. the user's own line break sits right at this boundary.
+    ///
+    /// Deliberately a local, adjacent-boundary check rather than comparing an
+    /// overall first-to-last span: an item that's internally forced to print
+    /// across multiple lines regardless of source layout (e.g. a nested case/do
+    /// block) would otherwise "infect" its neighbors into looking multiline on a
+    /// later formatting pass even though nothing about *their* source layout
+    /// changed - which breaks idempotence.
+    fn breaks_before(a: Span, b: Span) -> bool {
+        a.hi().0 != b.lo().0
+    }
+
+    /// True if any adjacent pair in `spans` has a line break between them (see
+    /// `breaks_before`) - used to decide whether a whole chain/list should print
+    /// expanded.
+    fn any_breaks(spans: &[Span]) -> bool {
+        spans.windows(2).any(|w| Self::breaks_before(w[0], w[1]))
     }
 
     /// True if `a` is a type signature immediately followed by its own
     /// definition - these stay adjacent, with no blank line between them.
     fn decls_are_glued(a: &Decl, b: &Decl) -> bool {
         matches!(a, Decl::Sig(..)) && a.ud() == b.ud()
+    }
+
+    /// Prints ` :: Typ`, breaking to an indented `\n:: Typ` when the signature
+    /// originally spanned multiple lines - so a deliberately wrapped signature
+    /// (forall/constraints/arrow chain sprawling across lines) doesn't collapse
+    /// into one long line.
+    fn print_sig_typ(&mut self, before: Span, typ: &Typ) {
+        if Self::breaks_before(before, typ.span()) {
+            self.indent_in();
+            self.newline();
+            self.raw(":: ");
+            let outer = self.in_broken_sig;
+            self.in_broken_sig = true;
+            self.print_typ(typ);
+            self.in_broken_sig = outer;
+            self.indent_out();
+        } else {
+            self.raw(" :: ");
+            self.print_typ(typ);
+        }
     }
 
     /// Print `items` as `open item, item, item close` or, if the source had
@@ -176,8 +252,8 @@ impl<'s> Printer<'s> {
             return;
         }
 
-        let multiline =
-            items.len() > 1 && Self::is_multiline(span_of(&items[0]), span_of(&items[items.len() - 1]));
+        let spans: Vec<Span> = items.iter().map(&span_of).collect();
+        let multiline = Self::any_breaks(&spans);
 
         if !multiline {
             self.raw(open);
@@ -188,6 +264,7 @@ impl<'s> Printer<'s> {
                 if i > 0 {
                     self.raw(", ");
                 }
+                self.flush_comments_before(span_of(item).lo().0);
                 print_item(self, item);
             }
             if pad {
@@ -204,6 +281,7 @@ impl<'s> Printer<'s> {
                     self.newline();
                     self.raw(", ");
                 }
+                self.flush_comments_before(span_of(item).lo().0);
                 print_item(self, item);
             }
             self.newline();
@@ -235,6 +313,7 @@ impl<'s> Printer<'s> {
     }
 
     fn print_header(&mut self, h: &Header) {
+        self.flush_comments_before(h.span().lo().0);
         let Header(name, exports, imports, ..) = h;
         self.raw("module ");
         self.lit(name);
@@ -252,26 +331,148 @@ impl<'s> Printer<'s> {
         }
         self.raw("where");
         self.newline();
-        for imp in imports {
-            self.flush_comments_before(imp.span().lo().0);
-            self.print_import_decl(imp);
+        self.print_imports(imports);
+    }
+
+    /// Groups and sorts imports the way purs-tidy does: unqualified "bare" imports
+    /// (`import Foo`, nothing else) form their own group first, separated by a blank
+    /// line from the rest; everything else is sorted alphabetically by module name,
+    /// with an unaliased import of a module sorting before its `as`-aliased form.
+    /// Imports that only differ in their name list (same module, same alias, same
+    /// hiding-ness) are merged into one, matching purs-tidy's import-merging.
+    ///
+    /// Comments inside the import block aren't reattached per-import after this
+    /// reordering (that mapping stops being meaningful once imports move around) -
+    /// they're flushed as one batch right before the block instead, so nothing is
+    /// lost even though placement within the block may not be preserved exactly.
+    fn print_imports(&mut self, imports: &[ImportDecl]) {
+        if let Some(last_line) = imports.iter().map(|i| i.span().hi().0).max() {
+            self.flush_comments_before(last_line + 1);
+        }
+
+        let mut merged: Vec<MergedImport> = Vec::new();
+        for i in imports {
+            let is_hiding = !i.hiding.is_empty();
+            let existing = merged.iter_mut().find(|m| {
+                self.text(m.from.span()) == self.text(i.from.span())
+                    && m.to.map(|t| self.text(t.span())) == i.to.map(|t| self.text(t.span()))
+                    && m.is_hiding == is_hiding
+            });
+            if let Some(existing) = existing {
+                existing.merged = true;
+                existing.hiding.extend(i.hiding.iter().cloned());
+                match (&mut existing.names, &i.names) {
+                    (Some(a), Some(b)) => a.extend(b.iter().cloned()),
+                    (None, Some(b)) => existing.names = Some(b.clone()),
+                    _ => {}
+                }
+            } else {
+                merged.push(MergedImport {
+                    from: i.from,
+                    to: i.to,
+                    is_hiding,
+                    hiding: i.hiding.clone(),
+                    names: i.names.clone(),
+                    is_bare: i.hiding.is_empty() && i.names.is_none() && i.to.is_none(),
+                    merged: false,
+                });
+            }
+        }
+
+        for m in &mut merged {
+            self.dedup_sort_imports(&mut m.hiding);
+            if let Some(names) = &mut m.names {
+                self.dedup_sort_imports(names);
+            }
+        }
+
+        merged.sort_by(|a, b| {
+            (!a.is_bare, self.text(a.from.span()), a.to.is_some())
+                .cmp(&(!b.is_bare, self.text(b.from.span()), b.to.is_some()))
+        });
+
+        for (idx, m) in merged.iter().enumerate() {
+            if idx > 0 && merged[idx - 1].is_bare && !m.is_bare {
+                self.raw("\n");
+            }
+            self.print_merged_import(m);
             self.newline();
+        }
+    }
+
+    fn dedup_sort_imports(&self, items: &mut Vec<Import>) {
+        items.sort_by_key(|a| self.import_display_text(a));
+        items.dedup_by(|a, b| self.import_display_text(a) == self.import_display_text(b));
+    }
+
+    fn import_display_text(&self, i: &Import) -> String {
+        match i {
+            Import::Value(_, n) => self.text(n.span()).to_string(),
+            Import::Symbol(_, s) => self.text(s.span()).to_string(),
+            Import::Typ(_, n) => self.text(n.span()).to_string(),
+            Import::TypDat(_, n, dm) => {
+                format!("{}{}", self.text(n.span()), self.data_member_display_text(dm))
+            }
+            Import::TypSymbol(_, s) => format!("type {}", self.text(s.span())),
+            Import::Class(_, n) => format!("class {}", self.text(n.span())),
+        }
+    }
+
+    fn data_member_display_text(&self, dm: &DataMember) -> String {
+        match dm {
+            DataMember::All(_) => "(..)".to_string(),
+            DataMember::Some(names) => format!(
+                "({})",
+                names
+                    .iter()
+                    .map(|n| self.text(n.span()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    fn print_merged_import(&mut self, m: &MergedImport) {
+        self.raw("import ");
+        self.lit(&m.from);
+        if !m.hiding.is_empty() {
+            self.raw(" hiding ");
+            self.print_import_names(&m.hiding, m.merged);
+        } else if let Some(names) = &m.names {
+            self.raw(" ");
+            self.print_import_names(names, m.merged);
+        }
+        if let Some(to) = &m.to {
+            self.raw(" as ");
+            self.lit(to);
+        }
+    }
+
+    fn print_import_names(&mut self, items: &[Import], force_flat: bool) {
+        if force_flat {
+            self.raw("(");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    self.raw(", ");
+                }
+                self.print_import(item);
+            }
+            self.raw(")");
+        } else {
+            self.list("(", ")", false, items, |x| x.span(), |p, x| p.print_import(x));
         }
     }
 
     fn print_export(&mut self, e: &Export) {
         match e {
             Export::Value(n) => self.lit(n),
-            Export::Symbol(s) => {
-                self.raw("(");
-                self.lit(s);
-                self.raw(")");
-            }
+            // A Symbol's own span already covers its surrounding parens (the lexer
+            // captures `(<*>)` as one token), so no parens are added here.
+            Export::Symbol(s) => self.lit(s),
             Export::Typ(n) => self.lit(n),
             Export::TypSymbol(s) => {
-                self.raw("type (");
+                self.raw("type ");
                 self.lit(s);
-                self.raw(")");
             }
             Export::TypDat(n, dm) => {
                 self.lit(n);
@@ -297,53 +498,18 @@ impl<'s> Printer<'s> {
         }
     }
 
-    fn print_import_decl(&mut self, i: &ImportDecl) {
-        self.raw("import ");
-        self.lit(&i.from);
-        if !i.hiding.is_empty() {
-            self.raw(" hiding ");
-            self.list(
-                "(",
-                ")",
-                false,
-                &i.hiding,
-                |x| x.span(),
-                |p, x| p.print_import(x),
-            );
-        } else if let Some(names) = &i.names {
-            self.raw(" ");
-            self.list(
-                "(",
-                ")",
-                false,
-                names,
-                |x| x.span(),
-                |p, x| p.print_import(x),
-            );
-        }
-        if let Some(to) = &i.to {
-            self.raw(" as ");
-            self.lit(to);
-        }
-    }
-
     fn print_import(&mut self, i: &Import) {
         match i {
             Import::Value(_, n) => self.lit(n),
-            Import::Symbol(_, s) => {
-                self.raw("(");
-                self.lit(s);
-                self.raw(")");
-            }
+            Import::Symbol(_, s) => self.lit(s),
             Import::Typ(_, n) => self.lit(n),
             Import::TypDat(_, n, dm) => {
                 self.lit(n);
                 self.print_data_member(dm);
             }
             Import::TypSymbol(_, s) => {
-                self.raw("type (");
+                self.raw("type ");
                 self.lit(s);
-                self.raw(")");
             }
             Import::Class(_, n) => {
                 self.raw("class ");
@@ -358,8 +524,7 @@ impl<'s> Printer<'s> {
         match d {
             Decl::Sig(name, typ) => {
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(typ);
+                self.print_sig_typ(name.span(), typ);
             }
             Decl::Def(name, binders, ge) => {
                 self.lit(name);
@@ -373,8 +538,7 @@ impl<'s> Printer<'s> {
             Decl::DataKind(name, kind) => {
                 self.raw("data ");
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(kind);
+                self.print_sig_typ(name.span(), kind);
             }
             Decl::Data(name, vars, ctors) => {
                 self.raw("data ");
@@ -386,8 +550,8 @@ impl<'s> Printer<'s> {
                 if ctors.is_empty() {
                     return;
                 }
-                let multiline = ctors.len() > 1
-                    && Self::is_multiline(ctors[0].span(), ctors[ctors.len() - 1].span());
+                let ctor_spans: Vec<Span> = ctors.iter().map(|c| c.span()).collect();
+                let multiline = Self::any_breaks(&ctor_spans);
                 self.indent_in();
                 for (i, (cname, cargs)) in ctors.iter().enumerate() {
                     if multiline {
@@ -395,6 +559,7 @@ impl<'s> Printer<'s> {
                     } else {
                         self.raw(" ");
                     }
+                    self.flush_comments_before(cname.span().lo().0);
                     self.raw(if i == 0 { "= " } else { "| " });
                     self.lit(cname);
                     for a in cargs {
@@ -408,8 +573,7 @@ impl<'s> Printer<'s> {
             Decl::TypeKind(name, kind) => {
                 self.raw("type ");
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(kind);
+                self.print_sig_typ(name.span(), kind);
             }
             Decl::Type(name, vars, typ) => {
                 self.raw("type ");
@@ -425,8 +589,7 @@ impl<'s> Printer<'s> {
             Decl::NewTypeKind(name, kind) => {
                 self.raw("newtype ");
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(kind);
+                self.print_sig_typ(name.span(), kind);
             }
             Decl::NewType(name, vars, ctor, typ) => {
                 self.raw("newtype ");
@@ -444,8 +607,7 @@ impl<'s> Printer<'s> {
             Decl::ClassKind(name, kind) => {
                 self.raw("class ");
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(kind);
+                self.print_sig_typ(name.span(), kind);
             }
             Decl::Class(constraints, name, vars, fundeps, members) => {
                 self.raw("class ");
@@ -472,6 +634,7 @@ impl<'s> Printer<'s> {
                     self.indent_in();
                     for m in members {
                         self.newline();
+                        self.flush_comments_before(m.span().lo().0);
                         self.print_class_member(m);
                     }
                     self.indent_out();
@@ -489,6 +652,7 @@ impl<'s> Printer<'s> {
                     self.indent_in();
                     for b in bindings {
                         self.newline();
+                        self.flush_comments_before(b.span().lo().0);
                         self.print_inst_binding(b);
                     }
                     self.indent_out();
@@ -506,14 +670,12 @@ impl<'s> Printer<'s> {
             Decl::Foreign(name, typ) => {
                 self.raw("foreign import ");
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(typ);
+                self.print_sig_typ(name.span(), typ);
             }
             Decl::ForeignData(name, typ) => {
                 self.raw("foreign import data ");
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(typ);
+                self.print_sig_typ(name.span(), typ);
             }
 
             Decl::Role(name, roles) => {
@@ -593,8 +755,7 @@ impl<'s> Printer<'s> {
     fn print_class_member(&mut self, m: &ClassMember) {
         let ClassMember(name, typ) = m;
         self.lit(name);
-        self.raw(" :: ");
-        self.print_typ(typ);
+        self.print_sig_typ(name.span(), typ);
     }
 
     fn print_inst_head(&mut self, h: &InstHead) {
@@ -614,8 +775,7 @@ impl<'s> Printer<'s> {
         match b {
             InstBinding::Sig(name, typ) => {
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(typ);
+                self.print_sig_typ(name.span(), typ);
             }
             InstBinding::Def(name, binders, ge) => {
                 self.lit(name);
@@ -672,8 +832,7 @@ impl<'s> Printer<'s> {
         match lb {
             LetBinding::Sig(name, typ) => {
                 self.lit(name);
-                self.raw(" :: ");
-                self.print_typ(typ);
+                self.print_sig_typ(name.span(), typ);
             }
             LetBinding::Name(name, binders, ge) => {
                 self.lit(name);
@@ -695,6 +854,7 @@ impl<'s> Printer<'s> {
         self.indent_in();
         for b in bindings {
             self.newline();
+            self.flush_comments_before(b.span().lo().0);
             self.print_let_binding(b);
         }
         self.indent_out();
@@ -794,11 +954,7 @@ impl<'s> Printer<'s> {
                 self.print_typ(inner);
                 self.raw(")");
             }
-            Typ::Arr(a, b) => {
-                self.print_typ(a);
-                self.raw(" -> ");
-                self.print_typ(b);
-            }
+            Typ::Arr(a, b) => self.print_typ_arrow_chain(a, b),
             Typ::App(f, a) => {
                 self.print_typ(f);
                 self.raw(" ");
@@ -806,29 +962,56 @@ impl<'s> Printer<'s> {
             }
             Typ::Op(l, op, r) => {
                 self.print_typ(l);
-                self.raw(" ");
-                self.lit(op);
-                self.raw(" ");
-                self.print_typ(r);
+                let multiline = self.in_broken_sig || Self::breaks_before(l.span(), r.span());
+                let own_indent = multiline && !self.in_broken_sig;
+                if own_indent {
+                    self.indent_in();
+                }
+                if multiline {
+                    self.newline();
+                    self.lit(op);
+                    self.raw(" ");
+                    self.print_typ(r);
+                } else {
+                    self.raw(" ");
+                    self.lit(op);
+                    self.raw(" ");
+                    self.print_typ(r);
+                }
+                if own_indent {
+                    self.indent_out();
+                }
             }
             Typ::Kinded(t, k) => {
                 self.print_typ(t);
                 self.raw(" :: ");
                 self.print_typ(k);
             }
-            Typ::Constrained(c, t) => {
-                self.print_constraint(c);
-                self.raw(" => ");
-                self.print_typ(t);
-            }
+            Typ::Constrained(c, t) => self.print_typ_constrained_chain(c, t),
             Typ::Forall(vars, t) => {
                 self.raw("forall");
                 for v in vars {
                     self.raw(" ");
                     self.print_typ_var_binding(v);
                 }
-                self.raw(". ");
-                self.print_typ(t);
+                if self.in_broken_sig {
+                    self.newline();
+                    self.raw(". ");
+                    self.print_typ(t);
+                } else {
+                    let multiline =
+                        vars.last().is_some_and(|v0| Self::breaks_before(v0.span(), t.span()));
+                    if multiline {
+                        self.indent_in();
+                        self.newline();
+                        self.raw(". ");
+                        self.print_typ(t);
+                        self.indent_out();
+                    } else {
+                        self.raw(". ");
+                        self.print_typ(t);
+                    }
+                }
             }
             Typ::Record(row) => {
                 self.raw("{");
@@ -875,11 +1058,91 @@ impl<'s> Printer<'s> {
         }
     }
 
+    /// `a -> b -> c -> ...` is parsed as a right-nested chain of `Typ::Arr`. Flatten
+    /// it so that, when the chain was originally written across multiple lines, every
+    /// `->` breaks to the same indent level (siblings) rather than nesting deeper
+    /// with each arrow.
+    fn print_typ_arrow_chain(&mut self, a: &Typ, b: &Typ) {
+        let mut segments = vec![a];
+        let mut rest = b;
+        while let Typ::Arr(x, y) = rest {
+            segments.push(x);
+            rest = y;
+        }
+        segments.push(rest);
+
+        let segment_spans: Vec<Span> = segments.iter().map(|s| s.span()).collect();
+        let multiline = self.in_broken_sig || Self::any_breaks(&segment_spans);
+        let own_indent = multiline && !self.in_broken_sig;
+        self.print_typ(segments[0]);
+        if own_indent {
+            self.indent_in();
+        }
+        for seg in &segments[1..] {
+            if multiline {
+                self.newline();
+                self.raw("-> ");
+            } else {
+                self.raw(" -> ");
+            }
+            self.print_typ(seg);
+        }
+        if own_indent {
+            self.indent_out();
+        }
+    }
+
+    /// `C1 => C2 => ... => Body` (including the desugared form of a parenthesized,
+    /// comma-separated constraint list) is a right-nested chain of `Typ::Constrained`.
+    /// Flattened the same way as `print_typ_arrow_chain`, for the same reason.
+    fn print_typ_constrained_chain(&mut self, c0: &Constraint, body0: &Typ) {
+        let mut constraints = vec![c0];
+        let mut rest = body0;
+        while let Typ::Constrained(c, b) = rest {
+            constraints.push(c);
+            rest = b;
+        }
+        let body = rest;
+
+        let mut chain_spans: Vec<Span> = constraints.iter().map(|c| c.span()).collect();
+        chain_spans.push(body.span());
+        let multiline = self.in_broken_sig || Self::any_breaks(&chain_spans);
+        let own_indent = multiline && !self.in_broken_sig;
+        self.print_constraint(constraints[0]);
+        if own_indent {
+            self.indent_in();
+        }
+        for c in &constraints[1..] {
+            if multiline {
+                self.newline();
+                self.raw("=> ");
+            } else {
+                self.raw(" => ");
+            }
+            self.print_constraint(c);
+        }
+        if multiline {
+            self.newline();
+            self.raw("=> ");
+        } else {
+            self.raw(" => ");
+        }
+        self.print_typ(body);
+        if own_indent {
+            self.indent_out();
+        }
+    }
+
     fn print_row(&mut self, row: &Row, spaced: bool) {
         let Row(fields, tail) = row;
         if fields.is_empty() && tail.is_none() {
             return;
         }
+        // A record's braces are their own bracketed context, unrelated to whatever
+        // signature this row happens to be nested inside - a field's own type (e.g.
+        // a forall) shouldn't inherit an enclosing broken-signature's flattening.
+        let outer_in_broken_sig = self.in_broken_sig;
+        self.in_broken_sig = false;
         if spaced {
             self.raw(" ");
         }
@@ -901,6 +1164,7 @@ impl<'s> Printer<'s> {
         if spaced {
             self.raw(" ");
         }
+        self.in_broken_sig = outer_in_broken_sig;
     }
 
     // -- expressions -------------------------------------------------------
@@ -943,10 +1207,19 @@ impl<'s> Printer<'s> {
             }
             Expr::Op(l, op, r) => {
                 self.print_expr(l);
-                self.raw(" ");
-                self.lit(op);
-                self.raw(" ");
-                self.print_expr(r);
+                if Self::breaks_before(l.span(), r.span()) {
+                    self.indent_in();
+                    self.newline();
+                    self.lit(op);
+                    self.raw(" ");
+                    self.print_expr(r);
+                    self.indent_out();
+                } else {
+                    self.raw(" ");
+                    self.lit(op);
+                    self.raw(" ");
+                    self.print_expr(r);
+                }
             }
             Expr::Access(inner, labels) => {
                 self.print_expr(inner);
@@ -987,7 +1260,7 @@ impl<'s> Printer<'s> {
                 self.print_expr(body);
             }
             Expr::IfThenElse(_, cond, then_e, else_e) => {
-                let multiline = cond.span().lo().0 != else_e.span().hi().0;
+                let multiline = Self::any_breaks(&[cond.span(), then_e.span(), else_e.span()]);
                 self.raw("if ");
                 self.print_expr(cond);
                 if multiline {
@@ -1033,6 +1306,7 @@ impl<'s> Printer<'s> {
                 self.indent_in();
                 for s in stmts {
                     self.newline();
+                    self.flush_comments_before(s.span().lo().0);
                     self.print_do_stmt(s);
                 }
                 self.indent_out();
@@ -1045,6 +1319,7 @@ impl<'s> Printer<'s> {
                 self.indent_in();
                 for s in stmts {
                     self.newline();
+                    self.flush_comments_before(s.span().lo().0);
                     self.print_do_stmt(s);
                 }
                 self.newline();
@@ -1079,6 +1354,7 @@ impl<'s> Printer<'s> {
                 self.indent_in();
                 for b in branches {
                     self.newline();
+                    self.flush_comments_before(b.span().lo().0);
                     self.print_case_branch(b);
                 }
                 self.indent_out();
@@ -1184,7 +1460,7 @@ mod tests {
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\nimport Prelude\nimport Data.Array (head, tail)\n\nfoo = 1\n\nbar = 2\n"
+            "module Foo where\nimport Prelude\n\nimport Data.Array (head, tail)\n\nfoo = 1\n\nbar = 2\n"
         );
         assert_idempotent(src);
     }
@@ -1425,5 +1701,158 @@ mod tests {
             checked > 10,
             "expected to actually check a good number of golden fixtures, only checked {checked}"
         );
+    }
+
+    #[test]
+    fn symbol_export_import_are_not_double_parenthesized() {
+        let src = "module Foo ((<*>), type (~>)) where\n\nimport Data.Functor ((<$>))\n\nfoo = (<*>)\n";
+        let out = fmt(src);
+        // An exact match is the real check here - `((<$>))` alone would look like a
+        // double-paren bug, but is actually correct: the outer pair is the (single-
+        // element) import list's own delimiters, the inner pair belongs to the
+        // Symbol's own span (which already covers its parens).
+        assert_eq!(
+            out,
+            "module Foo ((<*>), type (~>)) where\nimport Data.Functor ((<$>))\n\nfoo = (<*>)\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn comment_before_module_keyword_stays_before_it() {
+        let src = "-- top comment\nmodule Foo where\n\nfoo = 1\n";
+        let out = fmt(src);
+        assert!(
+            out.starts_with("-- top comment\nmodule Foo"),
+            "comment should stay before the module keyword: {:?}",
+            out
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn comment_inside_export_list_is_not_relocated_past_the_header() {
+        let src = "module Foo\n  ( a\n  -- mid comment\n  , b\n  ) where\n\na = 1\nb = 2\n";
+        let out = fmt(src);
+        let where_pos = out.find("where").unwrap();
+        let comment_pos = out.find("-- mid comment").unwrap();
+        assert!(
+            comment_pos < where_pos,
+            "comment should stay inside the export list, before `where`: {:?}",
+            out
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn bare_imports_are_grouped_first_and_separated() {
+        let src = "module Foo where\n\nimport Data.Array (head)\nimport Prelude\nimport Data.Maybe\n\nfoo = 1\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\nimport Data.Maybe\nimport Prelude\n\nimport Data.Array (head)\n\nfoo = 1\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn imports_are_sorted_and_duplicates_merged() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "import Data.Array (tail)\n",
+            "import Control.Bind (class Bind)\n",
+            "import Data.Array (head)\n\n",
+            "foo = 1\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n",
+                "import Control.Bind (class Bind)\n",
+                "import Data.Array (head, tail)\n\n",
+                "foo = 1\n",
+            )
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn multiline_type_signature_stays_expanded() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "f\n",
+            "  :: forall a\n",
+            "  . Show a\n",
+            "  => a\n",
+            "  -> a\n",
+            "  -> String\n",
+            "f a b = show a\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn flat_type_signature_stays_flat() {
+        let src = "module Foo where\n\nf :: forall a. Show a => a -> a -> String\nf a b = show a\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn multiline_operator_chain_stays_expanded() {
+        let src = "module Foo where\n\nfoo =\n  a\n    >>> b\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo = a\n  >>> b\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn comment_before_let_binding_is_not_relocated() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "foo = let\n",
+            "  a = 1\n",
+            "  -- a comment\n",
+            "  b = 2\n",
+            "in a { x: 1 }\n",
+        );
+        let out = fmt(src);
+        let comment_pos = out.find("-- a comment").expect("comment lost");
+        let record_pos = out.find("{ x: 1 }").expect("record missing");
+        assert!(
+            comment_pos < record_pos,
+            "comment should stay near its let binding, not migrate into an unrelated record: {:?}",
+            out
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn comment_before_do_stmt_and_case_branch_is_not_relocated() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "foo = do\n",
+            "  a\n",
+            "  -- a comment\n",
+            "  b\n",
+        );
+        let out = fmt(src);
+        assert!(out.contains("-- a comment"), "comment lost: {:?}", out);
+        assert_idempotent(src);
+
+        let src2 = concat!(
+            "module Foo where\n\n",
+            "foo = case x of\n",
+            "  A -> 1\n",
+            "  -- a comment\n",
+            "  B -> 2\n",
+        );
+        let out2 = fmt(src2);
+        assert!(out2.contains("-- a comment"), "comment lost: {:?}", out2);
+        assert_idempotent(src2);
     }
 }
