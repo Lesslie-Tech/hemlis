@@ -6043,7 +6043,7 @@ impl Backend {
 
     #[instrument(skip(self, source))]
     fn parse(&self, fi: ast::Fi, source: &'_ str) -> (Option<ast::Module>, ast::Fi) {
-        let l = lexer::lex(source, fi);
+        let (l, _comments) = lexer::lex(source, fi);
         let mut p = parser::P::new(&l, &self.names);
         let m = parser::module(&mut p);
         self.syntax_errors.insert(

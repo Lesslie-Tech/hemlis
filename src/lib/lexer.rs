@@ -257,7 +257,42 @@ impl Delim {
     }
 }
 
-pub fn lex(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
+/// Lexes `content`, returning the layout-processed token stream (used by the parser) and,
+/// separately, every comment token with its source span. Comments are not fed into the
+/// offside-rule/layout state machine below - they're collected in an independent pass so they
+/// can never influence layout decisions.
+pub fn lex(content: &str, fi: Fi) -> (Vec<SourceToken<'_>>, Vec<SourceToken<'_>>) {
+    let comments = lex_comments(content, fi);
+
+    (lex_tokens(content, fi), comments)
+}
+
+fn lex_comments(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
+    let mut indent = 0;
+    let mut scanned_to = 0;
+    let mut line = 0;
+    let mut comments = Vec::new();
+
+    for (t, s) in Token::lexer(content).spanned() {
+        let line_after = line + content[scanned_to..s.end].matches('\n').count();
+        scanned_to = s.end;
+        match &t {
+            Ok(Token::Indent(at)) => {
+                indent = s.end.saturating_sub(*at);
+            }
+            Ok(Token::LineComment(_) | Token::BlockComment(_)) => {
+                let span = Span::Known(fi, (line, s.start - indent), (line_after, s.end - indent));
+                comments.push((t, span));
+            }
+            _ => {}
+        }
+        line = line_after;
+    }
+
+    comments
+}
+
+fn lex_tokens(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
     let mut indent = 0;
     let mut state = vec![((0, 0), Delim::LytRoot), ((0, 0), Delim::LytWhere)];
     let mut out = Vec::new();
@@ -852,6 +887,7 @@ mod tests {
 
     fn p(s: &'static str) -> String {
         lex(s, Fi(0))
+            .0
             .iter()
             .map(|x| format!("{:?}", x.0))
             .collect::<Vec<_>>()
@@ -866,6 +902,36 @@ mod tests {
     #[test]
     fn some_tokens() {
         assert_snapshot!(p("module A where (a, b, c)\nimport B as B\nfoo = 1 + B.t"));
+    }
+
+    #[test]
+    fn comments_are_captured_separately() {
+        let (toks, comments) = lex("foo = 1 -- hi\n{- block -}\nbar = 2", Fi(0));
+        assert!(
+            toks.iter()
+                .all(|(t, _)| !matches!(t, Ok(Token::LineComment(_) | Token::BlockComment(_)))),
+            "comments must not appear in the layout token stream: {:?}",
+            toks
+        );
+        assert_eq!(
+            comments
+                .iter()
+                .map(|(t, _)| format!("{:?}", t))
+                .collect::<Vec<_>>(),
+            vec![
+                "Ok(LineComment(\"-- hi\"))".to_string(),
+                "Ok(BlockComment(\"{- block -}\"))".to_string(),
+            ]
+        );
+        assert_eq!(comments[0].1, Span::Known(Fi(0), (0, 8), (0, 13)));
+        assert_eq!(comments[1].1, Span::Known(Fi(0), (1, 0), (1, 11)));
+    }
+
+    #[test]
+    fn comments_do_not_affect_layout() {
+        let with = p("foo = 1 -- hi\nbar = 2");
+        let without = p("foo = 1\nbar = 2");
+        assert_eq!(with, without);
     }
 
     #[test]
