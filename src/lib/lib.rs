@@ -9,6 +9,8 @@ pub mod ast;
 pub mod lexer;
 pub mod nr;
 pub mod parser;
+pub mod print;
+pub mod source;
 pub mod style;
 
 use crate::ast::Ast;
@@ -129,6 +131,7 @@ pub enum Flag {
     Imports,
     Exports,
     Resolved,
+    Format,
 }
 
 pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
@@ -323,13 +326,24 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
             Ok(src) => {
                 use std::io::BufWriter;
 
-                let (l, _comments) = lexer::lex(&src, ast::Fi(i));
+                let (l, comments) = lexer::lex(&src, ast::Fi(i));
                 let n = DashMap::new();
                 let mut p = parser::P::new(&l, &n);
 
                 let out = parser::module(&mut p);
                 if p.i < p.tokens.len() {
                     p.errors.push(parser::Serror::NotAtEOF(p.span(), p.peekt()))
+                }
+
+                if flags.contains(&Flag::Format) {
+                    match (&out, p.errors.is_empty()) {
+                        (Some(m), true) => {
+                            print!("{}", print::print_module(&src, m, &comments));
+                        }
+                        _ => {
+                            eprintln!("ERR: {} did not parse cleanly, cannot format", arg);
+                        }
+                    }
                 }
 
                 if flags.contains(&Flag::Tokens)

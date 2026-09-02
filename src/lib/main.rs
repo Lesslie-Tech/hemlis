@@ -27,6 +27,7 @@ fn main() {
                 "-e" | "--exports" => lib_flags.insert(LibFlag::Exports),
                 "-i" | "--imports" => lib_flags.insert(LibFlag::Imports),
                 "-x" | "--xx" => lib_flags.insert(LibFlag::Resolved),
+                "-f" | "--format" => lib_flags.insert(LibFlag::Format),
                 "-r" | "--resolve" => flags.insert(Flag::Resolve),
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),
