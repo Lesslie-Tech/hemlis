@@ -132,6 +132,7 @@ pub enum Flag {
     Exports,
     Resolved,
     Format,
+    Write,
 }
 
 pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
@@ -338,7 +339,19 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
                 if flags.contains(&Flag::Format) {
                     match (&out, p.errors.is_empty()) {
                         (Some(m), true) => {
-                            print!("{}", print::print_module(&src, m, &comments));
+                            let formatted = print::print_module(&src, m, &comments);
+                            if flags.contains(&Flag::Write) {
+                                if formatted != src {
+                                    match fs::write(arg, &formatted) {
+                                        Ok(()) => println!("formatted {}", arg),
+                                        Err(e) => {
+                                            eprintln!("ERR: {} failed to write: {:?}", arg, e)
+                                        }
+                                    }
+                                }
+                            } else {
+                                print!("{}", formatted);
+                            }
                         }
                         _ => {
                             eprintln!("ERR: {} did not parse cleanly, cannot format", arg);

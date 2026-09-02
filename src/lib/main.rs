@@ -28,6 +28,7 @@ fn main() {
                 "-i" | "--imports" => lib_flags.insert(LibFlag::Imports),
                 "-x" | "--xx" => lib_flags.insert(LibFlag::Resolved),
                 "-f" | "--format" => lib_flags.insert(LibFlag::Format),
+                "-w" | "--write" => lib_flags.insert(LibFlag::Write),
                 "-r" | "--resolve" => flags.insert(Flag::Resolve),
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),
