@@ -1264,7 +1264,7 @@ impl<'s> N<'s> {
                         ast::DoStmt::Stmt(None, e) => {
                             self.expr(e);
                         }
-                        ast::DoStmt::Let(ls) => {
+                        ast::DoStmt::Let(_, ls) => {
                             self.let_binders(ls);
                         }
                     }
@@ -1283,7 +1283,7 @@ impl<'s> N<'s> {
                         ast::DoStmt::Stmt(_, e) => {
                             self.expr(e);
                         }
-                        ast::DoStmt::Let(_) => {}
+                        ast::DoStmt::Let(_, _) => {}
                     }
                 }
                 for s in stmts.iter() {
@@ -1292,7 +1292,7 @@ impl<'s> N<'s> {
                             self.binder(b);
                         }
                         ast::DoStmt::Stmt(None, _) => {}
-                        ast::DoStmt::Let(ls) => {
+                        ast::DoStmt::Let(_, ls) => {
                             self.let_binders(ls);
                         }
                     }
@@ -1487,7 +1487,7 @@ impl<'s> N<'s> {
             ast::Binder::Char(_) => (),
             ast::Binder::Str(_) => (),
             ast::Binder::Number(_, _) => (),
-            ast::Binder::Array(ts) => {
+            ast::Binder::Array(_, ts, _) => {
                 for b in ts.iter() {
                     self.binder(b);
                 }

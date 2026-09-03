@@ -594,8 +594,8 @@ fn typ_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Typ> {
                 p: Serror::Info(p.span(), "row or paren"),
                 |p: &mut P<'t>| {
                     let r = row(p)?;
-                    kw_rp(p)?;
                     let end = p.span();
+                    kw_rp(p)?;
                     Some(Typ::Row(S(r, start.merge(end))))
                 },
                 |p: &mut P<'t>| {
@@ -1265,10 +1265,11 @@ fn do_statement<'t>(p: &mut P<'t>) -> Option<DoStmt> {
             Some(Some(DoStmt::Stmt(None, e)))
         },
         |p: &mut P<'t>| {
+            let start = p.span();
             kw_let(p)?;
             // Handle inline ones?
             let b = sep_until_(p, "let-bindings", let_binding)?;
-            Some(Some(DoStmt::Let(b)))
+            Some(Some(DoStmt::Let(start, b)))
         },
     )?
 }
@@ -1362,6 +1363,7 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
         }
         (Some(T::Number(_)), _) => Some(Binder::Number(false, number(p)?)),
         (Some(T::LeftSquare), _) => {
+            let start = p.span();
             kw_ls(p)?;
             let bs = sep_until(
                 p,
@@ -1370,8 +1372,9 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
                 binder,
                 next_is!(T::RightSquare),
             );
+            let end = p.span();
             kw_rs(p)?;
-            Some(Binder::Array(bs))
+            Some(Binder::Array(start, bs, end))
         }
         (Some(T::LeftBrace), _) => {
             kw_lb(p)?;
@@ -1926,7 +1929,7 @@ impl<'s> P<'s> {
     fn prev(&self) -> (Option<Token<'s>>, Span) {
         (
             self.tokens.get(self.i - 1).and_then(|x| x.0.ok()),
-            self.span(),
+            self.tokens.get(self.i - 1).map(|x| x.1).unwrap_or(Span::Zero),
         )
     }
 

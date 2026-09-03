@@ -599,7 +599,14 @@ pub enum Binder {
     Char(Char),
     Str(Str),
     Number(bool, Number),
-    Array(Vec<Binder>),
+    /// The two `Span`s are the `[`/`]` brackets themselves - without them,
+    /// `.span()` (derived by merging every field, including the item list)
+    /// reduces to `Span::Zero` whenever the list is empty (`[]`, matching
+    /// nothing), an unrelated-to-any-real-position value `Span::merge`
+    /// treats as neutral. A printer computing "was there a blank line before
+    /// this case branch" from that span then can't tell `[]` was ever there
+    /// at all, silently losing an entire source row from the calculation.
+    Array(Span, Vec<Binder>, Span),
     Record(Vec<RecordLabelBinder>),
     Paren(Span, Box<Binder>, Span),
 }
@@ -709,5 +716,12 @@ pub struct CaseBranch(pub Vec<Binder>, pub GuardedExpr);
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DoStmt {
     Stmt(Option<Binder>, Expr),
-    Let(Vec<LetBinding>),
+    /// The `Span` is the `let` keyword's own span - without it, `.span()`
+    /// (derived by merging every field) starts at the first binding instead,
+    /// which is *after* `let` whenever they print on separate lines (always,
+    /// for our own output - `let`-bindings are always one-per-line). A
+    /// printer computing "was there a blank line before this do-statement"
+    /// from that span would then undercount the gap by the row `let` itself
+    /// occupies, on every reparse of our own output.
+    Let(Span, Vec<LetBinding>),
 }

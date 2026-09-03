@@ -1,6 +1,8 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
+assertion_line: 2159
 expression: "p_typ(\"( a :: A )\")"
+snapshot_kind: text
 ---
 12 of 12
 ===
@@ -15,7 +17,7 @@ Module
    Name
     (2, 0)->(2, 1)
    Typ::Row
-    (2, 0)->(2, 6)
+    (2, 5)->(2, 15)
      Row
        (
         Label

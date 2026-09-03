@@ -1138,7 +1138,7 @@ impl<'a> StyleChecker<'a> {
     fn check_do_stmt(&mut self, stmt: &ast::DoStmt) {
         match stmt {
             ast::DoStmt::Stmt(_, e) => self.check_expr(e),
-            ast::DoStmt::Let(bindings) => self.check_let_bindings(bindings),
+            ast::DoStmt::Let(_, bindings) => self.check_let_bindings(bindings),
         }
     }
 
