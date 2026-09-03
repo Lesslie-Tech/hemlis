@@ -2,7 +2,7 @@
 
 Working notes for the PureScript formatter being built on top of this repo's
 parser. Written so a new session can get oriented fast. Branch: `formatter`
-(6 commits on top of `main`, not yet merged).
+(7 commits on top of `main`, not yet merged).
 
 ## Status
 
@@ -11,8 +11,8 @@ Functionally complete first version. Covers the entire `Decl`/`Expr`/`Binder`/
 verbatim source-text slice — nothing else does). Verified against all 1423
 real-world `.purs` files in a sibling repo, `../pay-backend/lib` (external,
 read-only reference — never modified): every file formats and reparses
-cleanly and idempotently. 60 unit tests in `src/lib/print.rs`, all passing;
-full suite (162 lib + 123 style + golden) and clippy clean.
+cleanly and idempotently. 62 unit tests in `src/lib/print.rs`, all passing;
+full suite (164 lib + 123 style + golden) and clippy clean.
 
 A diff of our output against `../pay-backend/lib/Array.purs` (formatted by
 `purs-tidy`, the tool this is meant to replace) shrank from 511 diff lines to
@@ -765,6 +765,62 @@ that motivated this session), and one asserting a fully single-line type
 with nested parens/operators/application never gets broken up. Full corpus
 sweep re-run clean (1423/1423: 0 parse failures, 0 reparse failures, 0
 non-idempotent).
+
+## Session: gluing after a multiline value/argument
+
+Two more real user reports, both invisible to the corpus sweep for the same
+reason as the previous session (needs a specific pre-broken source shape).
+Both are the same underlying bug: something glued *after* a value/argument
+without ever checking whether that value/argument itself needed to move,
+so once the thing being glued to *did* print multiline, whatever followed
+either glued onto its own first line (should have moved down entirely) or
+right back onto its closing line (should have gotten its own line).
+
+1. **A record field's value never checked whether it needed to move onto
+   its own line** - `RecordLabelExpr::Field` (`{ label: value }`) and
+   `RecordUpdate::Leaf` (`r { label = value }`) always glued `label:`/
+   `label =` directly onto the value's first printed line, no matter what,
+   relying entirely on the value's *own* construct to decide its own
+   multiline-ness. That's correct for something like `case` (see the
+   existing `record_field_with_case_value_hangs_one_level_deeper` test,
+   which deliberately keeps `case` glued to `:`), but wrong for an `App`
+   chain whose argument had already broken onto its own line in the source
+   (`columnIn: List.singleton\n  (...)`, real code) - the field's value
+   needs to move down as a whole here, the same way `print_arrow_rhs`
+   already does for a decl's `=`. Fixed by giving records their own
+   `print_record_field_rhs`: same `paren_would_break`/`breaks_before`
+   decision as `print_arrow_rhs` for *whether* to move the value down, but
+   - unlike `print_arrow_rhs` - keeping the unconditional extra hang level
+   in *both* branches (not just the "stays glued" one), since that extra
+   level is what the `case`-value tests above depend on and is orthogonal
+   to whether the value also moves down.
+
+2. **A constraint's/type-application's trailing argument could glue back
+   onto a multiline argument's closing line.** `print_constraint` (a class
+   constraint's `Name arg1 arg2 ...`) had no multiline handling at all -
+   always glued every argument with a single space, so `Union a (row) b`
+   with `row` printing as its own multiline block (correct) still glued
+   ` b` right onto the row's closing `)` (wrong - `b` sits on its own
+   source line right after the row). `Typ::App` already had *a* multiline
+   policy (from the previous session) but the wrong shape for this case: it
+   decides once, globally, for the *whole* argument list ("any break
+   anywhere → every argument one-per-line, including ones before the first
+   break"), which would have also incorrectly pulled `a` away from `Union`
+   here even though nothing ever breaks between them. Replaced both with a
+   shared `print_spine_args` helper: glue each argument with a space until
+   the first source-span break, then switch to one-argument-per-line at a
+   single shared indent level entered on that first break (not one
+   `indent_in`/`indent_out` per argument) - so leading un-broken arguments
+   stay glued, and everything from the first break onward, including a
+   trailing argument after a multiline block, lands on its own line at the
+   same level. `Typ::App`'s two existing regression tests already only
+   ever exercised shapes where the very first argument was the one that
+   broke, so this is a strict generalization - both still pass unchanged.
+
+2 new regression tests in `src/lib/print.rs` (60 → 62): the record-field-
+after-a-broken-`App` case and the `Union a (row) b` trailing-argument case,
+both taken directly from the real reports. Full corpus sweep re-run clean
+(1423/1423: 0 parse failures, 0 reparse failures, 0 non-idempotent).
 
 ## Testing
 

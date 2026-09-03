@@ -485,6 +485,46 @@ impl<'s> Printer<'s> {
         (first, ops.into_iter().zip(operands).collect())
     }
 
+    /// Prints `args` (already glued to some preceding `first_span`, e.g. a
+    /// spine's head or a constraint's class name) one at a time, deciding
+    /// per-argument whether to glue it with a leading space or move it onto
+    /// a fresh, shared indent level: once one argument's source span breaks
+    /// from its predecessor, that argument and every one after it print
+    /// one-per-line at a single indent level entered on the first break -
+    /// so an argument gets glued right after some *other* argument that
+    /// printed as a multiline block (e.g. `Union a (row) b`, where `row`
+    /// prints as its own multi-line block but `b` still followed it on the
+    /// very next source line) doesn't end up looking like it moved back
+    /// onto that block's own closing line. Args before the first break stay
+    /// glued to whatever precedes them, since nothing forces them apart.
+    fn print_spine_args<T>(
+        &mut self,
+        first_span: Span,
+        args: &[T],
+        span_of: impl Fn(&T) -> Span,
+        print: impl Fn(&mut Self, &T),
+    ) {
+        let mut prev_span = first_span;
+        let mut broke = false;
+        for a in args {
+            let cur_span = span_of(a);
+            if !broke && Self::breaks_before(prev_span, cur_span) {
+                self.indent_in();
+                broke = true;
+            }
+            if broke {
+                self.newline();
+            } else {
+                self.raw(" ");
+            }
+            print(self, a);
+            prev_span = cur_span;
+        }
+        if broke {
+            self.indent_out();
+        }
+    }
+
     /// True if `a` is a type signature immediately followed by its own
     /// definition, or both are pattern-matching clauses of the same function
     /// (`Decl::Def`) - these stay adjacent, with no blank line between them.
@@ -1246,6 +1286,29 @@ impl<'s> Printer<'s> {
         self.print_arrow_rhs(before, arrow, e);
     }
 
+    /// The record-field counterpart of `print_arrow_rhs`: unlike a decl's
+    /// `=` or a lambda's `->`, a record field's value always sits one level
+    /// deeper than the field itself, whether or not it visibly moves onto
+    /// its own line - so a nested multi-branch `case`/`do` value stays
+    /// visually inside the field even when glued right after `label:`/
+    /// `label =`, and a value that itself needs to move onto its own line
+    /// (an `App` chain whose argument already broke in the source, say)
+    /// moves down without losing that same extra level.
+    fn print_record_field_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
+        if self.paren_would_break(e) || Self::breaks_before(before, e.span()) {
+            self.raw(arrow.trim_end());
+            self.indent_in();
+            self.newline();
+            self.print_expr(e);
+            self.indent_out();
+        } else {
+            self.raw(arrow);
+            self.indent_in();
+            self.print_expr(e);
+            self.indent_out();
+        }
+    }
+
     /// Prints `arrow e`, breaking `e` onto its own indented line when the
     /// source had it starting after a line break from `before` (the last
     /// token immediately preceding `arrow`) - the shared source-fidelity
@@ -1480,23 +1543,8 @@ impl<'s> Printer<'s> {
             Typ::Arr(a, b) => self.print_typ_arrow_chain(a, b),
             Typ::App(..) => {
                 let (head, args) = Self::typ_app_spine(t);
-                let mut spans = vec![head.span()];
-                spans.extend(args.iter().map(|a| a.span()));
-                let multiline = Self::any_breaks(&spans);
                 self.print_typ(head);
-                if multiline {
-                    self.indent_in();
-                    for a in &args {
-                        self.newline();
-                        self.print_typ(a);
-                    }
-                    self.indent_out();
-                } else {
-                    for a in &args {
-                        self.raw(" ");
-                        self.print_typ(a);
-                    }
-                }
+                self.print_spine_args(head.span(), &args, |a| a.span(), |p, a| p.print_typ(a));
             }
             Typ::Op(..) => {
                 let (first, rest) = Self::typ_op_spine(t);
@@ -1587,10 +1635,7 @@ impl<'s> Printer<'s> {
     fn print_constraint(&mut self, c: &Constraint) {
         let Constraint(name, args) = c;
         self.lit(name);
-        for a in args {
-            self.raw(" ");
-            self.print_typ(a);
-        }
+        self.print_spine_args(name.span(), args, |a| a.span(), |p, a| p.print_typ(a));
     }
 
     /// `a -> b -> c -> ...` is parsed as a right-nested chain of `Typ::Arr`. Flatten
@@ -2029,15 +2074,7 @@ impl<'s> Printer<'s> {
         match u {
             RecordUpdate::Leaf(l, e) => {
                 self.lit(l);
-                self.raw(" = ");
-                // Unconditional hang: a record field's value always sits one
-                // level deeper than the field itself, whether or not it visibly
-                // breaks - invisible when `e` prints flat, but stacks with
-                // whatever `e`'s own construct does (a nested list's own
-                // `own_indent`, `case`'s own `indent_in`) when it doesn't.
-                self.indent_in();
-                self.print_expr(e);
-                self.indent_out();
+                self.print_record_field_rhs(l.span(), " = ", e);
             }
             RecordUpdate::Branch(l, updates) => {
                 self.lit(l);
@@ -2060,12 +2097,7 @@ impl<'s> Printer<'s> {
             RecordLabelExpr::Pun(n) => self.lit(n),
             RecordLabelExpr::Field(l, e) => {
                 self.lit(l);
-                self.raw(": ");
-                // See the matching comment on `RecordUpdate::Leaf` - same
-                // unconditional hang for the same reason.
-                self.indent_in();
-                self.print_expr(e);
-                self.indent_out();
+                self.print_record_field_rhs(l.span(), ": ", e);
             }
         }
     }
@@ -2384,6 +2416,31 @@ mod tests {
     #[test]
     fn record_update_field_with_case_value_hangs_one_level_deeper() {
         let src = "module Foo where\n\nfoo =\n  r\n    { a = 1\n    , b = case x of\n        0 -> 1\n        _ -> 2\n    }\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn record_field_moves_to_its_own_line_when_its_value_already_broke_in_source() {
+        // Unlike `case` (see `record_field_with_case_value_hangs_one_level_deeper`,
+        // which stays glued to `:`), an `App` chain whose argument already
+        // broke onto its own line in the source moves the whole value down
+        // instead of gluing its head right after `label:`.
+        let src = "module Foo where\n\nf x =\n  update\n    { columnIn:\n      List.singleton\n        (Kanon.columnIn @\"type\" (relevantTypes # NonEmptyArray.map TransactionType.toStorageString))\n    , changedColumns: List.singleton (Kanon.changedColumn @\"status\")\n    }\n    tableTransaction\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn constraint_arg_moves_to_its_own_line_after_a_multiline_row_argument() {
+        // `Union a (row) b`: `a` stays glued to `Union` (no source break),
+        // but once `row` prints as its own multiline block, `b` - which sits
+        // on the very next source line after the row's closing paren - must
+        // not glue back onto that closing line; it needs its own line at the
+        // same indent as the row block.
+        let src = "module Foo where\n\nempty\n  :: forall a b\n   . Union a\n    ( balance :: Maybe StarBuck.StarBuck\n    , currency :: Currency\n    )\n    b\n  => Record b\nempty = x\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
