@@ -550,7 +550,23 @@ impl<'s> Printer<'s> {
             self.raw(":: ");
             let outer = self.in_broken_sig;
             self.in_broken_sig = true;
+            // `typ` is glued directly after `:: ` here, a fixed-width raw
+            // token the indent-level counter has no memory of - so if
+            // `typ` is itself a nesting shape (`App`/`Record`/`Row`) that
+            // breaks, it needs one extra level, the same reasoning as
+            // `print_constraint`'s own hang. Not applied to an operator-
+            // chain shape (`Arr`/`Op`/`Constrained`/`Forall`): those must
+            // stay at the ambient level for their own continuations (see
+            // `print_typ_arrow_chain`'s doc comment) - adding a level here
+            // would incorrectly push every `->`/`=>` continuation deeper.
+            let needs_hang = matches!(typ, Typ::App(..) | Typ::Record(..) | Typ::Row(..));
+            if needs_hang {
+                self.indent_in();
+            }
             self.print_typ(typ);
+            if needs_hang {
+                self.indent_out();
+            }
             self.in_broken_sig = outer;
             self.indent_out();
         } else {
@@ -1635,7 +1651,16 @@ impl<'s> Printer<'s> {
     fn print_constraint(&mut self, c: &Constraint) {
         let Constraint(name, args) = c;
         self.lit(name);
+        // Unconditional hang, same reasoning as `print_record_field_rhs`: a
+        // constraint's args are glued directly after its name, which is in
+        // turn glued after a fixed-width raw token (`. `, `=> `) whose own
+        // width the indent-level counter has no memory of - so if the args
+        // break, they need one extra level on top of `print_spine_args`'
+        // own break-handling, or the resulting block looks shallower than
+        // the constraint's own name, not just less indented.
+        self.indent_in();
         self.print_spine_args(name.span(), args, |a| a.span(), |p, a| p.print_typ(a));
+        self.indent_out();
     }
 
     /// `a -> b -> c -> ...` is parsed as a right-nested chain of `Typ::Arr`. Flatten
@@ -1887,7 +1912,16 @@ impl<'s> Printer<'s> {
                         self.newline();
                         self.lit(*op);
                         self.raw(" ");
+                        // Unconditional hang, same reasoning as
+                        // `print_record_field_rhs`: an operand is glued
+                        // directly after its operator, so if the operand
+                        // itself breaks (an `App` call, a `case`), that
+                        // break needs to land one level deeper than the
+                        // chain's own continuation, not at the same level -
+                        // invisible when the operand prints flat.
+                        self.indent_in();
                         self.print_expr(r);
+                        self.indent_out();
                     }
                     self.indent_out();
                 } else {
@@ -1895,7 +1929,9 @@ impl<'s> Printer<'s> {
                         self.raw(" ");
                         self.lit(*op);
                         self.raw(" ");
+                        self.indent_in();
                         self.print_expr(r);
+                        self.indent_out();
                     }
                 }
             }
@@ -2439,8 +2475,11 @@ mod tests {
         // but once `row` prints as its own multiline block, `b` - which sits
         // on the very next source line after the row's closing paren - must
         // not glue back onto that closing line; it needs its own line at the
-        // same indent as the row block.
-        let src = "module Foo where\n\nempty\n  :: forall a b\n   . Union a\n    ( balance :: Maybe StarBuck.StarBuck\n    , currency :: Currency\n    )\n    b\n  => Record b\nempty = x\n";
+        // same indent as the row block. The block also sits one level deeper
+        // than `Union` itself (`print_constraint`'s own unconditional hang) -
+        // otherwise it looks shallower than the very name it's an argument
+        // of, since the indent-level counter has no memory of `. `'s width.
+        let src = "module Foo where\n\nempty\n  :: forall a b\n   . Union a\n      ( balance :: Maybe StarBuck.StarBuck\n      , currency :: Currency\n      )\n      b\n  => Record b\nempty = x\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -2733,6 +2772,19 @@ mod tests {
         assert_idempotent(src);
     }
 
+    #[test]
+    fn typ_app_directly_after_a_broken_sig_gets_an_extra_hang_level() {
+        // `typ` is glued directly after `:: ` here (a fixed-width raw token
+        // the indent-level counter has no memory of) - if `typ` is a nesting
+        // shape (`Array { ... }`) that itself breaks, it needs one extra
+        // level, or the resulting block looks shallower than `Array` itself.
+        let src =
+            "module Foo where\n\nf\n  :: Array\n      { from :: TransactionId\n      , to :: TransactionId\n      }\nf = x\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
     /// Regression test: a broken type-operator chain used to add its own
     /// indent level for the operator (like a value's operator chain does),
     /// drifting deeper than the non-operator break that introduced it. Type
@@ -2850,6 +2902,19 @@ mod tests {
     #[test]
     fn multiline_operator_chain_of_three_or_more_stays_at_one_indent_level() {
         let src = "module Foo where\n\nfoo =\n  a\n    <> b\n    <> c\n    <> d\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn operator_chain_operand_that_is_itself_a_broken_call_hangs_one_level_deeper() {
+        // An operand is glued directly after its operator, so if the operand
+        // itself breaks (an `App` call whose argument is on its own line),
+        // that break needs to land one level deeper than the chain's own
+        // continuation - not at the same level, which would look like the
+        // call's argument is just another step of the chain.
+        let src = "module Foo where\n\nf rs =\n  rs\n    # List.map\n        ( \\r ->\n            r\n              # empty\n        )\n    # List.toArray\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);

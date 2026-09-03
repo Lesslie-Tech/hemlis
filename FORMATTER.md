@@ -2,7 +2,7 @@
 
 Working notes for the PureScript formatter being built on top of this repo's
 parser. Written so a new session can get oriented fast. Branch: `formatter`
-(7 commits on top of `main`, not yet merged).
+(8 commits on top of `main`, not yet merged).
 
 ## Status
 
@@ -11,8 +11,8 @@ Functionally complete first version. Covers the entire `Decl`/`Expr`/`Binder`/
 verbatim source-text slice — nothing else does). Verified against all 1423
 real-world `.purs` files in a sibling repo, `../pay-backend/lib` (external,
 read-only reference — never modified): every file formats and reparses
-cleanly and idempotently. 62 unit tests in `src/lib/print.rs`, all passing;
-full suite (164 lib + 123 style + golden) and clippy clean.
+cleanly and idempotently. 64 unit tests in `src/lib/print.rs`, all passing;
+full suite (166 lib + 123 style + golden) and clippy clean.
 
 A diff of our output against `../pay-backend/lib/Array.purs` (formatted by
 `purs-tidy`, the tool this is meant to replace) shrank from 511 diff lines to
@@ -821,6 +821,67 @@ right back onto its closing line (should have gotten its own line).
 after-a-broken-`App` case and the `Union a (row) b` trailing-argument case,
 both taken directly from the real reports. Full corpus sweep re-run clean
 (1423/1423: 0 parse failures, 0 reparse failures, 0 non-idempotent).
+
+## Session: the glued-token indent gap
+
+A third real report, same shape as the previous two sessions: a nested block
+looked shallower than it should - in one case shallower than *the very head
+it's an argument of*, which reads as backward, not just "less indented."
+Traced against real (git-verified, human/`purs-tidy`-formatted, not
+hemlis-formatted) source from `../pay-backend/lib/Transaction/Storage.purs`
+rather than synthetic examples, since the effect only shows up once a nested
+block is reached through a specific kind of glued prefix.
+
+Root cause: `:: `, ` . ` (`forall`'s continuation), and an operator chain's
+`op ` are all printed as literal raw characters glued directly in front of
+whatever comes next, *not* as a level bump - that's deliberate (it's how `.`
+stays aligned under `::`), but it means the indent-level counter has no
+memory of those characters' width. A plain continuation (another `->`/`=>`,
+another chain operand) never needed that memory, because those print at the
+*same* level as whatever glued them there by design (see "no extra indent
+for operators", previous session). But a *nesting* shape reached the same
+way - a constraint's own args, a bare `Array {...}` directly as a signature's
+type, an `App` call as an operator chain's operand - does need one more
+level when it breaks, or it lands at (or, worse, shallower than) the glued
+prefix's own column instead of visibly deeper than it.
+
+Fixed at three call sites, each an unconditional extra `indent_in`/
+`indent_out` around printing the thing that's glued (same "invisible when
+flat, stacks when it breaks" shape as `print_record_field_rhs`'s hang):
+`print_constraint` (its own args, glued after a class name that's in turn
+glued after `. `/`=> `), `print_sig_typ`'s already-broken branch (`typ`
+glued after `:: ` - only when `typ` is itself a nesting shape: `App`/
+`Record`/`Row`, never `Arr`/`Op`/`Constrained`/`Forall`, which would
+wrongly push every `->`/`=>` continuation a level deeper), and `Expr::Op`
+(each operand, glued after its own operator).
+
+This can't fully close the gap to `purs-tidy`'s own output byte-for-byte in
+the constraint/signature cases - `. `/`:: ` are 3 characters wide but
+`INDENT` is a fixed 2, so a nesting shape reached through them still lands
+one column short of lining up under the glued prefix's own text, an
+architectural limit of a flat, level-multiple indent scheme (see "Layout
+philosophy") rather than something fixable by another `indent_in`. The
+operator-chain case (no glued-prefix width mismatch involved) closed
+completely - reformatting the real `unpack`/`newBulkSql` functions this was
+found against now reproduces the original source byte-for-byte for the
+`Expr::Op`+`App` shape, and lands one column off (rather than a whole level
+short, or backward past the head) for the constraint/signature shape.
+
+Along the way, found (but did not fix, and did not introduce) a pre-existing,
+separate bug: a comment sitting on its own line directly before an operator
+in a chain (`# Kanon.unpack\n-- comment\n# R.modify ...`) gets split onto its
+*own* orphaned line between the operator and its operand
+(`#\n  -- comment\n  R.modify ...`) instead of staying attached ahead of the
+whole `# R.modify` line. Confirmed present already in the prior commit,
+unrelated to this session's `indent_in` additions - `Expr::Op`'s per-operand
+comment flush point is simply after the operator token has already been
+printed. Not fixed here; flagged for its own session.
+
+2 new regression tests in `src/lib/print.rs` (62 → 64): the `Array {...}`-
+directly-after-`::` case and the operator-chain-operand-that's-itself-a-
+broken-call case, both taken directly from the real report and verified
+byte-for-byte against the source they came from. Full corpus sweep re-run
+clean (1423/1423: 0 parse failures, 0 reparse failures, 0 non-idempotent).
 
 ## Testing
 
