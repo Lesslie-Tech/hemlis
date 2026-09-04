@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_module(r\"\nmodule A where\n\na :: Test\na =\n  b\n    let\n      b =\n        let\n          f :: forall e. S -> e -> _\n          f m e =\n            { a: M 1\n            , s: Left {}\n            }\n        in\n        do\n          m <- g\n          E.l M.i\n    in [ ]\n            \")"
 ---
 62 of 62
@@ -84,14 +84,15 @@ Module
                RecordLabelExpr::Field
                 Label
                  (12, 14)->(12, 15)
-                Expr::Update
+                Expr::App
                  Expr::Constructor
                   QProperName
                    NULL
                    ProperName
                     (12, 17)->(12, 21)
-                 (12, 22)->(12, 23)
-                 (12, 23)->(12, 24)
+                 Expr::Record
+                  (12, 22)->(12, 23)
+                  (12, 23)->(12, 24)
               (13, 12)->(13, 13)
           Expr::Do
            NULL

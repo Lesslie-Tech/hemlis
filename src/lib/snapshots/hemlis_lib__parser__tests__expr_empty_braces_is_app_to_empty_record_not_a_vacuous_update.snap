@@ -1,0 +1,27 @@
+---
+source: src/lib/parser.rs
+expression: "p_expr(\"foo {}\")"
+---
+10 of 10
+===
+Module
+ Header
+  MName
+   (0, 7)->(0, 11)
+  NULL
+  (0, 0)->(0, 6)
+  (0, 12)->(0, 17)
+  Decl::Def
+   Name
+    (2, 0)->(2, 1)
+   GuardedExpr::Unconditional
+    Expr::App
+     Expr::Ident
+      QName
+       NULL
+       Name
+        (2, 4)->(2, 7)
+     Expr::Record
+      (2, 8)->(2, 9)
+      (2, 9)->(2, 10)
+===

@@ -1494,6 +1494,15 @@ fn record_updates<'t>(p: &mut P<'t>) -> Option<(Span, Vec<RecordUpdate>, Span)> 
         record_update,
         next_is!(T::RightBrace),
     );
+    // A record update list is a `Separated` in the real grammar - at least
+    // one update, never zero - so `x {}` isn't "update x with no changes",
+    // it's a plain function application of `x` to an empty record literal.
+    // Failing here (the caller tries this transactionally, via `ttry!`/
+    // `alt!`) lets `{}` fall through to the ordinary atom/App path instead
+    // of being swallowed as a vacuous `Expr::Update`.
+    if updates.is_empty() {
+        return None;
+    }
     let end = p.span();
     kw_rb(p)?;
     Some((start, updates, end))
@@ -2299,6 +2308,14 @@ import A.B.C hiding (foo)
     #[test]
     fn expr_record_update_full() {
         assert_snapshot!(p_expr("foo { a = 1, b = { c = 1 }, d = { e: 1 } }"))
+    }
+
+    /// Regression test: `foo {}` has zero updates, which isn't valid record
+    /// update syntax (a `Separated` update list needs at least one) - it's
+    /// `foo` applied to an empty record literal instead.
+    #[test]
+    fn expr_empty_braces_is_app_to_empty_record_not_a_vacuous_update() {
+        assert_snapshot!(p_expr("foo {}"))
     }
 
     #[test]

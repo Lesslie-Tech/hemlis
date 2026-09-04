@@ -1342,6 +1342,88 @@ single-item-with-a-trailing-newline (`{ x: 1\n}`) lists correctly stay
 flat - this change only ever adds an expansion trigger, never removes
 one. Full suite (180 lib + 123 style + golden) and clippy clean.
 
+## Session: `list()`'s boundary check, a parser ambiguity bug, and `App` relocation
+
+Real report: `x {} [\na\n]` should format as `x {}\n    [ a\n    ]` nested
+under a relocated `a =`; instead it printed as `x {} [ a\n]` (the array
+never even visibly expanding). Three separate bugs, found in order while
+chasing this one report.
+
+**1. `list()`'s multiline check still had a gap the previous session's fix
+didn't close.** That session added `open_span`/`close_span` to catch a
+break between the brackets when there are *zero* items to otherwise carry
+one. But a single-item list has exactly the same blind spot for a
+non-empty reason: `any_breaks` only ever looks at breaks between adjacent
+*item* pairs, and one item has no adjacent pair at all - so `[\na\n]` (one
+item, broken away from both brackets) still stayed flat as `[ a ]`. Fixed
+by generalizing rather than special-casing further: fold `open_span` and
+`close_span` into the *same* boundary-span sequence `any_breaks` already
+walks (`[open, item1, item2, ..., close]`) instead of checking the empty
+case separately - this uniformly covers a break before the first item,
+between any two items, after the last item, and (still) the zero-item
+case, with one check instead of two.
+
+**2. `x {}` doesn't mean what it looks like.** Chasing why the array
+still wasn't expanding even after fix 1 led to a real parser bug: `x {}`
+was parsing as `Expr::Update` (record update, `x` with a - here vacuous -
+set of field changes) rather than `Expr::App(x, Record{})` (`x` applied to
+an empty record literal), because `record_updates` accepted a *zero*-length
+update list. The two are different ASTs with different printers, and the
+formatter had correctly formatted the (wrong) tree it was given. In the
+real grammar a record update's field list is a `Separated` - at least one
+update, never zero - so `{}` immediately after an atom can never validly
+be an empty update list; it should fall through to being parsed as a
+plain, empty-record `App` argument instead. Fixed in `record_updates`:
+return `None` (the same "this alternative failed, try the next one" signal
+`ttry!`/`alt!` already use everywhere else in this parser) when the parsed
+update list is empty, instead of always succeeding. 1 new parser
+regression test plus an existing `minimal_b` snapshot update (a nested
+`Left {}` now parses as `App`, not `Update`, as it always should have).
+
+**3. `Expr::App` never relocated its own head.** With both of the above
+fixed, `x {}` correctly stays one atomic-looking unit and the array
+correctly registers as "would break" - but the call as a whole still
+printed as `x {}\n  [ a\n  ]`, `x {}` staying glued to `=` while the array
+that follows it dropped to its own line. `list()` already has exactly this
+problem solved for a glued `Array`/`Record`: `own_indent` relocates the
+opening bracket onto a fresh indented line first, when glued after
+something and about to expand, rather than leaving it stranded flush on
+the original line while its contents indent one level below *that*.
+`Expr::App` had no equivalent - `print_spine_args` moves an *argument*
+that breaks onto its own line, but never the head, or any arguments
+already glued in front of the one that breaks.
+
+This one had a real design fork, surfaced by a first, narrower attempt:
+relocate only when some argument stays glued to the head *before* hitting
+the one that breaks (i.e. never when the very first argument is the one
+that breaks). That narrower rule kept every previously-passing test
+green with zero test changes, including the ones that motivated `App`'s
+`expr_would_break` split from `Typ::App` two sessions back (`map (\x ->
+...) xs`, `bar\n  baz\n  qux`) - but it also left `x {} [\na\n]` itself
+unrelocated, since (per bug 2's fix) `x {}` is a single `Expr::Update`
+node and the array is the *only*, i.e. first, argument - exactly the
+"never relocate" case. Asked the user directly which convention was
+intended, since the two options meaningfully diverge across the whole
+corpus (`map (\x -> ...) xs` and `bar\n  baz\n  qux` either keep gluing
+their head or start relocating it too, depending on the answer) - not a
+judgment call to make silently either way. Answer: always relocate when
+the call ends up multiline and isn't already at a fresh line, with no
+exception for a first-argument break. Implemented as `Expr::App`'s own
+`own_indent`, computed exactly like `list()`'s: `any_breaks` over
+`[head, arg1, ...]` spans, or any argument's own `expr_would_break`.
+
+This changed 8 existing tests' expected output (all updated to the new,
+now-authoritative shape) - every one of them a call glued right after
+something (`=`, an operator) whose first argument is what breaks,
+previously left un-relocated by design and now relocating like everything
+else. None of them needed new logic beyond the `own_indent` flag itself;
+`print_spine_args`'s own per-argument behavior (glue until the first
+break, then one-per-line for the rest) is unchanged.
+
+1 new regression test taken directly from the real report (`app_relocates_
+when_a_later_glued_argument_would_break`), on top of the parser test from
+bug 2. Full suite (182 lib + 123 style + golden) and clippy clean.
+
 ## Testing
 
 - `cargo test --lib print::` — the real test suite, 53 tests in

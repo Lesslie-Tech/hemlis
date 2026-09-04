@@ -748,22 +748,41 @@ impl<'s> Printer<'s> {
         span_of: impl Fn(&T) -> Span,
         mut print_item: impl FnMut(&mut Self, &T),
     ) {
-        let spans: Vec<Span> = items.iter().map(&span_of).collect();
-        // A source break between adjacent items isn't the only thing that
-        // should switch this list to the expanded, one-per-line style: an
-        // item can have no such break before or after it and still be going
-        // to print across multiple lines all on its own (an `App` whose own
-        // spine breaks, an operator chain, ...) - real report:
-        // `[a b, c\n d]` (no break around the second item's own span, which
-        // itself starts on the same line as the first item's comma) stayed
-        // glued flat with the second item's own internal break looking like
-        // it randomly indented mid-line, instead of switching the whole
-        // list to the expanded style the way a source break between items
-        // would. Checked the same way `expr_would_break` decides this for
-        // `Expr::App`'s own arguments: render the item in isolation and see
-        // whether anything in it actually broke - a pure function of the
-        // item's own content, not its source span.
-        let mut multiline = Self::any_breaks(&spans);
+        // A source break between adjacent items isn't the only place this
+        // list can be told to expand: a break can just as well sit between
+        // `open` and the first item, or between the last item and `close`
+        // (most visibly - and the only way it can show up at all - when
+        // there's only one item, or none: a plain `any_breaks` over item
+        // spans has no adjacent pair to see it with then). Real report:
+        // `[\na\n]` (one item, broken away from both brackets) stayed flat
+        // as `[ a ]`. Folding `open_span`/`close_span` into the same
+        // boundary-span chain `any_breaks` already walks handles every one
+        // of these uniformly, including the zero-item case (`[\n]`, wrongly
+        // collapsing to `[]`) - a real report in its own right, fixed the
+        // same way.
+        let mut boundary_spans: Vec<Span> = Vec::with_capacity(items.len() + 2);
+        if open_span != Span::zero() {
+            boundary_spans.push(open_span);
+        }
+        boundary_spans.extend(items.iter().map(&span_of));
+        if close_span != Span::zero() {
+            boundary_spans.push(close_span);
+        }
+        // A source break isn't the only thing that should switch this list
+        // to the expanded, one-per-line style: an item can have no break
+        // around it at all and still be going to print across multiple
+        // lines all on its own (an `App` whose own spine breaks, an
+        // operator chain, ...) - real report: `[a b, c\n d]` (no break
+        // around the second item's own span, which itself starts on the
+        // same line as the first item's comma) stayed glued flat with the
+        // second item's own internal break looking like it randomly
+        // indented mid-line, instead of switching the whole list to the
+        // expanded style the way a source break would. Checked the same
+        // way `expr_would_break` decides this for `Expr::App`'s own
+        // arguments: render the item in isolation and see whether anything
+        // in it actually broke - a pure function of the item's own
+        // content, not its source span.
+        let mut multiline = Self::any_breaks(&boundary_spans);
         if !multiline {
             for item in items {
                 let comment_idx_before = self.comment_idx;
@@ -774,16 +793,6 @@ impl<'s> Printer<'s> {
                     break;
                 }
             }
-        }
-        // An empty list has no items to carry a break between - but the
-        // brackets themselves can still have one between them in the
-        // source (`[\n]`), which a plain `any_breaks`/`would_break` check
-        // over zero items can never see. Left unhandled, that source break
-        // was silently dropped: `a = [\n]` collapsed to `a = []`, instead of
-        // preserving the same expanded, own-line bracket style a nonempty
-        // multiline list gets.
-        if items.is_empty() && open_span != Span::zero() {
-            multiline = multiline || Self::breaks_before(open_span, close_span);
         }
 
         if !multiline {
@@ -2179,6 +2188,30 @@ impl<'s> Printer<'s> {
             }
             Expr::App(..) => {
                 let (head, args) = Self::app_spine(e);
+                // Relocate the whole call - head included - onto its own
+                // indented line whenever it's glued right after something
+                // (an outer `=`, a lambda's `->`, an operator, ...) and is
+                // itself going to print across multiple lines - the same
+                // "would this end up looking flat-glued while what follows
+                // it drops down" concern `list()`'s own `own_indent` already
+                // decides for a glued `Array`/`Record`. Real report: `x {}
+                // [\na\n]` printed as `x {}\n  [ a\n  ]`, the head (`x {}`,
+                // itself a single `Expr::Update` node - not two separate
+                // `App` arguments) never moving down even though the array
+                // it heads spans several lines. Without this, only the
+                // argument that actually breaks moved (via
+                // `print_spine_args`, below) - the head, and any args
+                // before whatever breaks, stayed flush on the call's
+                // original line.
+                let mut spans = vec![head.span()];
+                spans.extend(args.iter().map(|a| a.span()));
+                let multiline =
+                    Self::any_breaks(&spans) || args.iter().any(|a| self.expr_would_break(a));
+                let own_indent = multiline && !self.at_fresh_line();
+                if own_indent {
+                    self.indent_in();
+                    self.newline();
+                }
                 self.print_expr(head);
                 self.print_spine_args(
                     head.span(),
@@ -2187,6 +2220,9 @@ impl<'s> Printer<'s> {
                     |p, a| p.expr_would_break(a),
                     |p, a| p.print_expr(a),
                 );
+                if own_indent {
+                    self.indent_out();
+                }
             }
             Expr::Vta(f, t) => {
                 self.print_expr(f);
@@ -2519,7 +2555,7 @@ mod tests {
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = map\n  ( \\x ->\n      ( x\n          + 1\n      )\n  )\n  xs\n"
+            "module Foo where\n\nfoo =\n  map\n    ( \\x ->\n        ( x\n            + 1\n        )\n    )\n    xs\n"
         );
         assert_idempotent(src);
     }
@@ -2581,7 +2617,7 @@ mod tests {
     fn array_item_that_would_break_on_its_own_expands_the_whole_array() {
         let src = "module Foo where\n\nfoo = [a b, c\n d]\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  [ a b\n  , c\n      d\n  ]\n");
+        assert_eq!(out, "module Foo where\n\nfoo =\n  [ a b\n  ,\n      c\n        d\n  ]\n");
         assert_idempotent(src);
     }
 
@@ -2597,38 +2633,37 @@ mod tests {
     fn app_expands_one_arg_per_line_when_source_has_a_newline_between_args() {
         let src = "module Foo where\n\nfoo = bar\n  baz\n  qux\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = bar\n  baz\n  qux\n");
+        assert_eq!(out, "module Foo where\n\nfoo =\n  bar\n    baz\n    qux\n");
         assert_idempotent(src);
     }
 
-    /// Regression test: only the arguments *after* the point a call's source
-    /// first breaks should move onto their own line, not every argument -
-    /// `bar` stays glued to `foo` since nothing forces it apart, but once
-    /// `baz` breaks from `bar`, `baz` and `qux` both get their own line
-    /// (`print_spine_args`'s existing "once broken, stay broken" rule,
-    /// which `Expr::App` previously bypassed with its own all-or-nothing
-    /// `any_breaks` check over the whole spine).
+    /// Regression test: a call glued right after `=` that ends up printing
+    /// across multiple lines relocates entirely - head included - onto its
+    /// own indented line, the same way `list()`'s `own_indent` already does
+    /// for a glued `Array`/`Record` (`Expr::App` previously left its head
+    /// flush glued to `=`/whatever precedes it, only pushing the arguments
+    /// after the break onto their own line via `print_spine_args`'s
+    /// existing "once broken, stay broken" rule).
     #[test]
     fn app_only_pushes_args_after_the_first_break_onto_their_own_line() {
         let src = "module Foo where\n\nfoo = a b\n  c d\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = a b\n  c\n  d\n");
+        assert_eq!(out, "module Foo where\n\nfoo =\n  a b\n    c\n    d\n");
         assert_idempotent(src);
     }
 
     /// Regression test: an argument that's itself going to print across
     /// multiple lines (here, a `Paren` wrapping a call that breaks) forces
-    /// the same "push this and everything after onto its own line"
-    /// treatment as a real source break would, even with no source break of
-    /// its own before it - `foo`'s own head/call was previously left glued
-    /// flat in this case, only breaking *inside* the paren, which made the
-    /// paren's closing `)` and the following argument look like they never
-    /// left the call's own line.
+    /// the same relocation as a real source break would, even with no
+    /// source break of its own before it - `foo`'s own head/call was
+    /// previously left glued flat in this case, only breaking *inside* the
+    /// paren, which made the paren's closing `)` and the following argument
+    /// look like they never left the call's own line.
     #[test]
     fn app_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
         let src = "module Foo where\n\nfoo = a (b\nc) d\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = a\n  ( b\n      c\n  )\n  d\n");
+        assert_eq!(out, "module Foo where\n\nfoo =\n  a\n    ( b\n        c\n    )\n    d\n");
         assert_idempotent(src);
     }
 
@@ -2640,7 +2675,23 @@ mod tests {
     fn app_record_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
         let src = "module Foo where\n\nfoo = a { x: 1\n, y: 2 } d\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = a\n  { x: 1\n  , y: 2\n  }\n  d\n");
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo =\n  a\n    { x: 1\n    , y: 2\n    }\n    d\n"
+        );
+        assert_idempotent(src);
+    }
+
+    /// Real report: a call whose first argument stays glued (`x {}` - a
+    /// single `Expr::Update` node with zero updates, not a separate `App`
+    /// argument) followed by one that breaks (`[\na\n]`) needs the *whole*
+    /// call to relocate, not just the argument that broke - `own_indent`'s
+    /// job at every level, `App` included.
+    #[test]
+    fn app_relocates_when_a_later_glued_argument_would_break() {
+        let src = "module Foo where\n\na = x {} [\na\n]\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\na =\n  x {}\n    [ a\n    ]\n");
         assert_idempotent(src);
     }
 
@@ -2656,7 +2707,7 @@ mod tests {
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = bar\n  ( case x of\n      A -> 1\n      B -> 2\n  )\n  qux\n"
+            "module Foo where\n\nfoo =\n  bar\n    ( case x of\n        A -> 1\n        B -> 2\n    )\n    qux\n"
         );
         assert_idempotent(src);
     }
@@ -3559,8 +3610,11 @@ mod tests {
         // itself breaks (an `App` call whose argument is on its own line),
         // that break needs to land one level deeper than the chain's own
         // continuation - not at the same level, which would look like the
-        // call's argument is just another step of the chain.
-        let src = "module Foo where\n\nf rs =\n  rs\n    # List.map\n        ( \\r ->\n            r\n              # empty\n        )\n    # List.toArray\n";
+        // call's argument is just another step of the chain. The call
+        // itself (`List.map (...)`) also relocates off `#` onto its own
+        // line first, same as it would off `=` - it's glued right after an
+        // operator and ends up printing across multiple lines.
+        let src = "module Foo where\n\nf rs =\n  rs\n    #\n        List.map\n          ( \\r ->\n              r\n                # empty\n          )\n    # List.toArray\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
