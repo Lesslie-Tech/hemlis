@@ -829,6 +829,23 @@ fn simple_typ_var_bindings<'t>(p: &mut P<'t>) -> Vec<TypVarBinding> {
 }
 
 fn row_label<'t>(p: &mut P<'t>) -> Option<(Label, Typ)> {
+    // `row`'s stop condition treats a `String`/`RawString` as a possible row
+    // label start (quoted labels, e.g. `("my-label" :: Int)`), so this also
+    // has to recognize a *non*-label string - a `Typ::Str` used as an
+    // ordinary type, e.g. `Kanon.Pk ("key")` - and bail out without
+    // consuming it. Committing via `label(p)?` first and only then checking
+    // for `::` would consume the string on the way to failing, and that
+    // partial consumption doesn't roll back: `sep_until` sees this row-field
+    // attempt fail, stops, and returns an empty `Row` with the string
+    // silently gone - `typ_atom`'s `alt!` then finds the very next token is
+    // already the closing paren it wanted and never falls through to the
+    // `Typ::Paren` alternative that should have parsed it. Checking with
+    // lookahead first (matching `record_label`/`record_binder`'s existing
+    // "peek before committing" style below) avoids ever consuming on a path
+    // that doesn't pan out.
+    if !matches!(p.peek2t(), (_, Some(T::ColonColon))) {
+        return None;
+    }
     let l = label(p)?;
     kw_coloncolon(p)?;
     let t = typ(p)?;

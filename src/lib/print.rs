@@ -89,6 +89,51 @@ impl<'s> Printer<'s> {
         trimmed_len == 0 || self.out[..trimmed_len].ends_with('\n')
     }
 
+    /// The column (in characters, 0-based) of wherever printing continues
+    /// right now on the current line - i.e. how much has already been
+    /// written since the last line break. At a fresh line (see
+    /// `at_fresh_line`) this is always exactly `self.indent`, since a fresh
+    /// line consists of nothing but that many indent spaces; mid-line
+    /// (something's been glued directly onto this line - `:: `, `-> `, a
+    /// class name, ...) it's the real width of everything glued so far,
+    /// which `self.indent` alone has no memory of. See `hang_at_column` and
+    /// the "floor" model in FORMATTER.md.
+    fn current_column(&self) -> usize {
+        let last_nl = self.out.rfind('\n').map_or(0, |i| i + 1);
+        self.out[last_nl..].chars().count()
+    }
+
+    /// Runs `f` with the indent baseline set to `col` (an exact column, not
+    /// necessarily a multiple of `INDENT`) instead of whatever it currently
+    /// is, restoring the previous baseline afterward. `indent_in`/
+    /// `indent_out` calls inside `f` still add/remove `INDENT` on top of
+    /// `col` as usual - this only changes what they're relative to.
+    fn with_indent_at<R>(&mut self, col: usize, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.indent;
+        self.indent = col;
+        let r = f(self);
+        self.indent = saved;
+        r
+    }
+
+    /// `with_indent_at(current_column(), f)` - runs `f` (printing something
+    /// glued directly onto the current line: a nesting shape right after
+    /// `:: `/`-> `/`=> `) with the indent baseline set to exactly the real
+    /// column that glued prefix landed at, instead of leaving whatever
+    /// *ambient* baseline was active before the prefix was printed. The
+    /// ambient value has no memory of the prefix's own width - `:: `/`=> `
+    /// are 3 characters, `INDENT` is a fixed 2 - so a plain `indent_in`
+    /// bumping the stale ambient value lands one column short of lining up
+    /// under the glued prefix's own text once something inside `f` (e.g.
+    /// `print_spine_args`) does its own further `indent_in` when it breaks.
+    /// Call this immediately before `f` would otherwise start printing -
+    /// nothing may be written in between, or the captured column is wrong.
+    /// See the "floor" model in FORMATTER.md.
+    fn hang_glued<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let col = self.current_column();
+        self.with_indent_at(col, f)
+    }
+
     /// Break to a new line at the current indent. If we're already at the start
     /// of one (nothing but indent spaces written since the last '\n' - typically
     /// because an outer construct just broke here too, and what it's printing
@@ -112,7 +157,7 @@ impl<'s> Printer<'s> {
         }
         self.out.truncate(trimmed_len);
         self.out.push('\n');
-        for _ in 0..self.indent * INDENT {
+        for _ in 0..self.indent {
             self.out.push(' ');
         }
     }
@@ -126,11 +171,11 @@ impl<'s> Printer<'s> {
     }
 
     fn indent_in(&mut self) {
-        self.indent += 1;
+        self.indent += INDENT;
     }
 
     fn indent_out(&mut self) {
-        self.indent = self.indent.saturating_sub(1);
+        self.indent = self.indent.saturating_sub(INDENT);
         if self.at_fresh_line() {
             // The current line is nothing but indent spaces (or empty) at the
             // level we're now leaving - most commonly because a trailing
@@ -149,7 +194,7 @@ impl<'s> Printer<'s> {
     }
 
     fn write_indent(&mut self) {
-        for _ in 0..self.indent * INDENT {
+        for _ in 0..self.indent {
             self.out.push(' ');
         }
     }
@@ -183,6 +228,16 @@ impl<'s> Printer<'s> {
         for _ in 0..levels {
             self.indent_out();
         }
+        std::mem::replace(&mut self.out, saved)
+    }
+
+    /// `render_indented`'s counterpart for an exact column rather than a
+    /// level count - see `with_indent_at`. Used by `print_paren_block` so a
+    /// glued `( `'s own content hangs under its real column (however much
+    /// text it's glued after) instead of an approximate level bump.
+    fn render_at_column(&mut self, col: usize, print_inner: impl FnOnce(&mut Self)) -> String {
+        let saved = std::mem::take(&mut self.out);
+        self.with_indent_at(col, print_inner);
         std::mem::replace(&mut self.out, saved)
     }
 
@@ -251,7 +306,23 @@ impl<'s> Printer<'s> {
     /// self-relocated paren would flip that decision on the next formatting
     /// pass. The "don't move back" fix belongs at the call site that
     /// actually knows it's printing an arrow's RHS - see `print_arrow_rhs`.
-    fn print_paren_block(&mut self, print_inner: impl FnOnce(&mut Self)) {
+    ///
+    /// `is_typ` picks which of two, deliberately different, hang strategies
+    /// `inner` gets once it's decided to print as a block (see the "floor"
+    /// model in FORMATTER.md - types and values are not the same here):
+    /// - `Typ::Paren` (`is_typ = true`): `inner` hangs under the *exact
+    ///   column* right after `( `, however much text that's glued after
+    ///   (`:: `, `-> `, a class name, ...) - a type-level `::`/`=>`/`->`/`.`
+    ///   is only ever a "floor" that the very next thing glues onto; it never
+    ///   moves, so `inner`'s own hang has to account for its real width
+    ///   itself instead of approximating with a level bump.
+    /// - `Expr::Paren` (`is_typ = false`): `inner` hangs one level below
+    ///   wherever we already were, the same as always - a value's own glued
+    ///   constructs already have an established "break the glued token
+    ///   first instead" strategy (`paren_would_break` + `print_arrow_rhs`),
+    ///   so by the time this runs, whatever `(` is glued after either isn't
+    ///   going to move, or already broke onto its own fresh line.
+    fn print_paren_block(&mut self, is_typ: bool, print_inner: impl FnOnce(&mut Self)) {
         // A paren is its own bracketed context, unrelated to whatever signature
         // it happens to be nested inside - a chain inside it that was written
         // flat shouldn't inherit an enclosing broken-signature's forced
@@ -259,13 +330,26 @@ impl<'s> Printer<'s> {
         // which doesn't use `in_broken_sig`, so this is a no-op there.
         let outer_in_broken_sig = self.in_broken_sig;
         self.in_broken_sig = false;
-        let inner_text = self.render_indented(1, print_inner);
+        let open_col = self.current_column();
+        let inner_text = if is_typ {
+            self.render_at_column(open_col + 2, print_inner)
+        } else {
+            self.render_indented(1, print_inner)
+        };
         self.in_broken_sig = outer_in_broken_sig;
         self.raw("(");
         if inner_text.contains('\n') {
             self.raw(" ");
             self.raw(&inner_text);
-            self.newline();
+            if is_typ {
+                // The closing paren lines up under the opening one, not
+                // wherever this whole block happened to start - which can be
+                // a different column entirely when `(` itself was glued
+                // mid-line.
+                self.with_indent_at(open_col, Self::newline);
+            } else {
+                self.newline();
+            }
         } else {
             self.raw(&inner_text);
         }
@@ -551,21 +635,20 @@ impl<'s> Printer<'s> {
             let outer = self.in_broken_sig;
             self.in_broken_sig = true;
             // `typ` is glued directly after `:: ` here, a fixed-width raw
-            // token the indent-level counter has no memory of - so if
-            // `typ` is itself a nesting shape (`App`/`Record`/`Row`) that
-            // breaks, it needs one extra level, the same reasoning as
-            // `print_constraint`'s own hang. Not applied to an operator-
-            // chain shape (`Arr`/`Op`/`Constrained`/`Forall`): those must
-            // stay at the ambient level for their own continuations (see
-            // `print_typ_arrow_chain`'s doc comment) - adding a level here
-            // would incorrectly push every `->`/`=>` continuation deeper.
+            // token the indent baseline has no memory of - so if `typ` is
+            // itself a nesting shape (`App`/`Record`/`Row`) that breaks, it
+            // needs to hang under `typ`'s own real column (`hang_glued`),
+            // the same reasoning as `print_constraint`'s own hang. Not
+            // applied to an operator-chain shape (`Arr`/`Op`/`Constrained`/
+            // `Forall`): those must stay at the ambient level for their own
+            // continuations (see `print_typ_arrow_chain`'s doc comment) -
+            // hanging here would incorrectly push every `->`/`=>`
+            // continuation deeper.
             let needs_hang = matches!(typ, Typ::App(..) | Typ::Record(..) | Typ::Row(..));
             if needs_hang {
-                self.indent_in();
-            }
-            self.print_typ(typ);
-            if needs_hang {
-                self.indent_out();
+                self.hang_glued(|p| p.print_typ(typ));
+            } else {
+                self.print_typ(typ);
             }
             self.in_broken_sig = outer;
             self.indent_out();
@@ -622,6 +705,13 @@ impl<'s> Printer<'s> {
     /// to be - relocating into unrelated code, and (since that also changes
     /// what row this list's own surroundings appear to end on) risking a
     /// multiline decision elsewhere flipping between formatting passes.
+    /// `item_hang` gives each item, in the expanded path, one extra level
+    /// while it's being printed - for a nesting shape that itself breaks
+    /// further (most commonly an operator chain glued right after `open `/
+    /// `, `), or it looks flush with the item's own head instead of visibly
+    /// nested under it (see the loop body's own comment). Pass `false` when
+    /// the item printer already manages this itself - a record's own fields
+    /// do, via `print_record_field_rhs` - to avoid doubling up.
     #[allow(clippy::too_many_arguments)]
     fn list<T>(
         &mut self,
@@ -629,6 +719,7 @@ impl<'s> Printer<'s> {
         close: &str,
         close_span: Span,
         pad: bool,
+        item_hang: bool,
         items: &[T],
         span_of: impl Fn(&T) -> Span,
         mut print_item: impl FnMut(&mut Self, &T),
@@ -678,6 +769,16 @@ impl<'s> Printer<'s> {
             // would still stick around for every item after it, indenting them
             // one level deeper than the bracket itself. Only take our own level
             // when we're the one initiating the break.
+            //
+            // Unlike `print_row` (see its own version of this), a *value*-level
+            // list glued after something (an outer `=`, a lambda's `->`, ...)
+            // does relocate its opening bracket down a level here rather than
+            // hanging in place - values and types are deliberately different
+            // (see the "floor" model in FORMATTER.md): a value's own glued
+            // constructs already have their own established "break the glued
+            // token first instead" strategy (`paren_would_break` +
+            // `print_arrow_rhs`), so by the time `list()` runs, whatever it's
+            // glued after either isn't going to move, or already broke.
             let own_indent = !self.at_fresh_line();
             if own_indent {
                 self.indent_in();
@@ -696,7 +797,34 @@ impl<'s> Printer<'s> {
                 if i > 0 {
                     self.raw(", ");
                 }
+                // An item is glued directly after `open `/`, ` here, a
+                // fixed-width raw token the indent baseline has no memory
+                // of - so if the item itself is a nesting shape that breaks
+                // further (most commonly an operator chain: `Button.create
+                // {...}\n  # Button.isFullwidth true`), that break needs one
+                // more level than the item's own line, or it looks flush
+                // with the item's own head - or worse, easy to mistake for
+                // another sibling item at the list's own comma column -
+                // instead of visibly nested under it. Invisible when the
+                // item prints flat (no `newline()` calls inside it to see
+                // the difference). Same reasoning as
+                // `print_record_field_rhs`'s doc comment, which found the
+                // identical bug for a record field's value moving to its
+                // own line - `{ `/`, ` are exactly `INDENT` (2) characters
+                // wide too, which is exactly why the missing level here
+                // went unnoticed for plain items but not for one that itself
+                // breaks. Only for callers whose items don't already manage
+                // their own hang (`item_hang`) - a record's own fields
+                // already get exactly this treatment, branch-by-branch, from
+                // `print_record_field_rhs`, and adding another level on top
+                // here would double up on it.
+                if item_hang {
+                    self.indent_in();
+                }
                 print_item(self, item);
+                if item_hang {
+                    self.indent_out();
+                }
                 // Each item is always the last thing on its own line here (the
                 // next one, or the closing bracket, starts its own fresh
                 // `newline()`) - safe to check for a trailing comment. Without
@@ -772,6 +900,7 @@ impl<'s> Printer<'s> {
                 ")",
                 Span::zero(),
                 false,
+                true,
                 exports,
                 |e| e.span(),
                 |p, e| p.print_export(e),
@@ -915,7 +1044,16 @@ impl<'s> Printer<'s> {
             }
             self.raw(")");
         } else {
-            self.list("(", ")", Span::zero(), false, items, |x| x.span(), |p, x| p.print_import(x));
+            self.list(
+                "(",
+                ")",
+                Span::zero(),
+                false,
+                true,
+                items,
+                |x| x.span(),
+                |p, x| p.print_import(x),
+            );
         }
     }
 
@@ -949,7 +1087,16 @@ impl<'s> Printer<'s> {
         match dm {
             DataMember::All(_) => self.raw("(..)"),
             DataMember::Some(names) => {
-                self.list("(", ")", Span::zero(), false, names, |n| n.span(), |p, n| p.lit(n));
+                self.list(
+                    "(",
+                    ")",
+                    Span::zero(),
+                    false,
+                    true,
+                    names,
+                    |n| n.span(),
+                    |p, n| p.lit(n),
+                );
             }
         }
     }
@@ -1307,15 +1454,35 @@ impl<'s> Printer<'s> {
     /// deeper than the field itself, whether or not it visibly moves onto
     /// its own line - so a nested multi-branch `case`/`do` value stays
     /// visually inside the field even when glued right after `label:`/
-    /// `label =`, and a value that itself needs to move onto its own line
-    /// (an `App` chain whose argument already broke in the source, say)
-    /// moves down without losing that same extra level.
+    /// `label =`.
+    ///
+    /// The two branches need a *different* number of levels, though - one is
+    /// not just the other with a forced newline. When the value stays glued
+    /// (the `else` branch: `b: case x of`), one level is enough, because the
+    /// value's own head (`case`) is still visually attached to the label on
+    /// the same line - the one level only has to keep the value's own
+    /// further breaking (`case`'s branches) from looking like a sibling
+    /// field rather than nested content, and `case`'s own
+    /// `print_indented_siblings` hang supplies the rest. When the value
+    /// moves onto its own line entirely (the `if` branch), that visual
+    /// attachment is gone, so one level isn't enough on its own: `label:`
+    /// and `{`/`, ` are always exactly `INDENT` characters wide, so one
+    /// level places the value flush with `label`'s own column - looking
+    /// like it merely continues the label rather than nesting under it, not
+    /// visibly "one level deeper than the field" the way the doc comment
+    /// above promises. Two levels are needed there - real report:
+    /// `columnIn:\n  List.singleton\n    (...)` needs `List.singleton` a
+    /// full level past `columnIn`'s own column, with `App`'s own further
+    /// break (its own `indent_in`, for the argument that itself broke) on
+    /// top of that.
     fn print_record_field_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
         if self.paren_would_break(e) || Self::breaks_before(before, e.span()) {
             self.raw(arrow.trim_end());
             self.indent_in();
+            self.indent_in();
             self.newline();
             self.print_expr(e);
+            self.indent_out();
             self.indent_out();
         } else {
             self.raw(arrow);
@@ -1500,13 +1667,23 @@ impl<'s> Printer<'s> {
                 self.raw(")");
             }
             Binder::Array(_, items, close) => {
-                self.list("[", "]", *close, true, items, |x| x.span(), |p, x| p.print_binder(x));
+                self.list(
+                    "[",
+                    "]",
+                    *close,
+                    true,
+                    true,
+                    items,
+                    |x| x.span(),
+                    |p, x| p.print_binder(x),
+                );
             }
             Binder::Record(fields) => {
                 self.list(
                     "{",
                     "}",
                     Span::zero(),
+                    true,
                     true,
                     fields,
                     |x| x.span(),
@@ -1554,7 +1731,7 @@ impl<'s> Printer<'s> {
             }
             Typ::Hole(h) => self.lit(h),
             Typ::Paren(_, inner, _) => {
-                self.print_paren_block(|p| p.print_typ(inner));
+                self.print_paren_block(true, |p| p.print_typ(inner));
             }
             Typ::Arr(a, b) => self.print_typ_arrow_chain(a, b),
             Typ::App(..) => {
@@ -1570,6 +1747,22 @@ impl<'s> Printer<'s> {
                     || Self::any_breaks(&spans)
                     || rest.iter().any(|(_, r)| self.typ_paren_would_break(r));
                 self.print_typ(first);
+                // `in_broken_sig` means this chain is itself the flattened
+                // continuation of a signature/alias's own `::`/`=` break (see
+                // `print_typ_arrow_chain`/`print_typ_constrained_chain`), which
+                // already established the right column - adding a level here
+                // would push every operator deeper than the sibling `->`/`=>`
+                // lines it lines up with. Anywhere else (e.g. glued right after
+                // a `Typ::Paren`'s `( `, which resets `in_broken_sig` - see
+                // `print_paren_block`), there's no such column already
+                // accounted for, so the chain needs its own hang, the same way
+                // a value's operator chain (`Expr::Op`) always does - otherwise
+                // its continuation lands flush with the first operand instead
+                // of one level past the bracket it's glued to.
+                let own_hang = multiline && !self.in_broken_sig;
+                if own_hang {
+                    self.indent_in();
+                }
                 for (op, r) in &rest {
                     if multiline {
                         self.newline();
@@ -1581,6 +1774,9 @@ impl<'s> Printer<'s> {
                         self.raw(" ");
                     }
                     self.print_typ(r);
+                }
+                if own_hang {
+                    self.indent_out();
                 }
             }
             Typ::Kinded(t, k) => {
@@ -1650,17 +1846,39 @@ impl<'s> Printer<'s> {
 
     fn print_constraint(&mut self, c: &Constraint) {
         let Constraint(name, args) = c;
-        self.lit(name);
         // Unconditional hang, same reasoning as `print_record_field_rhs`: a
         // constraint's args are glued directly after its name, which is in
         // turn glued after a fixed-width raw token (`. `, `=> `) whose own
-        // width the indent-level counter has no memory of - so if the args
-        // break, they need one extra level on top of `print_spine_args`'
-        // own break-handling, or the resulting block looks shallower than
-        // the constraint's own name, not just less indented.
-        self.indent_in();
-        self.print_spine_args(name.span(), args, |a| a.span(), |p, a| p.print_typ(a));
-        self.indent_out();
+        // width the indent baseline has no memory of - so if the args
+        // break, they need to hang under `name`'s own real column (captured
+        // here, before printing it, then handed to `print_spine_args` via
+        // `with_indent_at` so *its* own break-handling adds one level on top
+        // of that, not of the stale ambient), or the resulting block looks
+        // shallower than the constraint's own name, not just less indented.
+        let name_col = self.current_column();
+        self.lit(name);
+        self.with_indent_at(name_col, |p| {
+            p.print_spine_args(name.span(), args, |a| a.span(), |p, a| p.print_typ(a));
+        });
+    }
+
+    /// Prints `t`, hung under its own real column first when `t` is a
+    /// nesting shape (`App`/`Record`/`Row`) - mirrors `print_sig_typ`'s own
+    /// `needs_hang` check, for the same reason: whatever glues directly in
+    /// front of `t` here (an arrow chain's `-> `, a constrained chain's
+    /// closing `=> `) is a fixed-width raw token the indent baseline has no
+    /// memory of, so if `t` itself breaks, it needs to hang under `t`'s own
+    /// column (`hang_glued`) or it lands shallower than that very token.
+    /// Never applied to `Arr`/`Op`/`Constrained`/`Forall` - those decide
+    /// their own indent independently, and hanging here would wrongly push
+    /// every nested `->`/`=>`/operator continuation a level deeper.
+    fn print_typ_glued(&mut self, t: &Typ) {
+        let needs_hang = matches!(t, Typ::App(..) | Typ::Record(..) | Typ::Row(..));
+        if needs_hang {
+            self.hang_glued(|p| p.print_typ(t));
+        } else {
+            self.print_typ(t);
+        }
     }
 
     /// `a -> b -> c -> ...` is parsed as a right-nested chain of `Typ::Arr`. Flatten
@@ -1670,7 +1888,8 @@ impl<'s> Printer<'s> {
     /// prints at whatever indent was already active (a bare `newline()`, no
     /// `indent_in`), the same way `Typ::Op` does; only a non-operator break (a
     /// `Typ::App` argument moving to its own line, a `Typ::Paren` block) increases
-    /// indent.
+    /// indent - via `print_typ_glued`, since each segment is glued directly after
+    /// `-> ` (or, for the first segment, `:: `/`= `).
     fn print_typ_arrow_chain(&mut self, a: &Typ, b: &Typ) {
         let mut segments = vec![a];
         let mut rest = b;
@@ -1684,7 +1903,7 @@ impl<'s> Printer<'s> {
         let multiline = self.in_broken_sig
             || Self::any_breaks(&segment_spans)
             || segments[1..].iter().any(|s| self.typ_paren_would_break(s));
-        self.print_typ(segments[0]);
+        self.print_typ_glued(segments[0]);
         for seg in &segments[1..] {
             if multiline {
                 self.newline();
@@ -1692,7 +1911,7 @@ impl<'s> Printer<'s> {
             } else {
                 self.raw(" -> ");
             }
-            self.print_typ(seg);
+            self.print_typ_glued(seg);
         }
     }
 
@@ -1730,7 +1949,7 @@ impl<'s> Printer<'s> {
         } else {
             self.raw(" => ");
         }
-        self.print_typ(body);
+        self.print_typ_glued(body);
     }
 
     /// Prints a record/row type's `open field, field | tail close` (or the
@@ -1791,14 +2010,13 @@ impl<'s> Printer<'s> {
             }
             self.raw(close);
         } else {
-            // See `list()`'s own `own_indent` for why: don't bump our own
-            // level if some outer construct already broke to a fresh line
-            // right before this call.
-            let own_indent = !self.at_fresh_line();
-            if own_indent {
-                self.indent_in();
-                self.newline();
-            }
+            // See `list()`'s own version of this for why: hang every line
+            // after `open` from the column it's about to print at, rather
+            // than relocating `open` itself to a deeper line when something
+            // (an arrow's `-> `, a class name, ...) is already glued onto
+            // this line ahead of it.
+            let saved_indent = self.indent;
+            self.indent = self.current_column();
             self.raw(open);
             self.raw(" ");
             for (i, (label, typ)) in fields.iter().enumerate() {
@@ -1827,9 +2045,7 @@ impl<'s> Printer<'s> {
             self.flush_comments_before(close_line);
             self.newline();
             self.raw(close);
-            if own_indent {
-                self.indent_out();
-            }
+            self.indent = saved_indent;
         }
 
         self.in_broken_sig = outer_in_broken_sig;
@@ -1864,7 +2080,7 @@ impl<'s> Printer<'s> {
             Expr::Hole(x) => self.lit(x),
             Expr::Section(_) => self.raw("_"),
             Expr::Paren(_, inner, _) => {
-                self.print_paren_block(|p| p.print_expr(inner));
+                self.print_paren_block(false, |p| p.print_expr(inner));
             }
             Expr::Negate(inner) => {
                 self.raw("-");
@@ -1948,6 +2164,7 @@ impl<'s> Printer<'s> {
                     "]",
                     *close,
                     true,
+                    true,
                     items,
                     |x| x.span(),
                     |p, x| p.print_expr(x),
@@ -1959,6 +2176,7 @@ impl<'s> Printer<'s> {
                     "}",
                     *close,
                     true,
+                    false,
                     fields,
                     |x| x.span(),
                     |p, x| p.print_record_label_expr(x),
@@ -2010,6 +2228,7 @@ impl<'s> Printer<'s> {
                     "}",
                     *close,
                     true,
+                    false,
                     updates,
                     |x| x.span(),
                     |p, x| p.print_record_update(x),
@@ -2120,6 +2339,7 @@ impl<'s> Printer<'s> {
                     "}",
                     Span::zero(),
                     true,
+                    false,
                     updates,
                     |x| x.span(),
                     |p, x| p.print_record_update(x),
@@ -2462,8 +2682,13 @@ mod tests {
         // Unlike `case` (see `record_field_with_case_value_hangs_one_level_deeper`,
         // which stays glued to `:`), an `App` chain whose argument already
         // broke onto its own line in the source moves the whole value down
-        // instead of gluing its head right after `label:`.
-        let src = "module Foo where\n\nf x =\n  update\n    { columnIn:\n      List.singleton\n        (Kanon.columnIn @\"type\" (relevantTypes # NonEmptyArray.map TransactionType.toStorageString))\n    , changedColumns: List.singleton (Kanon.changedColumn @\"status\")\n    }\n    tableTransaction\n";
+        // instead of gluing its head right after `label:` - and needs two
+        // levels past `columnIn`'s own row, not one (see
+        // `print_record_field_rhs`'s doc comment): one level alone puts
+        // `List.singleton` flush with `columnIn`'s own column instead of
+        // visibly nested under it, since `{ `/`columnIn:` are each exactly
+        // `INDENT` wide.
+        let src = "module Foo where\n\nf x =\n  update\n    { columnIn:\n        List.singleton\n          (Kanon.columnIn @\"type\" (relevantTypes # NonEmptyArray.map TransactionType.toStorageString))\n    , changedColumns: List.singleton (Kanon.changedColumn @\"status\")\n    }\n    tableTransaction\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -2475,11 +2700,12 @@ mod tests {
         // but once `row` prints as its own multiline block, `b` - which sits
         // on the very next source line after the row's closing paren - must
         // not glue back onto that closing line; it needs its own line at the
-        // same indent as the row block. The block also sits one level deeper
-        // than `Union` itself (`print_constraint`'s own unconditional hang) -
-        // otherwise it looks shallower than the very name it's an argument
-        // of, since the indent-level counter has no memory of `. `'s width.
-        let src = "module Foo where\n\nempty\n  :: forall a b\n   . Union a\n      ( balance :: Maybe StarBuck.StarBuck\n      , currency :: Currency\n      )\n      b\n  => Record b\nempty = x\n";
+        // same indent as the row block. The block hangs under `Union`'s own
+        // real column (`print_constraint`'s hang, via `hang_glued`) - not an
+        // approximate level bump - or it looks shallower than the very name
+        // it's an argument of, since the ambient indent baseline has no
+        // memory of `. `'s width.
+        let src = "module Foo where\n\nempty\n  :: forall a b\n   . Union a\n       ( balance :: Maybe StarBuck.StarBuck\n       , currency :: Currency\n       )\n       b\n  => Record b\nempty = x\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -2755,9 +2981,15 @@ mod tests {
     /// back" fix) that a parenthesized value gets.
     #[test]
     fn typ_paren_expands_when_source_has_a_newline_inside() {
+        // The paren's own hang lines up under its real column - right after
+        // `( `, wherever that lands once glued after `:: ` - not an
+        // approximate level bump; see the "floor" model in FORMATTER.md.
         let src = "module Foo where\n\nf :: (Int ->\n  String)\nf = undefined\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nf\n  :: ( Int\n    -> String\n  )\nf = undefined\n");
+        assert_eq!(
+            out,
+            "module Foo where\n\nf\n  :: ( Int\n       -> String\n     )\nf = undefined\n"
+        );
         assert_idempotent(src);
     }
 
@@ -2775,11 +3007,84 @@ mod tests {
     #[test]
     fn typ_app_directly_after_a_broken_sig_gets_an_extra_hang_level() {
         // `typ` is glued directly after `:: ` here (a fixed-width raw token
-        // the indent-level counter has no memory of) - if `typ` is a nesting
-        // shape (`Array { ... }`) that itself breaks, it needs one extra
-        // level, or the resulting block looks shallower than `Array` itself.
+        // the ambient indent baseline has no memory of) - if `typ` is a
+        // nesting shape (`Array { ... }`) that itself breaks, it needs to
+        // hang under `Array`'s own real column (`hang_glued`), or the
+        // resulting block looks shallower than `Array` itself.
         let src =
-            "module Foo where\n\nf\n  :: Array\n      { from :: TransactionId\n      , to :: TransactionId\n      }\nf = x\n";
+            "module Foo where\n\nf\n  :: Array\n       { from :: TransactionId\n       , to :: TransactionId\n       }\nf = x\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression test: `print_typ_arrow_chain` printed every segment with a
+    /// bare `print_typ`, unlike `print_sig_typ`'s own `needs_hang` check for
+    /// a bare (non-arrow) signature type - so a nesting shape (`Array
+    /// {...}`) that's the *first* segment of an arrow chain (glued directly
+    /// after `:: `, same as `typ_app_directly_after_a_broken_sig_gets_an_extra_hang_level`
+    /// above, just with a `-> ...` tail after it) never got its extra hang
+    /// level, landing a whole level shallower than `Array` itself instead of
+    /// past it.
+    #[test]
+    fn typ_arrow_chain_segment_gets_the_same_extra_hang_as_a_bare_sig() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "linkBraids\n",
+            "  :: Array\n",
+            "       { transaction :: TransactionId\n",
+            "       , braid :: BraidId.BraidId\n",
+            "       }\n",
+            "  -> Ctx _ _ Unit\n",
+            "linkBraids = linkBraidsSql >>> KanonCtx.runSql\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// The same missing hang, reached through `print_sig_typ`'s own
+    /// `needs_hang` branch directly (no arrow chain involved) rather than
+    /// through `print_typ_arrow_chain` - a `Typ::App` whose own argument is a
+    /// `Typ::Paren`-wrapped operator chain, glued after `:: `. `needs_hang`
+    /// hangs under `Kanon.Table`'s own real column (`hang_glued`) rather
+    /// than approximating with a level bump off the ambient baseline - see
+    /// "Session: the 'floor' model" in FORMATTER.md for why the earlier,
+    /// level-based version of this landed one column short.
+    #[test]
+    fn typ_app_paren_op_chain_directly_after_a_broken_sig_gets_an_extra_hang_level() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "tableTransactionLinkBraid\n",
+            "  :: Kanon.Table\n",
+            "       ( Kanon.Pk (\"transaction\" .. \"braid\")\n",
+            "           .. Kanon.Index \"braid\"\n",
+            "           .. Kanon.Name \"transaction_link_braid_v0\"\n",
+            "       )\n",
+            "       TransactionLinkBraidR\n",
+            "tableTransactionLinkBraid = Kanon.table @\"transaction_link_braid_v0\"\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `print_typ_constrained_chain`'s counterpart of the same fix: the
+    /// `body` after the last `=> ` is glued the same way a bare `:: `'s type
+    /// or an arrow chain's segment is, so it needs the same `print_typ_glued`
+    /// treatment when it's a nesting shape.
+    #[test]
+    fn typ_constrained_chain_body_gets_the_same_extra_hang_as_a_bare_sig() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "f\n",
+            "  :: Eq a\n",
+            "  => Array\n",
+            "       { x :: Int\n",
+            "       , y :: Int\n",
+            "       }\n",
+            "f = x\n",
+        );
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -2817,7 +3122,10 @@ mod tests {
     /// just because the *outer* declaration happened to be multiline. A
     /// paren is its own bracketed scope (like a row's braces already are;
     /// see `print_row`'s own reset) and must decide its own contents'
-    /// multiline-ness independently.
+    /// multiline-ness independently. The outer chain's own operator
+    /// continuation (`.. Kanon.Index`) gets its own hang level past the `( `
+    /// it's glued to - see `typ_op_chain_gets_its_own_hang_when_not_in_a_broken_sig`
+    /// - while the flat, nested `("company_id" .. "type")` stays untouched.
     #[test]
     fn broken_type_alias_does_not_force_a_flat_nested_paren_to_expand() {
         let src = concat!(
@@ -2825,10 +3133,82 @@ mod tests {
             "type Table =\n",
             "  Kanon.Table\n",
             "    ( Kanon.Pk \"id\"\n",
-            "      .. Kanon.Index (\"company_id\" .. \"type\")\n",
+            "        .. Kanon.Index (\"company_id\" .. \"type\")\n",
             "    )\n",
             "    Row\n",
         );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression test: a `Typ::Op` chain glued directly after a `Typ::Paren`'s
+    /// `( ` (which resets `in_broken_sig` - see `print_paren_block`) needs its
+    /// own hang level for its operator continuations, the same way `Expr::Op`
+    /// always does - without it, `.. Kanon.Index`/`.. Kanon.Name` land flush
+    /// with `Kanon.Pk`, one level shallower than they should (only as deep as
+    /// the paren's own content baseline, not past it). This is distinct from
+    /// `typ_operator_chain_does_not_add_its_own_indent`, where the chain *is*
+    /// the flattened continuation of a signature/alias's own break
+    /// (`in_broken_sig` true) and must stay flush with that break's column
+    /// instead.
+    #[test]
+    fn typ_op_chain_gets_its_own_hang_when_not_in_a_broken_sig() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "type Route =\n",
+            "  Endpoint\n",
+            "    ( Kanon.Pk \"key\"\n",
+            "        .. Kanon.Index \"transaction\"\n",
+            "        .. Kanon.Name \"transaction_link_idempotency_v0\"\n",
+            "    )\n",
+            "    TransactionLinkIdempotencyR\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Parser regression test: `Kanon.Pk ("key")` used to lose `"key"`
+    /// entirely, printing `Kanon.Pk ()`. Root cause was in `row_label`, not
+    /// the printer - `row`'s stop condition treats a `String`/`RawString` as
+    /// a possible row-label start (quoted labels like `("my-label" ::
+    /// Int)`), so parsing `("key")` first tried it as an empty row type: the
+    /// old `row_label` committed to consuming `"key"` as a label via
+    /// `label(p)?` *before* checking for the `::` that would confirm it
+    /// really was one, and that consumption didn't roll back when the `::`
+    /// check then failed. `sep_until` saw the (spuriously) failed field
+    /// attempt, stopped with zero fields, and by then `"key"` was already
+    /// gone - so the very next token looked like the closing `)` the
+    /// row-alternative wanted, and `typ_atom`'s `alt!` never got to try the
+    /// `Typ::Paren` alternative that should have parsed `"key"` as an
+    /// ordinary type. Fixed by checking for `::` with lookahead before
+    /// committing to a label at all (`row_label`, matching the existing
+    /// `record_label`/`record_binder` style) instead of consume-then-fail.
+    #[test]
+    fn paren_wrapped_string_typ_is_not_mistaken_for_an_empty_row() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "tableTransactionLinkIdempotency\n",
+            "  :: Kanon.Table\n",
+            "       ( Kanon.Pk (\"key\")\n",
+            "           .. Kanon.Index \"transaction\"\n",
+            "           .. Kanon.Name \"transaction_link_idempotency_v0\"\n",
+            "       )\n",
+            "       TransactionLinkIdempotencyR\n",
+            "tableTransactionLinkIdempotency = x\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A quoted row label immediately followed by `::` must still parse as
+    /// a label, not get rejected by the same lookahead that now bails out on
+    /// a bare string used as an ordinary type (see the test above).
+    #[test]
+    fn quoted_row_label_still_parses() {
+        let src = "module Foo where\n\ntype Foo = (\"my-label\" :: Int, normal :: String)\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -2848,11 +3228,15 @@ mod tests {
 
     #[test]
     fn row_type_expands_one_field_per_line_when_source_has_a_newline() {
+        // The row's own `(` glues flat right after `Record ` (its argument
+        // never broke from the head in the source, so `print_spine_args`
+        // never moves it) - its own fields then hang under its real column,
+        // not a level bump. See the "floor" model in FORMATTER.md.
         let src = "module Foo where\n\nf :: forall r. Record (a :: Int,\n  b :: String)\nf r = r\n";
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nf :: forall r. Record\n  ( a :: Int\n  , b :: String\n  )\nf r = r\n"
+            "module Foo where\n\nf :: forall r. Record ( a :: Int\n                      , b :: String\n                      )\nf r = r\n"
         );
         assert_idempotent(src);
     }
@@ -2873,7 +3257,90 @@ mod tests {
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nf :: forall r. Record\n  ( a :: Int\n  -- comment\n  , b :: String\n  )\nf r = r\n"
+            "module Foo where\n\nf :: forall r. Record ( a :: Int\n                      -- comment\n                      , b :: String\n                      )\nf r = r\n"
+        );
+        assert_idempotent(src);
+    }
+
+    /// Regression test for the "floor" model (see FORMATTER.md): a type-level
+    /// `::`/`=>`/`->`/`.` is only ever a floor that whatever follows it glues
+    /// onto - it never moves, no matter how much the glued thing itself goes
+    /// on to break. `print_row` used to treat "not at a fresh line" (glued
+    /// right after `=> `/`-> `) as a reason to relocate its own `{` onto a
+    /// deeper line (`indent_in` + `newline` before printing `open`) - so
+    /// `=>`/`->` ended up alone on their own line with the record moved two
+    /// levels below them, instead of staying glued with the record's own
+    /// fields hanging under its real column. Real report: a `Kanon.Pack`
+    /// constraint whose own two args correctly move to their own lines (an
+    /// `App`-argument break, unrelated and unaffected by this fix, though
+    /// also since made column-exact rather than a level approximation - see
+    /// `typ_app_directly_after_a_broken_sig_gets_an_extra_hang_level`), but
+    /// whose *constrained-chain body* (`=> { ... }`, then `-> { ... }`) kept
+    /// getting relocated.
+    #[test]
+    fn typ_record_glued_after_a_broken_sig_hangs_in_place_instead_of_moving_down() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "unpack\n",
+            "  :: forall unpacked packed\n",
+            "   . Lacks \"type_index\" packed\n",
+            "  => Kanon.Pack\n",
+            "       { balance :: Maybe StarBuck.StarBuck\n",
+            "       | unpacked\n",
+            "       }\n",
+            "       { date_transaction :: Maybe ExDate\n",
+            "       , type :: TransactionType\n",
+            "       | packed\n",
+            "       }\n",
+            "  => { date_transaction :: Maybe ExDate\n",
+            "     , type :: TransactionType\n",
+            "     , type_index :: Int\n",
+            "     | packed\n",
+            "     }\n",
+            "  -> { balance :: Maybe StarBuck.StarBuck\n",
+            "     | unpacked\n",
+            "     }\n",
+            "unpack = x\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `Typ::Paren`'s counterpart of the same fix, for `print_paren_block`:
+    /// `(` glued directly after an arrow's `-> ` hangs its own nested arrow
+    /// chain under its own first token (`c`, not an approximate level bump),
+    /// and its closing `)` lines up under its own `(` - not the outer `->`'s
+    /// floor, which can be a completely different column once `(` is glued
+    /// mid-line.
+    #[test]
+    fn typ_paren_glued_after_arrow_hangs_under_its_own_first_token() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "a\n",
+            "  :: forall b c d\n",
+            "   . b\n",
+            "  -> (c\n",
+            "      -> Int\n",
+            "      -> String)\n",
+            "  -> d\n",
+            "a x y = z\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "a\n",
+                "  :: forall b c d\n",
+                "   . b\n",
+                "  -> ( c\n",
+                "       -> Int\n",
+                "       -> String\n",
+                "     )\n",
+                "  -> d\n",
+                "a x y = z\n",
+            )
         );
         assert_idempotent(src);
     }
@@ -2881,6 +3348,35 @@ mod tests {
     #[test]
     fn multiline_operator_chain_stays_expanded() {
         let src = "module Foo where\n\nfoo =\n  a\n    >>> b\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression test: an array item glued directly after `[ `/`, ` (a
+    /// fixed-width raw token) that's itself an operator chain used to hang
+    /// its own continuation one level too shallow - `# Button.isFullwidth`
+    /// landed flush with `Button.create`'s own column instead of visibly
+    /// past it, since `[ `/`, ` are exactly `INDENT` wide (see `list()`'s
+    /// `item_hang` and its doc comment). Unlike `multiline_operator_chain_stays_expanded`
+    /// above (glued after a declaration's own `=`, which is a genuine
+    /// "floor" - nothing else competes with it at that column), a list item
+    /// needs the extra level so it isn't mistaken for a sibling item at the
+    /// list's own comma column.
+    #[test]
+    fn array_item_operator_chain_hangs_past_its_own_head() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "buttons =\n",
+            "  [ Button.create { onclick: ClickedHideModal false, children: [ Html.text \"Avbryt\" ] }\n",
+            "      # Button.isFullwidth true\n",
+            "      # Button.toHtml\n",
+            "  , Button.create { onclick: initiatedMsg, children: [ Html.text \"Klar\" ] }\n",
+            "      # Button.isPrimary\n",
+            "      # Button.isFullwidth true\n",
+            "      # Button.toHtml\n",
+            "  ]\n",
+        );
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);

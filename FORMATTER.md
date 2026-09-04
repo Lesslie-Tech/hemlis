@@ -867,6 +867,15 @@ found against now reproduces the original source byte-for-byte for the
 `Expr::Op`+`App` shape, and lands one column off (rather than a whole level
 short, or backward past the head) for the constraint/signature shape.
 
+**Correction (see "Session: closing the last column" below):** the "1
+column short, architectural limit" framing above turned out to be wrong -
+not a limit of the level-multiple scheme at all, just this session's fix
+using an *approximate* level bump (`indent_in` off the ambient baseline)
+where an *exact* one (`hang_glued`, off the real column the glued prefix
+landed at) was available all along. `print_constraint`'s hang and
+`print_sig_typ`'s `needs_hang` both hang exactly now; the gap is fully
+closed, not just narrowed.
+
 Along the way, found (but did not fix, and did not introduce) a pre-existing,
 separate bug: a comment sitting on its own line directly before an operator
 in a chain (`# Kanon.unpack\n-- comment\n# R.modify ...`) gets split onto its
@@ -882,6 +891,324 @@ directly-after-`::` case and the operator-chain-operand-that's-itself-a-
 broken-call case, both taken directly from the real report and verified
 byte-for-byte against the source they came from. Full corpus sweep re-run
 clean (1423/1423: 0 parse failures, 0 reparse failures, 0 non-idempotent).
+
+## Session: `Typ::Op`'s missing hang inside a paren
+
+A fourth real report, same shape as the previous two: `Typ::Op`'s "no extra
+indent for the chain's own continuation" rule (see "Session: operator chains
+and type formatting parity") is correct when the chain *is* the flattened
+continuation of a signature/alias's own break (`in_broken_sig` true - the
+`->`/`=>`/operator lines all line up under the same column that break
+already established), but it was applied unconditionally, including inside
+a `Typ::Paren` - which explicitly resets `in_broken_sig` to `false` on entry
+(its own bracketed scope, unrelated to whatever signature it's nested in;
+see `print_paren_block`). Reached that way, a chain like `Kanon.Pk "key" ..
+Kanon.Index "transaction" .. Kanon.Name "..."` printed its `..`
+continuations flush with `Kanon.Pk` - only as deep as the paren's own
+content baseline (established by *its* `indent_in`), never past it - instead
+of getting its own hang the way `Expr::Op` always does when glued after a
+`Paren`'s `( `.
+
+Fixed by gating the existing "no extra indent" behavior on `in_broken_sig`
+specifically, rather than applying it to every `Typ::Op`: `own_hang =
+multiline && !self.in_broken_sig`, wrapping the loop in `indent_in`/
+`indent_out` when true. This leaves the two existing, deliberately different
+conventions both correct in their own context - `type T =\n  A\n  .. B` (no
+hang, `in_broken_sig` true) and `Endpoint\n  ( Kanon.Pk ...\n      ..
+Kanon.Index ...\n  )` (own hang, `in_broken_sig` false inside the paren) -
+rather than picking one globally. One pre-existing regression test
+(`broken_type_alias_does_not_force_a_flat_nested_paren_to_expand`) had
+baked in the buggy flush indentation as its expected output and needed
+updating; one new regression test
+(`typ_op_chain_gets_its_own_hang_when_not_in_a_broken_sig`) added, taken
+directly from the real report. Full test suite (167 lib + 123 style +
+golden) and clippy clean.
+
+## Session: arrow/constrained chain segments missing their own glued hang
+
+A direct follow-up to the previous session, from two more real reports on the
+same file: a signature like `linkBraids :: Array { ... } -> Ctx _ _ Unit`
+printed the record's `{` a whole level shallower than the equivalent
+non-arrow case (`f :: Array { ... }` alone, already covered by
+`typ_app_directly_after_a_broken_sig_gets_an_extra_hang_level` and correct).
+
+Root cause: `print_sig_typ` already has a `needs_hang` check - when the type
+right after `:: ` is itself a nesting shape (`App`/`Record`/`Row`), it gets
+one extra `indent_in` before printing it, since it's glued directly after a
+fixed-width raw token (`:: `) the indent-level counter has no memory of (see
+"Session: the glued-token indent gap"). But that check only ever looks at
+the *whole* `typ` right after `::` - the moment there's an arrow in it (by
+far the common case for any function signature with more than zero
+arguments), `typ` is a `Typ::Arr`, `needs_hang` is correctly `false` (an
+arrow chain decides its own indent independently), and control passes to
+`print_typ_arrow_chain` - which prints every segment with a bare
+`print_typ`, never re-checking whether *that individual segment* is itself
+a nesting shape needing the same treatment. Same gap in
+`print_typ_constrained_chain`'s `body` (after the last `=> `).
+
+Fixed by factoring the `needs_hang` check out of `print_sig_typ` into a
+shared `print_typ_glued` helper (wraps `print_typ` in `indent_in`/
+`indent_out` exactly when `t` is `App`/`Record`/`Row`), and calling it for
+every arrow-chain segment (both the first, glued after `:: `/`= `, and every
+later one, glued after `-> `) and for the constrained chain's `body`.
+`print_sig_typ` itself wasn't touched - its own inline check already does
+the same thing for the one case it handles.
+
+This closes the *structural* gap (a full level missing) for the arrow-chain
+case. It does **not** close the residual one-column rounding gap from `:: `
+being 3 characters wide against a fixed 2-space `INDENT` - documented at the
+time as an accepted architectural limit in "Session: the glued-token indent
+gap" (later found to be wrong and fully closed - see "Session: closing the
+last column" below). The second report (`tableTransactionLinkBraid ::
+Kanon.Table ( ... ) TransactionLinkBraidR`, no arrow involved) was already
+hitting exactly that same gap through `print_sig_typ`'s existing branch,
+unrelated to this fix - a synthetic repro of it reproduces byte-for-byte one
+column short of the real report, same as the `Array {...}`-directly-after-
+`::` case already living with it.
+
+3 new regression tests, one per case above (including the constrained-chain
+`body` case, not itself reported but the same missing check).  Full suite
+(170 lib + 123 style + golden) and clippy clean.
+
+## Session: the "floor" model - types never relocate a glued bracket
+
+A direct correction to the previous two sessions' whole framing, from real
+feedback: the "glued-token indent gap" session above treated a nesting shape
+landing shallower than its glued prefix as an *architectural* limit of a
+flat, level-multiple indent scheme - "1 column short, not fixable by another
+`indent_in`". That framing was wrong for the actual bug it was papering
+over. The real, deeper bug: `print_row` (and `list()`, and
+`print_paren_block`) treated "not at a fresh line" (i.e. something's
+already glued onto this line - `=> `, `-> `, a class name) as a reason to
+**relocate** their own opening bracket onto a fresh, deeper line
+(`indent_in` + `newline` before printing `open`) - so `Kanon.Pack`'s
+constrained-chain body (`=> { date_transaction :: ... }`) printed as `=>`
+alone on its own line, with the record moved two levels below it, instead
+of staying glued with its own fields hanging under its real column.
+
+The key insight (the user's own framing, kept verbatim because it's the
+right mental model going forward): **values and types are fundamentally
+different here.** A value's `=`/`->`/`<-` can and does move to its own line
+when what follows would otherwise look bad glued (`paren_would_break` +
+`print_arrow_rhs`'s "don't let a subexpression move back" fix, see that
+session above) - relocating the *operator* is how values solve this. A
+type's `::`/`=>`/`->`/`.` never works that way: it is only ever a **floor**
+that whatever comes right after it glues onto, permanently, no matter how
+much that thing goes on to expand internally. The floor itself never moves;
+only what a glued, expanding construct's *own* continuation lines hang from
+changes - and it has to hang from the construct's real, exact column (`( `
+or `{ ` might be glued after `-> `, `Array `, a class name, anything), not
+an approximate level bump, or it's the exact same "lands shallower than its
+own prefix" bug in a different shape.
+
+Implementation: `Printer::indent` changed meaning, from "level count,
+multiplied by `INDENT` at write time" to "raw column count directly"
+(`indent_in`/`indent_out` now add/subtract `INDENT` themselves; `newline`/
+`write_indent` no longer multiply). This is exactly behavior-preserving for
+every existing `indent_in`/`indent_out` pair (a level was always exactly
+`INDENT` columns from a base of 0), confirmed by running the full suite
+before touching any call site. Added `current_column()` (how much of the
+current line has actually been written - equal to `self.indent` at a fresh
+line, since a fresh line is nothing *but* that many indent spaces, but
+otherwise the real glued width `self.indent` alone has no memory of) and
+`with_indent_at`/`render_at_column` (run something with the indent baseline
+temporarily set to an exact column instead of an `indent_in` bump).
+
+Then, for `print_row`'s and `print_paren_block`'s multiline branches
+specifically (both reachable from `Typ::Record`/`Typ::Row`/`Typ::Paren`,
+i.e. types only): stop relocating `open`/`(` to a fresh deeper line when
+not already at a fresh one - always glue in place, and set the indent
+baseline to `current_column()` (for `print_row`) or `current_column() + 2`
+i.e. right after `"( "` (for `print_paren_block`) before printing anything
+else, so every following line (each field, the closing bracket) hangs under
+the real glued column. `print_paren_block`'s closing `)` needed its own
+separate fix on top: it has to line up under `(`'s own column specifically,
+which can differ from wherever the whole block started once `(` itself was
+glued mid-line - not the ambient level from before the block, which is what
+it used unconditionally before.
+
+`list()` (the value-level counterpart, used by `Expr::Array`/`Expr::Record`/
+import-export lists/data constructors) was **not** touched, and
+`print_paren_block` only takes the new column-hanging path for
+`Typ::Paren` (a new `is_typ: bool` parameter distinguishes the two) - it
+still relocates for `Expr::Paren`, per the values-vs-types distinction
+above. A first pass touched `list()` too and broke `foo = [1,\n  2, 3]` →
+`foo =\n  [ 1\n  ...` (a real, already-tested value convention) into staying
+glued flat instead; reverted once the values/types distinction became
+clear, confirmed by the fact that reverting it was the only change needed
+to get every `Expr`-side regression test passing again unmodified.
+
+This does **not** touch the "glued-token indent gap" session's own fix
+(`print_constraint`'s hang, `print_sig_typ`'s `needs_hang`, `Expr::Op`'s
+per-operand hang) - those cover a *different* situation (an `App`/
+constraint argument that legitimately moves to its own fresh line because
+it broke from its head in the source - `Kanon.Pack`'s own two arguments in
+the regression test below, which correctly still move down one level each,
+unaffected). At the time this session was written, that session's "1 column
+short of `purs-tidy`, an architectural limit" framing was assumed to still
+hold for that mechanism, as a real but separate, smaller gap. It didn't -
+see "Session: closing the last column" immediately below, which closes it
+using the exact same `hang_glued` primitive this session introduced.
+
+2 new regression tests: the `Kanon.Pack`/`unpack` signature from the real
+report (constrained-chain body staying glued, not relocating), and a
+`Typ::Paren` glued after `->` with its own nested arrow chain, taken from
+the "floor" model's own worked example. 3 pre-existing tests needed their
+expected output updated to the new, more precise column-exact alignment
+(`row_type_expands_one_field_per_line_when_source_has_a_newline`,
+`comment_inside_a_multiline_row_stays_attached_to_its_own_field`,
+`typ_paren_expands_when_source_has_a_newline_inside`) - all three are
+strictly *more* correct now (exact column alignment under the paren's own
+first token, matching real `purs-tidy` byte-for-byte instead of the
+previous level-based approximation), not regressions. Full suite (172 lib +
+123 style + golden) and clippy clean.
+
+## Session: closing the last column
+
+A direct follow-up to the "floor" model session above: told to fix the
+remaining one-column gap on `print_constraint`'s hang and `print_sig_typ`'s
+`needs_hang` (`Kanon.Pack`'s own two arguments, `Array {...}`/`Kanon.Table
+( ... )` directly after `:: `) rather than accept it as an architectural
+limit.
+
+It wasn't one. Both sites used a blind `self.indent_in()` to approximate "one
+level past the glued prefix" - bumping whatever the *ambient* baseline
+happened to be before the prefix (`. `/`=> `/`:: `) was even printed, which
+has no memory of that prefix's actual width (3 characters, not `INDENT`'s
+2). The fix already had everything needed to do this exactly instead of
+approximately: `hang_glued` (`with_indent_at(current_column(), f)`, both new
+in the previous session) captures the *real* column right where the glued
+name/type is about to start, and hands that to `f` as the new baseline -
+so when `print_spine_args` (or `print_row`, for a bare `Record`/`Array`
+argument) does its own subsequent `indent_in` on breaking, it's adding one
+level to the *real* glued position, not a stale approximation of it.
+
+Three call sites changed to use it: `print_sig_typ`'s `needs_hang` branch
+(captures the column right after `self.raw(":: ")`, before `self.print_typ
+(typ)`), `print_typ_glued` (same thing, right after an arrow chain's `-> `
+or a constrained chain's `=> `), and `print_constraint` (captures the
+column *before* printing `name` itself, since `args`' hang needs to build on
+`name`'s own starting column, not wherever printing `name` happens to end
+up - `with_indent_at(name_col, ...)` wraps the call to `print_spine_args`
+directly, replacing the constraint's own separate `indent_in`/`indent_out`
+pair, so there's exactly one level added on top of `name_col`, not two
+stacked approximations).
+
+Every previously-"off by one column" case now reproduces the real report's
+expected output byte-for-byte: `Kanon.Pack`'s own two arguments, `Array
+{...}` directly after `::`, `Array {...}` as an arrow-chain's first segment,
+`Kanon.Table ( ... )`, and `Union a (row) b`'s row argument. 6 pre-existing
+tests updated to the new (exact, one column deeper) expected output - each
+verified idempotent and stable on its own new output before updating, not
+just asserted. No new regression tests needed - the existing ones already
+covered every affected call site precisely; they just had the old,
+approximate expected values baked in. Full suite (172 lib + 123 style +
+golden) and clippy clean.
+
+## Session: a parser data-loss bug, and a record field's missing second level
+
+Two unrelated real reports.
+
+**`Kanon.Pk ("key")` printed as `Kanon.Pk ()` - `"key"` vanished entirely.**
+Not a printer bug at all - a parser one, in `row_label`. `row`'s stop
+condition (`sep_until`'s `f` argument) treats a `String`/`RawString` as a
+possible row-label start, since PureScript allows quoted row labels
+(`("my-label" :: Int)`). Old `row_label` committed to consuming the string
+via `label(p)?` *before* checking for the `::` that would confirm it really
+was a label, and that consumption never rolled back when the `::` check
+then failed. So parsing `("key")` as a type (not a label): `label(p)?`
+eats `"key"`, `kw_coloncolon(p)?` fails (next token is `)`, not `::`),
+`row_label` returns `None` - but `"key"` is already gone. `sep_until` sees
+the (spuriously) failed field attempt, stops with zero fields, and by then
+the very next token looks like the closing `)` the row-alternative wanted -
+so `typ_atom`'s `alt!` never falls through to try `Typ::Paren`, which is
+what should have parsed `"key"` as an ordinary string type. Fixed by
+checking for `::` with lookahead (`peek2t`) *before* committing to a label
+at all, matching the existing `record_label`/`record_binder` "peek before
+committing" style elsewhere in the parser - safer than the alternative
+(rolling back position + `p.errors` on failure) and consistent with how the
+rest of the parser already avoids exactly this class of bug. Verified
+quoted row labels immediately followed by `::` still parse correctly (the
+lookahead's only job is telling those two cases apart).
+
+**A record field's value moved to its own line still looked one level
+shallower than it should.** `print_record_field_rhs` gives a field's value
+one extra level whether it stays glued (`b: case x of`) or moves to its own
+line (`columnIn:\n  List.singleton\n    (...)`) - but those two cases
+actually need a *different* number of levels, and using the same one for
+both was the bug. When the value stays glued, the value's own head is still
+visually attached to the label on the same line, so one level is enough -
+it only has to keep the value's own further breaking from looking like a
+sibling field, and the value's own hang (`case`'s `print_indented_siblings`,
+say) supplies the rest. When the value moves onto its own line entirely,
+that visual attachment is gone: `{ `/`, ` and a label followed by `:` are
+each coincidentally exactly `INDENT` (2) characters wide, so one level
+placed the value *flush with the label's own column* - satisfying "one
+level past the ambient row" while looking like it merely continues the
+label rather than nesting under it. Two levels are needed there. Fixed by
+adding a second `indent_in`/`indent_out` pair, but only in the
+force-newline branch - the glued branch is untouched, and stays correct at
+one level (verified against both existing `case`/record-update regression
+tests, which still pass unmodified). 1 pre-existing test
+(`record_field_moves_to_its_own_line_when_its_value_already_broke_in_source`)
+needed its expected value updated to the new, two-level-deeper output -
+verified idempotent and stable on its own new output before updating.
+
+A `label_col`/`hang_glued`-based version of the second fix was tried first
+(mirroring the "closing the last column" session's approach) and reverted:
+it broke both `case`/record-update tests by *also* raising the glued
+branch's level, since `label_col` happens to equal what the glued branch's
+existing one-level hang already produces (again because of the `{ `/`, `
+width coincidence) - conflating "the value's own column" with "one level
+past it" for that branch. The two branches needed genuinely different
+fixes, not one shared primitive; simply adding a second `indent_in` to the
+one branch that needed it was both correct and simpler.
+
+Full suite (174 lib + 123 style + golden) and clippy clean.
+
+## Session: the same missing level, for list items
+
+A direct follow-up to the previous session's record-field fix, same
+symptom, different call site: `list()` (`Expr::Array`/`Binder::Array`/
+import-export lists/data constructors) glues each expanded item directly
+after `open `/`, ` - a fixed-width raw token the indent baseline has no
+memory of - and an item that's itself a nesting shape needing to break
+further (an operator chain, most commonly: `Button.create {...}\n  #
+Button.isFullwidth true`) landed one level too shallow, for exactly the
+same reason as the record field bug: `[ `/`, ` are each coincidentally
+`INDENT` (2) characters wide, so the item's own construct's existing hang
+mechanism (here, `Expr::Op`'s always-hang-one-level design) put its
+continuation flush with the item's own head instead of visibly nested
+under it.
+
+Unlike the record-field fix, this one is *not* about `Expr::Op` itself -
+`multiline_operator_chain_flat_after_equals_stays_flat` (`foo = a\n  >>>
+b`) already validates that an operator chain glued directly after a
+declaration's own `=` correctly uses exactly one level, no more - `=` is a
+genuine "floor" there (see the "floor" model), nothing else competes with
+it at that column. A list item is different: it's one of several *siblings*
+sharing the same comma column, so its own further-breaking content needs
+the extra level to avoid looking like a new sibling item rather than
+nested continuation - the same distinction the record-field session drew
+between a value that's the sole RHS of a field versus one of several field
+values.
+
+Fixed with a new `item_hang: bool` parameter on `list()`, wrapping each
+expanded item's own printing in an extra `indent_in`/`indent_out` pair when
+true (invisible when the item never calls `newline()` itself, exactly the
+established "invisible when flat, stacks when it breaks" shape used
+everywhere else in this printer). Set `true` for callers whose items don't
+already manage their own hang - `Expr::Array`/`Binder::Array`, import/
+export lists, data constructor members - and `false` for every
+`Record`-family caller (`Expr::Record`, `Expr::Update`,
+`RecordUpdate::Branch`, `Binder::Record`), which already gets exactly this
+treatment, branch-by-branch, from `print_record_field_rhs` - a first
+attempt applied the wrap unconditionally inside `list()` itself and broke
+all three `case`/record-update regression tests by doubling up on that
+existing mechanism.
+
+1 new regression test, taken directly from the real report. Full suite
+(175 lib + 123 style + golden) and clippy clean.
 
 ## Testing
 
