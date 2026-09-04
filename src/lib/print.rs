@@ -1654,6 +1654,42 @@ impl<'s> Printer<'s> {
         self.print_indented_siblings(bindings, |b| b.span(), |p, b| p.print_let_binding(b));
     }
 
+    /// True if printing `b` at the current indent produces any line break at
+    /// all - the `LetBinding` counterpart of `expr_would_break`, used by
+    /// `print_let_kw_bindings` to decide whether a single binding can stay
+    /// glued to `let` (its RHS might still be a `case`/`do`/`let` that always
+    /// prints multiline regardless of source layout, which rules that out).
+    fn let_binding_would_break(&mut self, b: &LetBinding) -> bool {
+        let comment_idx_before = self.comment_idx;
+        let would_break = self.render_indented(0, |p| p.print_let_binding(b)).contains('\n');
+        self.comment_idx = comment_idx_before;
+        would_break
+    }
+
+    /// Prints a `let`-block's bindings right after the `let` keyword itself -
+    /// used by `Expr::Let` and `DoStmt::Let`, where (unlike `where`, which
+    /// always uses `print_let_bindings`' one-per-line indented block) the
+    /// source commonly writes a single simple binding glued flat on the same
+    /// line (`let a = 1`). Stays glued when there's exactly one binding, the
+    /// source had it starting on `let`'s own line, and printing it doesn't
+    /// itself force a line break (e.g. a nested `case`/`do`/`let` RHS always
+    /// does, regardless of source layout); otherwise falls back to
+    /// `print_let_bindings`'s indented block, same as `where`. Returns
+    /// whether it glued - `Expr::Let` needs that to decide whether `in`
+    /// itself can stay glued to the same line too (`let x = 1 in x`) or
+    /// needs its own fresh line below the bindings block.
+    fn print_let_kw_bindings(&mut self, let_span: Span, bindings: &[LetBinding]) -> bool {
+        if let [only] = bindings {
+            if !Self::breaks_before(let_span, only.span()) && !self.let_binding_would_break(only) {
+                self.raw(" ");
+                self.print_let_binding(only);
+                return true;
+            }
+        }
+        self.print_let_bindings(bindings);
+        false
+    }
+
     /// The body of `print_indented_siblings`, without the indent_in()/
     /// indent_out() pair around it - for a caller (`Expr::Ado`) that needs to
     /// keep the same indent level active across the sibling list *and*
@@ -2369,10 +2405,18 @@ impl<'s> Printer<'s> {
                 self.print_expr(result);
                 self.indent_out();
             }
-            Expr::Let(_, bindings, body) => {
+            Expr::Let(kw, bindings, body) => {
                 self.raw("let");
-                self.print_let_bindings(bindings);
-                self.newline();
+                let glued = self.print_let_kw_bindings(*kw, bindings);
+                // A glued single binding (`let x = 1`) stays on one line
+                // with `in` too - only a bindings block that actually broke
+                // onto its own indented lines needs `in` pushed onto a fresh
+                // line below it.
+                if glued {
+                    self.raw(" ");
+                } else {
+                    self.newline();
+                }
                 self.raw("in");
                 // There's no separate span for the `in` keyword itself (the parser
                 // doesn't capture one), but it always sits on the line right after
@@ -2422,9 +2466,9 @@ impl<'s> Printer<'s> {
                 self.print_binder(b);
                 self.print_arrow_rhs(b.span(), " <- ", e);
             }
-            DoStmt::Let(_, bindings) => {
+            DoStmt::Let(kw, bindings) => {
                 self.raw("let");
-                self.print_let_bindings(bindings);
+                self.print_let_kw_bindings(*kw, bindings);
             }
         }
     }
@@ -2935,7 +2979,36 @@ mod tests {
     fn let_in() {
         let src = "module Foo where\n\nfoo = let x = 1 in x\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = let\n  x = 1\nin x\n");
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn let_single_binding_stays_glued_in_do_block() {
+        // Regression test: a single simple `let` binding that sat glued flat
+        // on `let`'s own source line used to always break onto its own
+        // indented line (`let\n  a = 1`) even though nothing about it needed
+        // to - now it only breaks when the source did, or the binding's own
+        // RHS forces a break (e.g. a nested `case`/`do`).
+        let src = "module A where\n\na =\n  do\n    let a = 1\n    pure a\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn let_multiple_bindings_still_break() {
+        let src = "module A where\n\na = do\n  let\n    x = 1\n    y = 2\n  pure (x + y)\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn let_binding_on_its_own_source_line_still_breaks() {
+        let src = "module A where\n\na = do\n  let\n    x = 1\n  pure x\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
         assert_idempotent(src);
     }
 
