@@ -1280,6 +1280,68 @@ old expected value was capturing this exact bug). 3 new regression tests,
 `Record`/`Paren` generalization. Full suite (178 lib + 123 style + golden)
 and clippy clean.
 
+## Session: `list()`'s multiline decision missed two cases, both losing content-shape fidelity
+
+Two related reports against `list()` (`Expr::Array`/`Expr::Record`/
+`Expr::Update`/`Binder::Array` - anything printed as `open item, ...
+close`), both a variant of the same root problem: `list()` only ever
+decided "expand to one-item-per-line" from `any_breaks` over adjacent
+*item* spans, which two shapes can defeat entirely.
+
+1. An **empty** list has no items to carry a break between, so
+   `any_breaks(&[])` is always `false`, no matter what the source did
+   between the brackets. Real report: `a = [\n]` (a source newline
+   between `[` and `]`, no items) collapsed to `a = []`, silently
+   discarding that the source had deliberately spread the brackets across
+   two lines.
+2. An item with **no break around it** can still be going to print across
+   multiple lines all on its own - an `App` whose own spine breaks, an
+   operator chain. Real report: `[a b, c\n d]` (`c`/`d` is one item, an
+   `App` that itself breaks; nothing breaks *between* it and the first
+   item) formatted as `[ a b, c\n d ]` - the array itself never visibly
+   switched to the expanded style, so the second item's own internal
+   break looked like a stray mid-line indent instead of a properly
+   nested, comma-led item.
+
+Fixed both by generalizing `multiline`'s definition, the same way the
+previous session generalized `Expr::App`'s: alongside `any_breaks`, check
+whether any item would print across multiple lines on its own (rendered
+in isolation and inspected for a line break, exactly `expr_would_break`'s
+idea, inlined here since `list()` is generic over `T` and already owns
+`print_item`), and additionally - since that adds nothing when there are
+no items at all - whether the two bracket tokens themselves have a source
+break between them. Once `multiline` is `true` for either reason, the
+existing expanded-style code handles an empty item list correctly with
+no further changes: the item loop is simply zero iterations, and
+`own_indent`'s existing relocate-under-`=`/`->` logic and the trailing
+`raw(" ")`-then-`newline()` trim already produce exactly `[\n]`'s hanging
+shape for free.
+
+Needed a new `open_span: Span` parameter (existing `close_span`'s
+counterpart, same `Span::zero()`-means-unavailable convention) purely to
+detect case 1 - `any_breaks`/the per-item render check both need at least
+one item to see anything, so the empty case has no other way to know the
+brackets weren't adjacent in the source. Left as `Span::zero()` at the
+few call sites with no real open-bracket span on hand (export lists,
+import name lists, data constructor members, `Binder::Record`,
+`RecordUpdate::Branch`) - the empty-with-a-newline case simply isn't
+caught there, same as it already wasn't for `close_span`-less callers.
+
+Unlike the `Typ::App`/`print_constraint` split from the previous session,
+this generalization needed no such split: `list()` is exclusively a
+value-side (`Expr`/`Binder`) construct - there's no `Typ` counterpart
+using it (`Typ` has its own `print_row`/`print_paren_block`, which hang
+in place per the "floor" model) - so there was no competing "hang in
+place instead of relocating" convention to fight, and the full test suite
+passed with no test needing to change, only new ones added.
+
+3 new regression tests: one for the empty-brackets case, one for the
+would-break item case (both taken directly from the real reports), plus
+manual spot-checks confirming ordinary empty (`[]`, `{}`) and
+single-item-with-a-trailing-newline (`{ x: 1\n}`) lists correctly stay
+flat - this change only ever adds an expansion trigger, never removes
+one. Full suite (180 lib + 123 style + golden) and clippy clean.
+
 ## Testing
 
 - `cargo test --lib print::` — the real test suite, 53 tests in

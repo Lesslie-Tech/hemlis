@@ -711,19 +711,23 @@ impl<'s> Printer<'s> {
     /// `pad` adds a space just inside the brackets on the flat (single-line) path,
     /// e.g. `{ a: 1, b: 2 }` vs `[1, 2, 3]`. The expanded path is always padded,
     /// since the leading-comma layout needs the space regardless.
-    /// `close_span` is the closing bracket's own span, when the caller has
-    /// one available (pass `Span::zero()` otherwise, e.g. export/import
+    /// `open_span`/`close_span` are the brackets' own spans, when the caller
+    /// has them available (pass `Span::zero()` otherwise, e.g. export/import
     /// lists - `Span::zero().lo()` is `(0, 0)`, so the flush below simply
-    /// never finds anything to do). Used to flush a comment that sits after
-    /// the last item but before the close, which nothing else here would
-    /// ever reach otherwise - not `flush_comments_before(next item's line)`
-    /// (there's no next item) and not `flush_trailing_comment` (only fires
-    /// for a comment sharing the *last item's own* line, not one on its own
-    /// separate line still before the close). Left unflushed, such a comment
-    /// rides past this whole list to wherever the next flush point happens
-    /// to be - relocating into unrelated code, and (since that also changes
-    /// what row this list's own surroundings appear to end on) risking a
-    /// multiline decision elsewhere flipping between formatting passes.
+    /// never finds anything to do). `close_span` is used to flush a comment
+    /// that sits after the last item but before the close, which nothing
+    /// else here would ever reach otherwise - not `flush_comments_before(next
+    /// item's line)` (there's no next item) and not `flush_trailing_comment`
+    /// (only fires for a comment sharing the *last item's own* line, not one
+    /// on its own separate line still before the close). Left unflushed,
+    /// such a comment rides past this whole list to wherever the next flush
+    /// point happens to be - relocating into unrelated code, and (since that
+    /// also changes what row this list's own surroundings appear to end on)
+    /// risking a multiline decision elsewhere flipping between formatting
+    /// passes. `open_span` is used only to detect a source break between the
+    /// brackets when there are *no* items to otherwise carry one (see below).
+    /// Like `close_span`, pass `Span::zero()` there too when unavailable,
+    /// which simply never matches.
     /// `item_hang` gives each item, in the expanded path, one extra level
     /// while it's being printed - for a nesting shape that itself breaks
     /// further (most commonly an operator chain glued right after `open `/
@@ -736,6 +740,7 @@ impl<'s> Printer<'s> {
         &mut self,
         open: &str,
         close: &str,
+        open_span: Span,
         close_span: Span,
         pad: bool,
         item_hang: bool,
@@ -743,17 +748,51 @@ impl<'s> Printer<'s> {
         span_of: impl Fn(&T) -> Span,
         mut print_item: impl FnMut(&mut Self, &T),
     ) {
-        if items.is_empty() {
-            self.raw(open);
-            self.flush_comments_before(close_span.lo().0);
-            self.raw(close);
-            return;
+        let spans: Vec<Span> = items.iter().map(&span_of).collect();
+        // A source break between adjacent items isn't the only thing that
+        // should switch this list to the expanded, one-per-line style: an
+        // item can have no such break before or after it and still be going
+        // to print across multiple lines all on its own (an `App` whose own
+        // spine breaks, an operator chain, ...) - real report:
+        // `[a b, c\n d]` (no break around the second item's own span, which
+        // itself starts on the same line as the first item's comma) stayed
+        // glued flat with the second item's own internal break looking like
+        // it randomly indented mid-line, instead of switching the whole
+        // list to the expanded style the way a source break between items
+        // would. Checked the same way `expr_would_break` decides this for
+        // `Expr::App`'s own arguments: render the item in isolation and see
+        // whether anything in it actually broke - a pure function of the
+        // item's own content, not its source span.
+        let mut multiline = Self::any_breaks(&spans);
+        if !multiline {
+            for item in items {
+                let comment_idx_before = self.comment_idx;
+                let would_break = self.render_indented(0, |p| print_item(p, item)).contains('\n');
+                self.comment_idx = comment_idx_before;
+                if would_break {
+                    multiline = true;
+                    break;
+                }
+            }
+        }
+        // An empty list has no items to carry a break between - but the
+        // brackets themselves can still have one between them in the
+        // source (`[\n]`), which a plain `any_breaks`/`would_break` check
+        // over zero items can never see. Left unhandled, that source break
+        // was silently dropped: `a = [\n]` collapsed to `a = []`, instead of
+        // preserving the same expanded, own-line bracket style a nonempty
+        // multiline list gets.
+        if items.is_empty() && open_span != Span::zero() {
+            multiline = multiline || Self::breaks_before(open_span, close_span);
         }
 
-        let spans: Vec<Span> = items.iter().map(&span_of).collect();
-        let multiline = Self::any_breaks(&spans);
-
         if !multiline {
+            if items.is_empty() {
+                self.raw(open);
+                self.flush_comments_before(close_span.lo().0);
+                self.raw(close);
+                return;
+            }
             // Deliberately no `flush_trailing_comment` call in this branch,
             // unlike the multiline one below: with several items sharing one
             // physical line, "a pending comment starts on this item's own hi()
@@ -918,6 +957,7 @@ impl<'s> Printer<'s> {
                 "(",
                 ")",
                 Span::zero(),
+                Span::zero(),
                 false,
                 true,
                 exports,
@@ -1067,6 +1107,7 @@ impl<'s> Printer<'s> {
                 "(",
                 ")",
                 Span::zero(),
+                Span::zero(),
                 false,
                 true,
                 items,
@@ -1109,6 +1150,7 @@ impl<'s> Printer<'s> {
                 self.list(
                     "(",
                     ")",
+                    Span::zero(),
                     Span::zero(),
                     false,
                     true,
@@ -1685,10 +1727,11 @@ impl<'s> Printer<'s> {
                 self.print_binder(inner);
                 self.raw(")");
             }
-            Binder::Array(_, items, close) => {
+            Binder::Array(open, items, close) => {
                 self.list(
                     "[",
                     "]",
+                    *open,
                     *close,
                     true,
                     true,
@@ -1701,6 +1744,7 @@ impl<'s> Printer<'s> {
                 self.list(
                     "{",
                     "}",
+                    Span::zero(),
                     Span::zero(),
                     true,
                     true,
@@ -2191,10 +2235,11 @@ impl<'s> Printer<'s> {
                     self.lit(l);
                 }
             }
-            Expr::Array(_, items, close) => {
+            Expr::Array(open, items, close) => {
                 self.list(
                     "[",
                     "]",
+                    *open,
                     *close,
                     true,
                     true,
@@ -2203,10 +2248,11 @@ impl<'s> Printer<'s> {
                     |p, x| p.print_expr(x),
                 );
             }
-            Expr::Record(_, fields, close) => {
+            Expr::Record(open, fields, close) => {
                 self.list(
                     "{",
                     "}",
+                    *open,
                     *close,
                     true,
                     false,
@@ -2253,12 +2299,13 @@ impl<'s> Printer<'s> {
                 self.raw("` ");
                 self.print_expr(r);
             }
-            Expr::Update(target, _, updates, close) => {
+            Expr::Update(target, open, updates, close) => {
                 self.print_expr(target);
                 self.raw(" ");
                 self.list(
                     "{",
                     "}",
+                    *open,
                     *close,
                     true,
                     false,
@@ -2370,6 +2417,7 @@ impl<'s> Printer<'s> {
                 self.list(
                     "{",
                     "}",
+                    Span::zero(),
                     Span::zero(),
                     true,
                     false,
@@ -2508,6 +2556,32 @@ mod tests {
         let src = "module Foo where\n\nfoo = [1,\n  2, 3]\n";
         let out = fmt(src);
         assert_eq!(out, "module Foo where\n\nfoo =\n  [ 1\n  , 2\n  , 3\n  ]\n");
+        assert_idempotent(src);
+    }
+
+    /// Regression test: an empty array with a source newline between its
+    /// brackets is a multiline array too, even with no items to carry the
+    /// break - `list()`'s empty-items fast path used to ignore this
+    /// entirely and always collapse to `[]`.
+    #[test]
+    fn empty_array_with_a_newline_between_the_brackets_stays_expanded() {
+        let src = "module Foo where\n\nfoo = [\n]\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo =\n  [\n  ]\n");
+        assert_idempotent(src);
+    }
+
+    /// Regression test: an item with no source break around it can still be
+    /// going to print across multiple lines all on its own (here, `c d`'s
+    /// own `App` spine breaks) - that alone should switch the whole array to
+    /// the expanded style, the same as a source break between items would,
+    /// instead of leaving the array looking flat with an item randomly
+    /// breaking mid-line.
+    #[test]
+    fn array_item_that_would_break_on_its_own_expands_the_whole_array() {
+        let src = "module Foo where\n\nfoo = [a b, c\n d]\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo =\n  [ a b\n  , c\n      d\n  ]\n");
         assert_idempotent(src);
     }
 
