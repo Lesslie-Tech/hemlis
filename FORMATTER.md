@@ -1210,6 +1210,76 @@ existing mechanism.
 1 new regression test, taken directly from the real report. Full suite
 (175 lib + 123 style + golden) and clippy clean.
 
+## Session: a call's own multiline decision was all-or-nothing
+
+`Expr::App` decided multiline-ness once for the whole spine
+(`any_breaks` over `[head, arg1, arg2, ...]`) and, if *any* adjacent pair
+had broken, printed *every* argument on its own line - even ones that sat
+right after the head with no break at all. Reported directly: source
+`a b\n  c d` (a break only between `b` and `c`) formatted to `a\n  b\n  c\n
+d`, moving `b` down for no reason, instead of the intended `a b\n  c\n  d`
+- `b` has nothing forcing it apart from `a`, so it should stay glued.
+
+`Typ::App` and `print_constraint` don't have this bug - both already used
+`print_spine_args`, which decides per-argument ("once one breaks, it and
+everything after prints one-per-line; before that, stay glued") instead of
+once for the whole spine. `Expr::App` predates `print_spine_args` and was
+never converted over; this session did that, deleting its bespoke
+all-or-nothing block.
+
+A second, related bug came out of the same report: an argument that's
+itself going to print across multiple lines - most commonly a `Paren`
+wrapping something that breaks - has no source break *before* it, so
+`print_spine_args`'s original `breaks_before`-only check wouldn't trigger
+on it either. Real report: `map (\x -> (x +\n  1)) xs` formatted with
+`map (` glued flat and `xs` glued right after the closing `)`, i.e. the
+call itself never visibly broke even though its argument sprawled across
+five lines. Fixed by giving `print_spine_args` a second trigger alongside
+`breaks_before`: a new `would_break` callback, checked per-argument the
+same way `paren_would_break` already decides other layout choices - by
+actually rendering the argument and looking for a line break in the
+result.
+
+This is `paren_would_break` restricted to `Expr::Paren`. That
+restriction is deliberate at `paren_would_break`'s two existing call
+sites (`print_arrow_rhs`, `print_record_field_rhs`), each about whether
+to break *before* a glued bracket so its closing delimiter doesn't look
+like it "moved back" - a concern specific to things with a closing
+delimiter to regress to a shallower column. `print_spine_args`'s new
+check has no such nuance: it only wants to know whether an argument is
+going to span multiple lines, regardless of why or what kind of node it
+is, so a `Record`/`Array` argument with its own multiline items needs to
+trigger it exactly as well as a `Paren` does. Pulled the shared
+render-and-check body out into a new `expr_would_break`
+(`typ_would_break` on the `Typ` side), with `paren_would_break`/
+`typ_paren_would_break` now just that plus the `Paren`-only gate.
+
+`Typ::App`/`print_constraint`'s two `print_spine_args` call sites pass
+`|_, _| false` for the new callback - **not** `typ_would_break`. Tried
+wiring it up there too, since both call sites already had a `would_break`
+slot to fill; it broke two existing regression tests
+(`row_type_expands_one_field_per_line_when_source_has_a_newline`,
+`comment_inside_a_multiline_row_stays_attached_to_its_own_field`), and
+rightly so. The "floor" model (see two sessions up) means a glued
+type-level bracket that breaks hangs *in place* at its own column
+(`print_row`/`print_paren_block`) rather than relocating onto a fresh
+line - `Record ( a :: Int, b :: String )`'s row is correct exactly where
+it is once it breaks. Pre-emptively relocating it because it "would
+break" fights that directly. Values don't have this convention - a
+value's own bracket relocates via `paren_would_break` +
+`print_arrow_rhs`'s "break the glued token first" strategy instead - so
+`expr_would_break` on the `Expr::App` spine is correct where the
+identical check on the `Typ::App` spine would not be. Same underlying
+helper, deliberately different wiring on each side, for the same reason
+the two sides' bracket-hang strategies have always differed.
+
+One existing test's expectation changed to the new (correct) output
+(`paren_after_arrow_breaks_the_arrow_first_instead_of_moving_back`, whose
+old expected value was capturing this exact bug). 3 new regression tests,
+2 taken directly from the real report plus one confirming the
+`Record`/`Paren` generalization. Full suite (178 lib + 123 style + golden)
+and clippy clean.
+
 ## Testing
 
 - `cargo test --lib print::` — the real test suite, 53 tests in

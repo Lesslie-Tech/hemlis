@@ -251,9 +251,19 @@ impl<'s> Printer<'s> {
     /// its closing `)` doesn't end up looking like it "moved back" past
     /// whatever precedes it once printed.
     fn paren_would_break(&mut self, e: &Expr) -> bool {
-        if !matches!(e, Expr::Paren(..)) {
-            return false;
-        }
+        matches!(e, Expr::Paren(..)) && self.expr_would_break(e)
+    }
+
+    /// `paren_would_break`'s unrestricted counterpart: true if printing `e`
+    /// at the current indent produces any line break at all, whatever kind
+    /// of node it is - a `Record`/`Array` with its own multiline items
+    /// breaks just as well as a `Paren` does. Used where the *reason* a
+    /// glued argument breaks doesn't matter, only whether it does (see
+    /// `print_spine_args`'s `would_break` callback) - unlike
+    /// `paren_would_break`'s two call sites, there's no "closing delimiter
+    /// regresses to a shallower column" concern to narrow this to parens
+    /// for.
+    fn expr_would_break(&mut self, e: &Expr) -> bool {
         let comment_idx_before = self.comment_idx;
         let would_break = self.render_indented(0, |p| p.print_expr(e)).contains('\n');
         self.comment_idx = comment_idx_before;
@@ -266,9 +276,11 @@ impl<'s> Printer<'s> {
     /// onto a fresh line first, so its closing `)` doesn't end up looking
     /// like it moved back past whatever precedes it.
     fn typ_paren_would_break(&mut self, t: &Typ) -> bool {
-        if !matches!(t, Typ::Paren(..)) {
-            return false;
-        }
+        matches!(t, Typ::Paren(..)) && self.typ_would_break(t)
+    }
+
+    /// The `Typ` counterpart of `expr_would_break` - see its doc comment.
+    fn typ_would_break(&mut self, t: &Typ) -> bool {
         let comment_idx_before = self.comment_idx;
         let would_break = self.render_indented(0, |p| p.print_typ(t)).contains('\n');
         self.comment_idx = comment_idx_before;
@@ -572,27 +584,34 @@ impl<'s> Printer<'s> {
     /// Prints `args` (already glued to some preceding `first_span`, e.g. a
     /// spine's head or a constraint's class name) one at a time, deciding
     /// per-argument whether to glue it with a leading space or move it onto
-    /// a fresh, shared indent level: once one argument's source span breaks
-    /// from its predecessor, that argument and every one after it print
+    /// a fresh, shared indent level: once one argument either has a source
+    /// break before it, or is itself going to print across multiple lines
+    /// (`would_break`, e.g. a paren/record/array argument with multiline
+    /// content of its own), that argument and every one after it print
     /// one-per-line at a single indent level entered on the first break -
     /// so an argument gets glued right after some *other* argument that
     /// printed as a multiline block (e.g. `Union a (row) b`, where `row`
     /// prints as its own multi-line block but `b` still followed it on the
     /// very next source line) doesn't end up looking like it moved back
-    /// onto that block's own closing line. Args before the first break stay
-    /// glued to whatever precedes them, since nothing forces them apart.
+    /// onto that block's own closing line, and a call whose only multiline
+    /// argument breaks with no source line break before it (`f (a\nb) c`)
+    /// still gets `c` pushed onto its own line rather than left glued flat
+    /// after a block that visually spans several lines. Args before the
+    /// first break stay glued to whatever precedes them, since nothing
+    /// forces them apart.
     fn print_spine_args<T>(
         &mut self,
         first_span: Span,
         args: &[T],
         span_of: impl Fn(&T) -> Span,
+        would_break: impl Fn(&mut Self, &T) -> bool,
         print: impl Fn(&mut Self, &T),
     ) {
         let mut prev_span = first_span;
         let mut broke = false;
         for a in args {
             let cur_span = span_of(a);
-            if !broke && Self::breaks_before(prev_span, cur_span) {
+            if !broke && (Self::breaks_before(prev_span, cur_span) || would_break(self, a)) {
                 self.indent_in();
                 broke = true;
             }
@@ -1737,7 +1756,21 @@ impl<'s> Printer<'s> {
             Typ::App(..) => {
                 let (head, args) = Self::typ_app_spine(t);
                 self.print_typ(head);
-                self.print_spine_args(head.span(), &args, |a| a.span(), |p, a| p.print_typ(a));
+                // No `would_break` check here (unlike `Expr::App`'s spine,
+                // see `expr_would_break`'s doc comment): the "floor" model
+                // (FORMATTER.md) means a glued type-level bracket that
+                // breaks hangs in place at its own column instead of
+                // relocating (see `print_row`/`print_paren_block`), so a
+                // `Typ` argument that would break is never itself a reason
+                // to move it, or its successors, onto a fresh line - only a
+                // real source break is.
+                self.print_spine_args(
+                    head.span(),
+                    &args,
+                    |a| a.span(),
+                    |_, _| false,
+                    |p, a| p.print_typ(a),
+                );
             }
             Typ::Op(..) => {
                 let (first, rest) = Self::typ_op_spine(t);
@@ -1858,7 +1891,16 @@ impl<'s> Printer<'s> {
         let name_col = self.current_column();
         self.lit(name);
         self.with_indent_at(name_col, |p| {
-            p.print_spine_args(name.span(), args, |a| a.span(), |p, a| p.print_typ(a));
+            // See the matching note on `Typ::App` - the floor model means a
+            // `Typ` arg that would break is never itself a reason to
+            // relocate it or its successors.
+            p.print_spine_args(
+                name.span(),
+                args,
+                |a| a.span(),
+                |_, _| false,
+                |p, a| p.print_typ(a),
+            );
         });
     }
 
@@ -2093,23 +2135,14 @@ impl<'s> Printer<'s> {
             }
             Expr::App(..) => {
                 let (head, args) = Self::app_spine(e);
-                let mut spans = vec![head.span()];
-                spans.extend(args.iter().map(|a| a.span()));
-                let multiline = Self::any_breaks(&spans);
                 self.print_expr(head);
-                if multiline {
-                    self.indent_in();
-                    for a in &args {
-                        self.newline();
-                        self.print_expr(a);
-                    }
-                    self.indent_out();
-                } else {
-                    for a in &args {
-                        self.raw(" ");
-                        self.print_expr(a);
-                    }
-                }
+                self.print_spine_args(
+                    head.span(),
+                    &args,
+                    |a| a.span(),
+                    |p, a| p.expr_would_break(a),
+                    |p, a| p.print_expr(a),
+                );
             }
             Expr::Vta(f, t) => {
                 self.print_expr(f);
@@ -2438,7 +2471,7 @@ mod tests {
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = map ( \\x ->\n    ( x\n        + 1\n    )\n) xs\n"
+            "module Foo where\n\nfoo = map\n  ( \\x ->\n      ( x\n          + 1\n      )\n  )\n  xs\n"
         );
         assert_idempotent(src);
     }
@@ -2491,6 +2524,49 @@ mod tests {
         let src = "module Foo where\n\nfoo = bar\n  baz\n  qux\n";
         let out = fmt(src);
         assert_eq!(out, "module Foo where\n\nfoo = bar\n  baz\n  qux\n");
+        assert_idempotent(src);
+    }
+
+    /// Regression test: only the arguments *after* the point a call's source
+    /// first breaks should move onto their own line, not every argument -
+    /// `bar` stays glued to `foo` since nothing forces it apart, but once
+    /// `baz` breaks from `bar`, `baz` and `qux` both get their own line
+    /// (`print_spine_args`'s existing "once broken, stay broken" rule,
+    /// which `Expr::App` previously bypassed with its own all-or-nothing
+    /// `any_breaks` check over the whole spine).
+    #[test]
+    fn app_only_pushes_args_after_the_first_break_onto_their_own_line() {
+        let src = "module Foo where\n\nfoo = a b\n  c d\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo = a b\n  c\n  d\n");
+        assert_idempotent(src);
+    }
+
+    /// Regression test: an argument that's itself going to print across
+    /// multiple lines (here, a `Paren` wrapping a call that breaks) forces
+    /// the same "push this and everything after onto its own line"
+    /// treatment as a real source break would, even with no source break of
+    /// its own before it - `foo`'s own head/call was previously left glued
+    /// flat in this case, only breaking *inside* the paren, which made the
+    /// paren's closing `)` and the following argument look like they never
+    /// left the call's own line.
+    #[test]
+    fn app_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
+        let src = "module Foo where\n\nfoo = a (b\nc) d\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo = a\n  ( b\n      c\n  )\n  d\n");
+        assert_idempotent(src);
+    }
+
+    /// Same fix as the previous test, but for a `Record` argument rather
+    /// than a `Paren` one - `expr_would_break` (unlike `paren_would_break`)
+    /// is deliberately not restricted to any one node shape, since any kind
+    /// of glued argument can print across multiple lines on its own.
+    #[test]
+    fn app_record_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
+        let src = "module Foo where\n\nfoo = a { x: 1\n, y: 2 } d\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo = a\n  { x: 1\n  , y: 2\n  }\n  d\n");
         assert_idempotent(src);
     }
 
