@@ -768,40 +768,54 @@ impl<'s> Printer<'s> {
         if close_span != Span::zero() {
             boundary_spans.push(close_span);
         }
-        // A source break isn't the only thing that should switch this list
-        // to the expanded, one-per-line style: an item can have no break
-        // around it at all and still be going to print across multiple
-        // lines all on its own (an `App` whose own spine breaks, an
-        // operator chain, ...) - real report: `[a b, c\n d]` (no break
-        // around the second item's own span, which itself starts on the
-        // same line as the first item's comma) stayed glued flat with the
-        // second item's own internal break looking like it randomly
-        // indented mid-line, instead of switching the whole list to the
-        // expanded style the way a source break would. Checked the same
-        // way `expr_would_break` decides this for `Expr::App`'s own
-        // arguments: render the item in isolation and see whether anything
-        // in it actually broke - a pure function of the item's own
-        // content, not its source span.
-        let mut multiline = Self::any_breaks(&boundary_spans);
-        if !multiline {
-            for item in items {
-                let comment_idx_before = self.comment_idx;
-                let would_break = self.render_indented(0, |p| print_item(p, item)).contains('\n');
-                self.comment_idx = comment_idx_before;
-                if would_break {
-                    multiline = true;
-                    break;
-                }
-            }
-        }
+        let multiline_from_source = Self::any_breaks(&boundary_spans);
 
-        if !multiline {
+        if !multiline_from_source {
             if items.is_empty() {
                 self.raw(open);
                 self.flush_comments_before(close_span.lo().0);
                 self.raw(close);
                 return;
             }
+            // A source break isn't the only thing that should switch this
+            // list to the expanded, one-per-line style: an item can have no
+            // break around it at all and still be going to print across
+            // multiple lines all on its own (an `App` whose own spine
+            // breaks, an operator chain, ...) - real report: `[a b, c\n d]`
+            // (no break around the second item's own span, which itself
+            // starts on the same line as the first item's comma) stayed
+            // glued flat with the second item's own internal break looking
+            // like it randomly indented mid-line, instead of switching the
+            // whole list to the expanded style the way a source break
+            // would.
+            //
+            // This used to be decided upfront: render every item into a
+            // scratch buffer just to check for a `'\n'`, then - once that
+            // confirmed nothing broke - print every item a *second* time for
+            // real. Cheap in isolation, but catastrophic once an item is
+            // itself a nested `Array`/`Record`: printing it (for the
+            // scratch check, or for real) recurses into this exact same
+            // "render twice" pattern for *its own* items, doubling the
+            // redundant work at every level of nesting - `O(2^depth)`
+            // instead of `O(depth)`. A real deeply-nested-but-entirely-flat
+            // record literal (an XML-shaped test fixture on one line, ~10+
+            // levels deep) hit this and never finished printing.
+            //
+            // Fixed by trying the flat style directly instead of probing
+            // first: write `open`/items/`close` straight into the real
+            // output, then check *after the fact* whether anything just
+            // printed contains a `'\n'` (a nested `case`/`do`/`let` value
+            // always does, regardless of source layout). If nothing did,
+            // this was exactly the right call, at the cost of one traversal
+            // - not two. If something did, roll back to `mark` (rewinding
+            // `comment_idx` too - whatever this attempt flushed needs to be
+            // re-flushed by the expanded path below, not skipped) and fall
+            // through to the expanded style instead: a real but
+            // non-recursive 2x, paid only by the ancestors of whatever
+            // actually forced the break, not by every level of nesting
+            // regardless of whether anything under it ever breaks.
+            let mark = self.out.len();
+            let comment_idx_before = self.comment_idx;
             // Deliberately no `flush_trailing_comment` call in this branch,
             // unlike the multiline one below: with several items sharing one
             // physical line, "a pending comment starts on this item's own hi()
@@ -827,7 +841,16 @@ impl<'s> Printer<'s> {
                 self.raw(" ");
             }
             self.raw(close);
-        } else {
+            if !self.out[mark..].contains('\n') {
+                return;
+            }
+            self.out.truncate(mark);
+            self.comment_idx = comment_idx_before;
+        }
+
+        // Reached either because the source already forced this (checked
+        // above), or because the flat attempt just rolled back.
+        {
             // If some outer construct already broke to a fresh line right before
             // this call (e.g. a `=`/`->` that decided to break because *this*
             // list starts on its own source line), don't also bump our own
@@ -2241,21 +2264,68 @@ impl<'s> Printer<'s> {
                 // original line.
                 let mut spans = vec![head.span()];
                 spans.extend(args.iter().map(|a| a.span()));
-                let multiline =
-                    Self::any_breaks(&spans) || args.iter().any(|a| self.expr_would_break(a));
+                // Check each argument's own `expr_would_break` at most once,
+                // caching its already-rendered flat text when it doesn't
+                // break so it can be reused directly below instead of being
+                // printed a second time. This used to be two separate full
+                // renders per argument (this check, then `print_spine_args`
+                // re-checking - and, either way, re-printing - each one
+                // again) - cheap in isolation, but since an argument can
+                // itself be a call with its own arguments, that doubling
+                // recurses: `O(2^depth)` instead of `O(depth)` for a chain
+                // of calls each wrapping the next (`Ctor { field: [ Ctor
+                // { ... } ] }`, ~15 levels, no forced breaks anywhere - a
+                // real report that never finished printing). Same fix as
+                // `list()`'s own version of this (see its comment).
+                let arg_texts: Vec<Option<String>> = args
+                    .iter()
+                    .map(|a| {
+                        let comment_idx_before = self.comment_idx;
+                        let text = self.render_indented(0, |p| p.print_expr(a));
+                        if text.contains('\n') {
+                            self.comment_idx = comment_idx_before;
+                            None
+                        } else {
+                            Some(text)
+                        }
+                    })
+                    .collect();
+                let multiline = Self::any_breaks(&spans) || arg_texts.iter().any(Option::is_none);
                 let own_indent = multiline && !self.at_fresh_line();
                 if own_indent {
                     self.indent_in();
                     self.newline();
                 }
                 self.print_expr(head);
-                self.print_spine_args(
-                    head.span(),
-                    &args,
-                    |a| a.span(),
-                    |p, a| p.expr_would_break(a),
-                    |p, a| p.print_expr(a),
-                );
+                let mut prev_span = head.span();
+                let mut broke = false;
+                for (a, cached) in args.iter().zip(arg_texts) {
+                    let cur_span = a.span();
+                    if !broke {
+                        if Self::breaks_before(prev_span, cur_span) {
+                            self.indent_in();
+                            broke = true;
+                        } else if let Some(text) = cached {
+                            self.raw(" ");
+                            self.raw(&text);
+                            prev_span = cur_span;
+                            continue;
+                        } else {
+                            self.indent_in();
+                            broke = true;
+                        }
+                    }
+                    if broke {
+                        self.newline();
+                    } else {
+                        self.raw(" ");
+                    }
+                    self.print_expr(a);
+                    prev_span = cur_span;
+                }
+                if broke {
+                    self.indent_out();
+                }
                 if own_indent {
                     self.indent_out();
                 }
@@ -3737,5 +3807,29 @@ mod tests {
         let out2 = fmt(src2);
         assert!(out2.contains("-- a comment"), "comment lost: {:?}", out2);
         assert_idempotent(src2);
+    }
+
+    #[test]
+    fn deeply_nested_flat_literal_formats_without_exponential_blowup() {
+        // Regression test: `list()`'s multiline check used to render every
+        // item into a scratch buffer to check for a `'\n'`, then print it
+        // again for real - a call whose args (or an array's/record's items)
+        // never break still paid for two full renders of each, and since an
+        // item can itself be a nested `Array`/`Record`, that doubling
+        // recursed: `O(2^depth)` instead of `O(depth)`. A real
+        // deeply-nested-but-entirely-flat record literal (an XML-shaped
+        // test fixture on one line) hit this and never finished printing.
+        // This depth (30) would take unreasonably long (or overflow a
+        // `-release` binary's stack) if the exponential behavior ever comes
+        // back - the real value of this test is that it completes at all.
+        let depth = 30;
+        let mut inner = "1".to_string();
+        for _ in 0..depth {
+            inner = format!("[ {} ]", inner);
+        }
+        let src = format!("module Foo where\n\nx = {}\n", inner);
+        let out = fmt(&src);
+        assert_eq!(out, src);
+        assert_idempotent(&src);
     }
 }

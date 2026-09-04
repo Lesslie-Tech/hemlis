@@ -875,7 +875,10 @@ fn row<'t>(p: &mut P<'t>) -> Option<Row> {
 enum ExprOp {
     Op(QOp),
     Infix(Expr),
-    App,
+    // Carries the atom this lookahead already had to fully parse just to
+    // confirm one exists - see `pratt_expr`'s outer lookahead, which reuses
+    // it as `rhs` instead of parsing the same atom a second time.
+    App(Expr),
 }
 
 fn expr_op<'t>(p: &mut P<'t>) -> Option<ExprOp> {
@@ -888,10 +891,11 @@ fn expr_op<'t>(p: &mut P<'t>) -> Option<ExprOp> {
             Some(ExprOp::Infix(e))
         }
         _ => {
-            if matches!(expr_atom(p, None)?, Expr::Error(_)) {
+            let atom = expr_atom(p, None)?;
+            if matches!(atom, Expr::Error(_)) {
                 None
             } else {
-                Some(ExprOp::App)
+                Some(ExprOp::App(atom))
             }
         }
     }
@@ -902,7 +906,7 @@ fn expr_fop(t: &ExprOp) -> Prec {
     match t {
         ExprOp::Op(qop) => op_fixity((qop.1).0 .0),
         ExprOp::Infix(_) => L(10),
-        ExprOp::App => L(11),
+        ExprOp::App(_) => L(11),
     }
 }
 
@@ -1033,7 +1037,10 @@ fn expr_mrg(op: ExprOp, lhs: Expr, rhs: Expr) -> Expr {
     match op {
         ExprOp::Op(op) => Expr::Op(b!(lhs), op, b!(rhs)),
         ExprOp::Infix(op) => Expr::Infix(b!(lhs), b!(op), b!(rhs)),
-        ExprOp::App => Expr::App(b!(lhs), b!(rhs)),
+        // `rhs` (extracted by `pratt_expr` before this call - see its own
+        // comment) is already the atom this variant carries; the payload
+        // itself is no longer needed here.
+        ExprOp::App(_) => Expr::App(b!(lhs), b!(rhs)),
     }
 }
 
@@ -1062,10 +1069,29 @@ fn expr_where<'t>(p: &mut P<'t>) -> Option<Expr> {
 }
 
 fn pratt_expr<'t>(p: &mut P<'t>, mut lhs: Expr, prec: usize) -> Option<Expr> {
-    while let Some(outer_lookahead) = (|p: &mut P<'t>| {
-        let op = expr_op(&mut p.fork())?;
+    while let Some(mut outer_lookahead) = (|p: &mut P<'t>| {
+        let mut fork = p.fork();
+        let op = expr_op(&mut fork)?;
         if expr_fop(&op).prec() >= prec {
-            if !matches!(op, ExprOp::App) {
+            if matches!(op, ExprOp::App(_)) {
+                // `expr_op`'s default (App) branch had to fully parse the
+                // next atom just to confirm one exists - commit the fork's
+                // progress (and errors) instead of throwing that parse away
+                // and redoing it below via `expr_atom(p, ...)`. Without
+                // this, every App-argument atom is parsed twice per level
+                // (once here as a lookahead, once as the real `rhs`), and
+                // since an atom can itself contain further nested `App`s,
+                // that doubling recurses: `O(2^depth)` instead of
+                // `O(depth)` for a chain of calls each wrapping the next in
+                // a record/array literal - a real report (an XML-shaped
+                // test fixture, ~15 levels deep, all on one line) where
+                // even parsing - before printing was ever reached - never
+                // finished. Only the position is committed, matching
+                // `ttry!`'s own convention - a successful fork's errors
+                // (like `alt!`'s) are diagnostic-only and dropped once
+                // something downstream actually succeeds.
+                p.i = fork.i;
+            } else {
                 let _ = expr_op(p)?;
             }
             Some(op)
@@ -1074,7 +1100,15 @@ fn pratt_expr<'t>(p: &mut P<'t>, mut lhs: Expr, prec: usize) -> Option<Expr> {
         }
     })(p)
     {
-        let mut rhs = expr_atom(p, Some("Expected an expression after the operator"))?;
+        let mut rhs = match &mut outer_lookahead {
+            // Reuse the atom the lookahead above already parsed (see its
+            // own comment) - replacing it with a placeholder is fine, since
+            // nothing reads an `ExprOp::App`'s payload again after this.
+            ExprOp::App(atom) => std::mem::replace(atom, Expr::Error(Span::zero())),
+            ExprOp::Op(_) | ExprOp::Infix(_) => {
+                expr_atom(p, Some("Expected an expression after the operator"))?
+            }
+        };
         while let Some(next) = (|p: &mut P<'t>| {
             let op = expr_op(&mut p.fork())?;
             expr_fop(&op).next(expr_fop(&outer_lookahead).prec())
@@ -2605,5 +2639,64 @@ module Test where
 f :: forall n. Compare n (-1) GT => P n
 "
         ))
+    }
+
+    // Regression test: `pratt_expr`'s outer lookahead used to fully parse
+    // the next atom on a forked parser just to confirm an `App` continuation
+    // exists, then throw that parse away and parse the *same* atom again for
+    // real via `expr_atom` immediately after. Harmless in isolation, but
+    // since an atom can itself contain further nested `App`s (e.g. a call
+    // wrapping a record literal whose own field is another such call), that
+    // doubling recurses: `O(2^depth)` instead of `O(depth)` for a chain of
+    // calls each wrapping the next. A real report (an XML-shaped record
+    // literal, ~15 levels deep, all on one line) never finished *parsing*,
+    // well before printing was ever reached. Not a snapshot test - the tree
+    // for even a moderate depth is unwieldy, and the point of this test is
+    // that it completes at all (it would hang, or take unreasonably long,
+    // if the exponential behavior ever comes back) while still parsing
+    // cleanly to the expected nesting depth.
+    #[test]
+    fn deeply_nested_app_chain_parses_without_exponential_blowup() {
+        use super::*;
+        use crate::lexer;
+
+        let depth = 25;
+        let mut inner = "Leaf".to_string();
+        for _ in 0..depth {
+            inner = format!("Ctor {{ children: [ {} ] }}", inner);
+        }
+        let src = format!("module A where\n\nx = {}\n", inner);
+
+        let (l, _comments) = lexer::lex(&src, Fi(0));
+        let d = dashmap::DashMap::new();
+        let mut p = P::new(&l, &d);
+        let m = module(&mut p).expect("module should parse");
+        assert!(p.errors.is_empty(), "parse errors: {:?}", p.errors);
+
+        // Follows the exact shape `Ctor { children: [ <next> ] }` builds:
+        // an `App` whose argument is a one-field `Record` whose value is a
+        // one-item `Array` holding the next level, bottoming out at `Leaf`.
+        fn nesting_depth(e: &Expr) -> usize {
+            let Expr::App(_, arg) = e else {
+                return 0;
+            };
+            let Expr::Record(_, fields, _) = arg.as_ref() else {
+                panic!("expected the App's argument to be a record: {:?}", arg);
+            };
+            let [RecordLabelExpr::Field(_, value)] = fields.as_slice() else {
+                panic!("expected exactly one record field: {:?}", fields);
+            };
+            let Expr::Array(_, items, _) = value else {
+                panic!("expected the field's value to be an array: {:?}", value);
+            };
+            let [item] = items.as_slice() else {
+                panic!("expected exactly one array item: {:?}", items);
+            };
+            1 + nesting_depth(item)
+        }
+        let Decl::Def(_, _, GuardedExpr::Unconditional(e)) = &m.1[0] else {
+            panic!("expected a single value declaration");
+        };
+        assert_eq!(nesting_depth(e), depth);
     }
 }
