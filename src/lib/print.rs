@@ -116,8 +116,28 @@ impl<'s> Printer<'s> {
     /// which `self.indent` alone has no memory of. See `hang_at_column` and
     /// the "floor" model in FORMATTER.md.
     fn current_column(&self) -> usize {
-        let last_nl = self.out.rfind('\n').map_or(0, |i| i + 1);
-        self.out[last_nl..].chars().count()
+        match self.out.rfind('\n') {
+            Some(i) => self.out[i + 1..].chars().count(),
+            // No newline anywhere in `self.out` - either this is truly the
+            // start of the whole print (`self.indent` is 0 here too, so
+            // returning it is the same as before), or `self.out` is a fresh
+            // scratch buffer just swapped in by `render_indented`/
+            // `render_at_column` (`with_indent_at` already set `self.indent`
+            // to the intended starting column, but - unlike a real
+            // `newline()` - swapping the buffer never physically writes
+            // those indent spaces). Falling through to the character count
+            // below would then read a fresh, empty buffer as column 0
+            // regardless of `self.indent` - exactly the "fresh line" case
+            // `current_column`'s own doc comment claims never needs special
+            // handling, broken by scratch buffers specifically because
+            // nothing has actually been written into them yet. Real report:
+            // a `Paren` immediately inside another glued `Paren` (`( ( case
+            // _ of ... ) >>> ... )`) - the inner one's own `open_col`
+            // capture landed at column 0 instead of its real column,
+            // corrupting every line under it.
+            None if self.out.is_empty() => self.indent,
+            None => self.out.chars().count(),
+        }
     }
 
     /// Runs `f` with the indent baseline set to `col` (an exact column, not
@@ -351,7 +371,7 @@ impl<'s> Printer<'s> {
     ///   first instead" strategy (`paren_would_break` + `print_arrow_rhs`),
     ///   so by the time this runs, whatever `(` is glued after either isn't
     ///   going to move, or already broke onto its own fresh line.
-    fn print_paren_block(&mut self, is_typ: bool, print_inner: impl FnOnce(&mut Self)) {
+    fn print_paren_block(&mut self, print_inner: impl FnOnce(&mut Self)) {
         // A paren is its own bracketed context, unrelated to whatever signature
         // it happens to be nested inside - a chain inside it that was written
         // flat shouldn't inherit an enclosing broken-signature's forced
@@ -359,26 +379,33 @@ impl<'s> Printer<'s> {
         // which doesn't use `in_broken_sig`, so this is a no-op there.
         let outer_in_broken_sig = self.in_broken_sig;
         self.in_broken_sig = false;
+        // Same "floor" model as `print_row`: hang the body, and the closing
+        // paren, under this paren's own real column rather than an
+        // `indent_in`-level approximation of it - `open_col` is a level
+        // bump (`+ INDENT`) only when `(` happens to sit at the ambient
+        // baseline already (the common case, unglued), but when `(` is
+        // glued mid-line after something of its own width (an operator's
+        // ` <#> `, a `class` name, ...), the ambient baseline has no memory
+        // of that width. Was previously only done for `Typ::Paren` (values
+        // were thought to always relocate the glued token first instead of
+        // ever needing to hang in place - see `print_arrow_rhs`), but
+        // `Expr::Op`'s own operand printing glues a `Paren` operand with no
+        // such relocation decision, so its close ended up one level short
+        // of the open whenever the operand was itself indented past the
+        // ambient baseline (real report: an operator chain's `<#> ( ... )`
+        // operand printed with `)` landing under the chain's continuation
+        // indent, not under its own `(`). Unifying this here is exactly
+        // behavior-preserving for every unglued call site (`open_col + 2`
+        // and `open_col` both collapse to the ordinary `indent_in`/ambient
+        // values when `(` starts at the ambient baseline already).
         let open_col = self.current_column();
-        let inner_text = if is_typ {
-            self.render_at_column(open_col + 2, print_inner)
-        } else {
-            self.render_indented(1, print_inner)
-        };
+        let inner_text = self.render_at_column(open_col + 2, print_inner);
         self.in_broken_sig = outer_in_broken_sig;
         self.raw("(");
         if inner_text.contains('\n') {
             self.raw(" ");
             self.raw(&inner_text);
-            if is_typ {
-                // The closing paren lines up under the opening one, not
-                // wherever this whole block happened to start - which can be
-                // a different column entirely when `(` itself was glued
-                // mid-line.
-                self.with_indent_at(open_col, Self::newline);
-            } else {
-                self.newline();
-            }
+            self.with_indent_at(open_col, Self::newline);
         } else {
             self.raw(&inner_text);
         }
@@ -967,6 +994,19 @@ impl<'s> Printer<'s> {
                 self.indent_in();
                 self.newline();
             }
+            // Same "floor" fix as `print_paren_block`: hang every
+            // continuation line (and the closing bracket) under `open`'s
+            // own real column, not the ambient baseline - a no-op here when
+            // `own_indent` just relocated us (the fresh `newline()` above
+            // already put ambient and `open`'s column at the same place),
+            // but when the list stays glued mid-line (after an operator,
+            // most commonly), ambient has no memory of that glued prefix's
+            // width. Real report: an operator chain's glued `<#> [ a\n, b\n]`
+            // operand printed `,`/`]` one level short of `[`, the same bug
+            // `print_paren_block` had for a glued `Paren` operand.
+            let open_col = self.current_column();
+            let saved_indent = self.indent;
+            self.indent = open_col;
             self.raw(open);
             self.raw(" ");
             for (i, item) in items.iter().enumerate() {
@@ -1029,6 +1069,7 @@ impl<'s> Printer<'s> {
             self.flush_comments_before(close_span.lo().0);
             self.newline();
             self.raw(close);
+            self.indent = saved_indent;
             if own_indent {
                 self.indent_out();
             }
@@ -1959,7 +2000,7 @@ impl<'s> Printer<'s> {
             }
             Typ::Hole(h) => self.lit(h),
             Typ::Paren(_, inner, _) => {
-                self.print_paren_block(true, |p| p.print_typ(inner));
+                self.print_paren_block(|p| p.print_typ(inner));
             }
             Typ::Arr(a, b) => self.print_typ_arrow_chain(a, b),
             Typ::App(..) => {
@@ -2331,7 +2372,7 @@ impl<'s> Printer<'s> {
             Expr::Hole(x) => self.lit(x),
             Expr::Section(_) => self.raw("_"),
             Expr::Paren(_, inner, _) => {
-                self.print_paren_block(false, |p| p.print_expr(inner));
+                self.print_paren_block(|p| p.print_expr(inner));
             }
             Expr::Negate(inner) => {
                 self.raw("-");
@@ -2754,6 +2795,61 @@ mod tests {
         let once = fmt(src);
         let twice = fmt(&once);
         assert_eq!(once, twice, "formatting is not idempotent");
+    }
+
+    #[test]
+    fn paren_operand_of_an_op_chain_closes_under_its_own_open_paren() {
+        // Real report: a `Paren` operand glued directly after an operator
+        // (`<#> ( ... )`) that itself printed multi-line had its closing
+        // `)` land one level short of where `(` actually was - `(` sits
+        // past the operator's own width, which the ambient indent baseline
+        // has no memory of. See `print_paren_block`.
+        let src = "module M where\n\nx =\n  y\n    <#> ( \\cred ->\n            [ Foo.Bar cur cred ]\n        )\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module M where\n\nx =\n  y\n    <#> ( \\cred ->\n            [ Foo.Bar cur cred ]\n        )\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn array_operand_of_an_op_chain_closes_under_its_own_open_bracket() {
+        // Same bug as the `Paren` case above, in `list()`'s glued (not
+        // `own_indent`) branch: a bracketed operand glued after an operator
+        // had its continuation `,`/closing `]` hang off the ambient indent
+        // instead of `[`'s own real column.
+        let src = "module M where\n\nx =\n  y\n    <#> [ credA\n        , credB\n        , credC\n        ]\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module M where\n\nx =\n  y\n    <#> [ credA\n        , credB\n        , credC\n        ]\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn nested_paren_inside_a_glued_paren_anchors_to_the_right_column() {
+        // Root cause behind the two tests above: `current_column()` read a
+        // freshly swapped-in scratch buffer (`render_indented`/
+        // `render_at_column`, used to decide a `Paren`'s own flat-vs-block
+        // layout) as column 0 regardless of `self.indent`, since nothing
+        // had been physically written into it yet. A `Paren` immediately
+        // inside another glued `Paren` - its own `print_paren_block` call
+        // is the very first thing printed into that scratch buffer - then
+        // anchored its own `open_col` at 0 instead of its real column,
+        // corrupting every line under it into invalid layout (confirmed via
+        // a real corpus file that failed to reparse after formatting: `( (
+        // case _ of ... ) >>> ... )`).
+        let src = "module M where\n\nx =\n  y\n    # f\n        ( ( case _ of\n              A -> 1\n              B -> 2\n          )\n            >>> g\n        )\n";
+        let out = fmt(src);
+        assert_idempotent(&out);
+        let (toks, comments) = lexer::lex(&out, Fi(0));
+        let names = DashMap::new();
+        let mut p = parser::P::new(&toks, &names);
+        let m = parser::module(&mut p).expect("formatted output should still parse");
+        assert!(p.errors.is_empty(), "parse errors: {:?}", p.errors);
+        let _ = (m, comments);
     }
 
     #[test]
