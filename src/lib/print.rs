@@ -462,7 +462,26 @@ impl<'s> Printer<'s> {
             if span.lo().0 >= line {
                 break;
             }
+            let hi = span.hi().0;
             self.emit_pending_comment();
+            // Preserve a source blank line between this comment and whatever
+            // follows it - the next comment this same loop is about to flush
+            // (only if it's actually still before `line`; otherwise it
+            // belongs to some unrelated, much later comment group and its
+            // position says nothing about a gap right here), or `line`
+            // itself otherwise. Same "0 or 1, never more" leading-blank-line
+            // preservation `print_module`'s decl loop and
+            // `print_indented_siblings` already apply *before* a comment
+            // group, just applied here *inside* one too (a standalone
+            // section comment like `-- MODEL` followed by a deliberate blank
+            // line before the declaration it precedes).
+            let next_line = match self.comments.get(self.comment_idx) {
+                Some((_, s)) if s.lo().0 < line => s.lo().0,
+                _ => line,
+            };
+            if next_line > hi + 1 {
+                self.insert_blank_line();
+            }
         }
     }
 
@@ -699,6 +718,44 @@ impl<'s> Printer<'s> {
             prev_span = cur_span;
         }
         if broke {
+            self.indent_out();
+        }
+    }
+
+    /// `print_spine_args`'s counterpart for a data constructor's own
+    /// argument types - same "glue until a real source break forces them
+    /// apart, then one per line from there onward" policy (no `would_break`
+    /// check: a constructor argument follows the same `Typ` "floor" model as
+    /// `Typ::App`'s own args - a glued type-level bracket that would break
+    /// hangs in place at its own column instead of relocating, so only a
+    /// real source break is a reason to move it or its successors), but
+    /// *two* indent levels deep instead of one when it does. `= `/`| ` are
+    /// always exactly `INDENT` characters wide, so `cname` already sits
+    /// flush with where a single extra level would land - one level would
+    /// make the first argument look like it merely continues `cname`'s own
+    /// column rather than nesting under it, not visibly past the
+    /// constructor the way a moved-onto-its-own-line argument should read.
+    /// Same reasoning as `print_record_field_rhs`'s own two-levels branch.
+    fn print_ctor_args(&mut self, cname_span: Span, cargs: &[Typ]) {
+        let mut prev_span = cname_span;
+        let mut broke = false;
+        for a in cargs {
+            let cur_span = a.span();
+            if !broke && Self::breaks_before(prev_span, cur_span) {
+                self.indent_in();
+                self.indent_in();
+                broke = true;
+            }
+            if broke {
+                self.newline();
+            } else {
+                self.raw(" ");
+            }
+            self.print_typ(a);
+            prev_span = cur_span;
+        }
+        if broke {
+            self.indent_out();
             self.indent_out();
         }
     }
@@ -1411,10 +1468,7 @@ impl<'s> Printer<'s> {
                     self.flush_comments_before(cname.span().lo().0);
                     self.raw(if i == 0 { "= " } else { "| " });
                     self.lit(cname);
-                    for a in cargs {
-                        self.raw(" ");
-                        self.print_typ(a);
-                    }
+                    self.print_ctor_args(cname.span(), cargs);
                 }
                 self.indent_out();
             }
@@ -3336,6 +3390,20 @@ mod tests {
         assert_idempotent(src);
     }
 
+    /// Real report: `flush_comments_before` never checked for a source blank
+    /// line *between* a leading comment and whatever it precedes (only
+    /// *before* the comment group itself, via `print_module`'s own decl
+    /// loop) - a standalone section comment (`-- section`) followed by a
+    /// deliberate blank line before the next declaration collapsed onto one
+    /// line.
+    #[test]
+    fn blank_line_between_a_leading_comment_and_its_decl_is_kept() {
+        let src = "module Foo where\n\n-- section\n\nfoo = 1\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
     #[test]
     fn case_of_with_multiple_branches() {
         let src = "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n";
@@ -3515,6 +3583,25 @@ mod tests {
             out,
             "module Foo where\n\ndata Flat = A | B Int\n\ndata Tall\n  = C\n  | D String\n"
         );
+        assert_idempotent(src);
+    }
+
+    /// Real report: a data constructor's own fields (unlike a name's own
+    /// binders or a call's own arguments) had no relocation logic at all -
+    /// always glued flat regardless of source breaks. Also caught, while
+    /// fixing this, that `data_cnstr` (parser.rs) parsed each field with the
+    /// full `typ` parser rather than `typ_atom`, so two space-separated
+    /// fields (`C A B`) mis-parsed as one field being `A` applied to `B`
+    /// (needs explicit parens for that, same as real PureScript's
+    /// `atype*` constructor-field grammar) - which the printer fix alone
+    /// couldn't have produced the right shape for, since the second field
+    /// would've printed as `Typ::App`'s own (correctly nested-one-deeper)
+    /// second operand instead of a sibling field at the same level.
+    #[test]
+    fn data_ctor_fields_that_would_break_relocate_two_levels_past_the_bullet() {
+        let src = "module Foo where\n\ndata D\n  = C\n      A\n      B\n  | E\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
         assert_idempotent(src);
     }
 

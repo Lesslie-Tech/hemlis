@@ -1826,7 +1826,14 @@ fn inst_binding<'t>(p: &mut P<'t>) -> Option<InstBinding> {
 
 fn data_cnstr<'t>(p: &mut P<'t>) -> Option<(ProperName, Vec<Typ>)> {
     let n = proper(p)?;
-    let ts = many_until(p, "data cnstr", typ, next_is!(T::Pipe | T::LayTop));
+    // Each field is an atomic type (`atype`), same production instance heads
+    // and instance binders already use (`typ_atom`/`binder_atom` above) - not
+    // the full `typ` parser, which would greedily consume a whole
+    // application chain into one field. Two space-separated constructors
+    // (`C Foo Bar`) are two separate fields; an application as a single field
+    // needs explicit parens (`C (Foo Bar)`), same as real PureScript's
+    // `dataCtor ::= properName atype*` grammar.
+    let ts = many_until(p, "data cnstr", |p| typ_atom(p, None), next_is!(T::Pipe | T::LayTop));
     Some((n, ts))
 }
 
