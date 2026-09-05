@@ -2373,7 +2373,41 @@ impl<'s> Printer<'s> {
                 let (first, rest) = Self::op_spine(e);
                 let mut spans = vec![first.span()];
                 spans.extend(rest.iter().map(|(_, r)| r.span()));
-                let multiline = Self::any_breaks(&spans);
+                // As well as a source break (`any_breaks`), an operand
+                // needs to force the *whole chain* multiline if it would
+                // print across multiple lines on its own even with no
+                // source break before it - not for the usual "a case/do
+                // always breaks" reason `any_breaks` already can't see, but
+                // because an operand glued flat after `op ` can itself
+                // relocate (`Expr::App`'s own `own_indent`, glued after a
+                // floor exactly the way `op ` is one) independently of
+                // anything Op's own span comparison looks at. Left alone,
+                // that relocation stretches the `first`-to-`rest[0]`
+                // adjacent boundary the moment *this* pass's own output gets
+                // reparsed: flat on pass 1 (matching a source with no real
+                // break there), `any_breaks` flips true on pass 2 once the
+                // relocated operand now visibly starts on a later line -
+                // not idempotent. Decide by rendering instead, the same
+                // `expr_would_break` primitive `list()`/`Expr::App`'s own
+                // equivalent generalizations already use - a pure function
+                // of the AST, stable no matter how many times reformatted.
+                // Cached (like `Expr::App`'s `arg_texts`) so an operand that
+                // stays flat isn't rendered twice.
+                let rest_texts: Vec<Option<String>> = rest
+                    .iter()
+                    .map(|(_, r)| {
+                        let comment_idx_before = self.comment_idx;
+                        let text = self.render_indented(0, |p| p.print_expr(r));
+                        if text.contains('\n') {
+                            self.comment_idx = comment_idx_before;
+                            None
+                        } else {
+                            Some(text)
+                        }
+                    })
+                    .collect();
+                let multiline =
+                    Self::any_breaks(&spans) || rest_texts.iter().any(Option::is_none);
                 self.print_expr(first);
                 if multiline {
                     self.indent_in();
@@ -2394,10 +2428,14 @@ impl<'s> Printer<'s> {
                     }
                     self.indent_out();
                 } else {
-                    for (op, r) in &rest {
+                    for ((op, r), cached) in rest.iter().zip(rest_texts) {
                         self.raw(" ");
                         self.lit(*op);
                         self.raw(" ");
+                        if let Some(text) = cached {
+                            self.raw(&text);
+                            continue;
+                        }
                         self.indent_in();
                         self.print_expr(r);
                         self.indent_out();
@@ -3845,6 +3883,28 @@ mod tests {
         let src = "module Foo where\n\nfoo = a\n  >>> b\n";
         let out = fmt(src);
         assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression test: an operand glued flat after an operator (no source
+    /// break before it) can still relocate itself onto its own line
+    /// (`Expr::App`'s own `own_indent`, when the operand is a call whose own
+    /// argument breaks) - which used to make the *first* formatting pass
+    /// stay flat (correctly, matching the source) while the *second* pass,
+    /// reparsing that output, saw a break between `first` and the operand
+    /// that wasn't really there in the original source and switched the
+    /// whole chain to the one-operator-per-line style: not idempotent. Now
+    /// decided by rendering (`expr_would_break`, like `list()`/`Expr::App`'s
+    /// own equivalent generalizations), so the *first* pass already produces
+    /// the stable, multiline-chain shape directly.
+    #[test]
+    fn operator_chain_operand_that_would_break_on_its_own_expands_the_whole_chain() {
+        let src = "module Foo where\n\nfoo = a $ b\n  { x: 1\n  , y: 2\n  }\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo = a\n  $\n      b\n        { x: 1\n        , y: 2\n        }\n"
+        );
         assert_idempotent(src);
     }
 

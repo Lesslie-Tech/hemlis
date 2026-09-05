@@ -8,15 +8,12 @@ parser. Written so a new session can get oriented fast. Branch: `formatter`
 
 Functionally complete first version. Covers the entire `Decl`/`Expr`/`Binder`/
 `Typ` AST surface (only genuine `Error` parser-recovery nodes fall back to a
-verbatim source-text slice — nothing else does). Verified against all 1423
+verbatim source-text slice — nothing else does). Re-verified against all 1423
 real-world `.purs` files in a sibling repo, `../pay-backend/lib` (external,
-read-only reference — never modified): every file formats and reparses
-cleanly and idempotently. 64 unit tests in `src/lib/print.rs`, all passing;
-full suite (166 lib + 123 style + golden) and clippy clean. **Stale as of
-"Session: a nested list() item was relocating its own bracket" below**: the
-sibling repo has since moved forward and the sweep now shows 226 pre-existing
-`NOT IDEMPOTENT` files from an unrelated `$`-operator gap - needs a fresh full
-pass to re-baseline, not caused by anything in this repo's recent commits.
+read-only reference — never modified) as of "Session: `Expr::Op`'s own
+version of the same idempotence bug" below: every file formats and reparses
+cleanly and idempotently, 0 failures. Unit tests in `src/lib/print.rs`, all
+passing; full suite (191 lib + 123 style + golden) and clippy clean.
 
 A diff of our output against `../pay-backend/lib/Array.purs` (formatted by
 `purs-tidy`, the tool this is meant to replace) shrank from 511 diff lines to
@@ -1530,6 +1527,74 @@ regression test taken directly from the real report
 lib + 123 style + golden) and clippy clean. External corpus sweep still shows
 the same pre-existing 226 `NOT IDEMPOTENT` files, unrelated to this fix (see
 previous session).
+
+## Session: `Expr::Op`'s own version of the same idempotence bug - and the root cause of all 226 pre-existing sweep failures
+
+Asked directly to chase down the 226 `NOT IDEMPOTENT` files the last two
+sessions kept finding pre-existing and unrelated. They all turned out to be
+one single bug, not 226 different ones: `Expr::Op`'s multiline decision
+(`let multiline = Self::any_breaks(&spans);`) had the exact same span-based
+instability the previous two sessions just fixed for `list()` and
+`Expr::App` - just never patched here, and this call site is common enough
+(`#`/`$`/`<#>`/`<>`/... chains, all over real code) to account for the
+entire pre-existing failure set on its own. Diffing a sample of the 226
+files' own once-vs-twice output confirmed a single consistent shape:
+`head #\n    operand` (operator glued flat to `head`, `operand` on its own
+line) on the first pass, `head\n  #\n      operand` (operator relocated onto
+its own line too) on the second - and a third pass on *that* output is
+stable, confirming the second shape is the true fixed point the first pass
+should have produced directly.
+
+Root cause, minimal repro: `a = b $ c\n  { x: 1\n  , y: 2\n  }` - `c { ... }`
+is `Expr::Op`'s `rest[0]` operand, an `Expr::App` whose own argument (the
+record) breaks. No source break sits between `b` and `c` (`$` chains stay
+flat by design when nothing forces them apart, per
+`multiline_operator_chain_flat_after_equals_stays_flat`), so `Op` picks the
+flat branch and glues `c` right after `$ `. But `c`'s own printing is
+`Expr::App`, and `$ ` is a "floor" exactly the way `=`/`->` are - not at a
+fresh line, would break (the record does) - so `Expr::App`'s own
+`own_indent` correctly relocates *it*, independent of `Op`. First pass:
+`b $\n    c\n      { ... }`. Reparsing that: the operand's span now visibly
+starts on a later line than `b`'s, so `Op`'s `any_breaks(spans)` - looking
+only at the `first`-to-`rest[0]` adjacent boundary, exactly the boundary
+`Expr::App`'s own relocation just stretched - flips to `true`, and pass 2
+switches to the one-operator-per-line style. This is the "Important
+gotcha" from "Layout philosophy" above, just reached through a sibling
+construct's own independent relocation decision rather than the
+already-documented "child always breaks regardless of source" case - the
+same root cause the "floor" model / `Expr::Paren` sessions already fixed
+everywhere else a glued child can move on its own (`Expr::Paren`,
+`list()`'s items, `Expr::App`'s own head), just never extended to `Op`'s
+*own* multiline flag.
+
+Fixed identically to `list()`/`Expr::App`'s own generalizations
+("`list()`'s multiline decision missed two cases", "a call's own multiline
+decision was all-or-nothing" above): render each `rest` operand into a
+scratch buffer (`render_indented(0, ...)`, cached per operand exactly like
+`Expr::App`'s `arg_texts` to avoid the `O(2^depth)` re-render blowup a
+nested chain-of-calls would otherwise hit) and fold `.contains('\n')` into
+the same single `multiline` flag alongside `any_breaks`. Deliberately kept
+as one whole-chain boolean, not converted to `print_spine_args`'s
+per-operand "glue until the first break" style - that's not how `Op` has
+ever decided (see `multiline_operator_chain_of_three_or_more_stays_at_one_
+indent_level`, an existing, untouched test asserting exactly one shared
+indent level for the whole chain), and changing that here would be a
+gratuitous style change, not a fix.
+
+No existing test's expected output changed - the flat branch's cached-text
+reuse and the multiline branch's existing hang logic are both untouched;
+this only widens *when* the chain switches into the multiline branch it
+already correctly implements. 1 new regression test taken directly from the
+minimal repro
+(`operator_chain_operand_that_would_break_on_its_own_expands_the_whole_
+chain`). Full suite (191 lib + 123 style + golden) and clippy clean.
+
+**Corpus sweep: 226 → 0.** Re-ran the full `../pay-backend/lib` sweep after
+this fix - all 1423 files clean (0 parse failures, 0 reparse failures, 0
+non-idempotent), confirming this one call site was the entire pre-existing
+failure set from the previous two sessions, not a coincidence of timing or
+drift in the sibling repo as those sessions had assumed. The "Status"
+section above has been re-baselined accordingly.
 
 ## Testing
 
