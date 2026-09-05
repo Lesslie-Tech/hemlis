@@ -2725,15 +2725,43 @@ impl<'s> Printer<'s> {
                 self.print_let_bindings(bindings);
                 self.indent_out();
             }
-            Expr::Case(_, scrutinees, branches) => {
-                self.raw("case ");
-                for (i, s) in scrutinees.iter().enumerate() {
-                    if i > 0 {
-                        self.raw(", ");
+            Expr::Case(kw, scrutinees, branches) => {
+                self.raw("case");
+                // Same "glued prefix in front of something that would break"
+                // relocation every other fixed-width keyword/operator prefix
+                // in this printer gets (see `print_arrow_rhs`, `print_sig_typ`) -
+                // a source break before the first scrutinee, between two
+                // scrutinees, or a scrutinee that's itself going to print
+                // multi-line (an `Op` chain, say) all move the *whole*
+                // scrutinee list onto its own indented line rather than
+                // leaving `of` looking glued to wherever the last scrutinee's
+                // own printing happened to end up.
+                let mut spans = vec![*kw];
+                spans.extend(scrutinees.iter().map(|s| s.span()));
+                let multiline =
+                    Self::any_breaks(&spans) || scrutinees.iter().any(|s| self.expr_would_break(s));
+                if multiline {
+                    self.indent_in();
+                    for (i, s) in scrutinees.iter().enumerate() {
+                        self.newline();
+                        if i > 0 {
+                            self.raw(", ");
+                        }
+                        self.print_expr(s);
                     }
-                    self.print_expr(s);
+                    self.newline();
+                    self.raw("of");
+                    self.indent_out();
+                } else {
+                    self.raw(" ");
+                    for (i, s) in scrutinees.iter().enumerate() {
+                        if i > 0 {
+                            self.raw(", ");
+                        }
+                        self.print_expr(s);
+                    }
+                    self.raw(" of");
                 }
-                self.raw(" of");
                 self.print_indented_siblings(branches, |b| b.span(), |p, b| p.print_case_branch(b));
             }
 
@@ -3314,6 +3342,32 @@ mod tests {
             out,
             "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n"
         );
+        assert_idempotent(src);
+    }
+
+    /// Real report: a `case` scrutinee that's itself going to print
+    /// multi-line (an `Op` chain here) never pushed `case ... of` apart onto
+    /// its own indented block - `of` ended up looking glued right after
+    /// wherever the scrutinee's own last line happened to land, same class
+    /// of "glued fixed-width prefix" gap `print_arrow_rhs`/`print_sig_typ`
+    /// already guard against elsewhere.
+    #[test]
+    fn case_scrutinee_that_would_break_relocates_case_and_of_onto_their_own_lines() {
+        let src = "module Foo where\n\nfoo = case\n  a\n    && b\n  of\n  true -> 1\n  false -> 2\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Same fix, for multiple comma-separated scrutinees - each one lands on
+    /// its own line, subsequent ones leading with `, ` (this printer's usual
+    /// leading-comma list style), with `of` and the branches unaffected.
+    #[test]
+    fn case_multiple_scrutinees_that_would_break_print_one_per_line() {
+        let src =
+            "module Foo where\n\nfoo = case\n  a\n  , b\n  of\n  true, e -> 1\n  _, _ -> 2\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
         assert_idempotent(src);
     }
 
