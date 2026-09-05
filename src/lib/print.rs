@@ -39,17 +39,22 @@ struct Printer<'s> {
     /// without this, each layer would indent again on top of the last, producing a
     /// staircase instead of every `.`/`=>`/`->` breaking to the same indent level.
     in_broken_sig: bool,
-    /// Byte offset into `out` marking "nothing has been printed for the
-    /// current `list()` item yet" - set by `list()` right before printing
-    /// each item in its expanded branch, consumed by a *nested* `list()`
-    /// call's own `own_indent` check (see there). An item glued directly
-    /// after `open `/`, ` is itself a legitimate glue point the outer list
-    /// already committed to, not a floor to relocate away from - but only
-    /// for as long as nothing has been printed for the item yet; the moment
-    /// `out.len()` no longer matches this offset, something (the item's own
-    /// head token, an earlier sibling construct) has been glued in front of
-    /// whatever's being decided now, and ordinary relocation resumes.
-    list_item_head: Option<usize>,
+    /// Byte offset into `out` marking a position some outer construct has
+    /// already committed to as a glue point for whatever comes next - set
+    /// right before printing that "whatever's next" (a `list()` item glued
+    /// after `open `/`, `; an `Expr::Op` operand glued after `op ` once the
+    /// chain's own `newline()` already put the operator on a fresh line of
+    /// its own), consumed by a *nested* construct's own `own_indent`-style
+    /// relocation check (`list()`'s own, `Expr::App`'s). Relocating there
+    /// anyway would double up on a floor the outer construct already
+    /// established - the same "floor" idea documented in FORMATTER.md,
+    /// just for a value-side glue point rather than a type-side one. Valid
+    /// only for as long as nothing has been printed since the mark was set;
+    /// the moment `out.len()` no longer matches it, something (the current
+    /// construct's own head token, an earlier sibling) has been glued in
+    /// front of whatever's being decided now, and ordinary relocation
+    /// resumes.
+    glued_floor: Option<usize>,
 }
 
 /// One or more source `ImportDecl`s for the same (module, alias, hiding-ness),
@@ -83,7 +88,7 @@ impl<'s> Printer<'s> {
             out: String::new(),
             indent: 0,
             in_broken_sig: false,
-            list_item_head: None,
+            glued_floor: None,
         }
     }
 
@@ -883,7 +888,7 @@ impl<'s> Printer<'s> {
             // glued after either isn't going to move, or already broke.
             //
             // Exception: if this whole list is itself sitting at exactly the
-            // position an *outer* list() just glued it to (`list_item_head`,
+            // position an *outer* list() just glued it to (`glued_floor`,
             // see its own doc comment) - i.e. this list is a sole/first item
             // like `[ { c: 1\n, d: 2\n} ]` - the outer list already committed
             // to gluing here, the same way `Button.create {...}` glued after
@@ -892,7 +897,7 @@ impl<'s> Printer<'s> {
             // layout instead of just hanging this list's own continuation
             // lines off the column it's already glued to.
             let own_indent =
-                !self.at_fresh_line() && self.list_item_head != Some(self.out.len());
+                !self.at_fresh_line() && self.glued_floor != Some(self.out.len());
             if own_indent {
                 self.indent_in();
                 self.newline();
@@ -934,10 +939,10 @@ impl<'s> Printer<'s> {
                 if item_hang {
                     self.indent_in();
                 }
-                let prev_list_item_head = self.list_item_head;
-                self.list_item_head = Some(self.out.len());
+                let prev_glued_floor = self.glued_floor;
+                self.glued_floor = Some(self.out.len());
                 print_item(self, item);
-                self.list_item_head = prev_list_item_head;
+                self.glued_floor = prev_glued_floor;
                 if item_hang {
                     self.indent_out();
                 }
@@ -2318,14 +2323,14 @@ impl<'s> Printer<'s> {
                     .collect();
                 let multiline = Self::any_breaks(&spans) || arg_texts.iter().any(Option::is_none);
                 // Suppressed when glued directly after an outer list()'s own
-                // `open `/`, ` (`list_item_head`, see its doc comment and
+                // `open `/`, ` (`glued_floor`, see its doc comment and
                 // `list()`'s matching check) - that's a glue point the outer
                 // list already committed to, not a floor to relocate away
                 // from, the same reasoning that already applies to a nested
                 // `list()`-based value there.
                 let own_indent = multiline
                     && !self.at_fresh_line()
-                    && self.list_item_head != Some(self.out.len());
+                    && self.glued_floor != Some(self.out.len());
                 if own_indent {
                     self.indent_in();
                     self.newline();
@@ -2415,6 +2420,17 @@ impl<'s> Printer<'s> {
                         self.newline();
                         self.lit(*op);
                         self.raw(" ");
+                        // The operand is glued directly after `op ` here -
+                        // `newline()` just made it a genuine floor (see
+                        // `glued_floor`), so a nested `own_indent`-style
+                        // relocation (most commonly `Expr::App`'s, when the
+                        // operand is a call whose own argument breaks)
+                        // needs to hang in place instead of moving further
+                        // away - otherwise the operand ends up stranded on
+                        // its own line below an empty `op`, doubling up on
+                        // the floor this `newline()` already established.
+                        let prev_glued_floor = self.glued_floor;
+                        self.glued_floor = Some(self.out.len());
                         // Unconditional hang, same reasoning as
                         // `print_record_field_rhs`: an operand is glued
                         // directly after its operator, so if the operand
@@ -2425,6 +2441,7 @@ impl<'s> Printer<'s> {
                         self.indent_in();
                         self.print_expr(r);
                         self.indent_out();
+                        self.glued_floor = prev_glued_floor;
                     }
                     self.indent_out();
                 } else {
@@ -3810,7 +3827,7 @@ mod tests {
     /// based value (a record, here) glued directly after `[ ` used to
     /// relocate its own opening brace onto a fresh, deeper line - doubling
     /// up on `item_hang`'s own extra level instead of just hanging its
-    /// fields off the column it's already glued to (see `list_item_head`).
+    /// fields off the column it's already glued to (see `glued_floor`).
     /// The record here has nothing forcing this array to be anything but a
     /// single item, so the only thing making it expand at all is the
     /// record's own internal break - exactly the shape that exposed the bug.
@@ -3829,7 +3846,7 @@ mod tests {
         assert_idempotent(src);
     }
 
-    /// Regression test: the same `list_item_head` bug as
+    /// Regression test: the same `glued_floor` bug as
     /// `array_sole_item_record_stays_glued_after_open_bracket`, but with the
     /// record as the head of an operator chain (`{...} # f # g`) rather than
     /// the whole item on its own - confirms the fix composes with
@@ -3854,7 +3871,7 @@ mod tests {
         assert_idempotent(src);
     }
 
-    /// Same `list_item_head` bug as the two `array_sole_item_*` tests above,
+    /// Same `glued_floor` bug as the two `array_sole_item_*` tests above,
     /// but for `Expr::App`'s own `own_indent` (see "a call's own multiline
     /// decision was all-or-nothing" above) instead of a nested `list()`
     /// call - a real report: a single-item array whose item is a call with
@@ -3899,11 +3916,13 @@ mod tests {
     /// the stable, multiline-chain shape directly.
     #[test]
     fn operator_chain_operand_that_would_break_on_its_own_expands_the_whole_chain() {
+        // `b` stays glued right after `$` - see `glued_floor` and "Session:
+        // `Expr::Op`'s operand floor" in FORMATTER.md.
         let src = "module Foo where\n\nfoo = a $ b\n  { x: 1\n  , y: 2\n  }\n";
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = a\n  $\n      b\n        { x: 1\n        , y: 2\n        }\n"
+            "module Foo where\n\nfoo = a\n  $ b\n      { x: 1\n      , y: 2\n      }\n"
         );
         assert_idempotent(src);
     }
@@ -3928,10 +3947,13 @@ mod tests {
         // that break needs to land one level deeper than the chain's own
         // continuation - not at the same level, which would look like the
         // call's argument is just another step of the chain. The call
-        // itself (`List.map (...)`) also relocates off `#` onto its own
-        // line first, same as it would off `=` - it's glued right after an
-        // operator and ends up printing across multiple lines.
-        let src = "module Foo where\n\nf rs =\n  rs\n    #\n        List.map\n          ( \\r ->\n              r\n                # empty\n          )\n    # List.toArray\n";
+        // itself (`List.map (...)`) stays glued right after `#` - `op ` is
+        // its own floor (`glued_floor`), the same way `open `/`, ` already
+        // is for a `list()` item, so the call's own `own_indent` doesn't
+        // relocate it a second time on top of that (see "Session:
+        // `Expr::Op`'s operand floor" in FORMATTER.md - this test's
+        // expected output used to bake in exactly that now-fixed bug).
+        let src = "module Foo where\n\nf rs =\n  rs\n    # List.map\n        ( \\r ->\n            r\n              # empty\n        )\n    # List.toArray\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);

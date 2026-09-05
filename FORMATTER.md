@@ -1596,6 +1596,72 @@ failure set from the previous two sessions, not a coincidence of timing or
 drift in the sibling repo as those sessions had assumed. The "Status"
 section above has been re-baselined accordingly.
 
+## Session: `Expr::Op`'s operand floor - a real report immediately after the previous session
+
+Real report, real code, found the moment the previous session's fix shipped:
+a chain like `Table.column {...} # Table.mapCellClasses (\payable -> case
+... of ...) # Table.withSort ...` printed with a large gap after the first
+`#` - the operator on its own line (correctly, the chain already had a
+source break there) but then *nothing else* on that line, and
+`Table.mapCellClasses` dropped to a further-indented line below it, instead
+of gluing right after `# `.
+
+Root cause: exactly the same shape as the previous session's `Expr::App`
+bug, just one level up. `Op`'s multiline branch prints each operator via
+`newline(); lit(op); raw(" ")`, gluing the operand directly afterward - but
+the operand here is `Table.mapCellClasses (...)`, an `Expr::App` whose own
+argument (the lambda/`case`) breaks, so `Expr::App`'s own `own_indent` fires
+independently: not at a fresh line (mid `"# "`), would break - so it
+relocates *itself* a second time, right on top of the floor `Op`'s own
+`newline()` had just established. This is the *same* double-relocation bug
+"Session: a nested list() item was relocating its own bracket" and its
+`Expr::App` follow-up fixed for `list()` items - just never extended to
+`Op`'s own operand position, which has an identical "I already committed to
+gluing something right here" floor that a nested `own_indent` decision has
+no way to see.
+
+Also caught: the previous session's own new test
+(`operator_chain_operand_that_would_break_on_its_own_expands_the_whole_
+chain`, `foo = a $ b\n  {...}`) had baked in the very same bug as its
+expected output (`a\n  $\n      b\n        {...}` - `b` stranded below an
+empty `$`, not glued after it), and a *pre-existing* test
+(`operator_chain_operand_that_is_itself_a_broken_call_hangs_one_level_
+deeper`, predating this whole investigation) had baked in the identical bug
+even more directly - its own doc comment explicitly described the buggy
+behavior as intended ("The call itself ... also relocates off `#` onto its
+own line first, same as it would off `=`"). Neither had been caught by the
+1422/1423-file corpus sweep, same reason the previous session's fix wasn't
+caught either: the corpus sweep only asserts idempotence, and this shape -
+operand stranded below an empty operator - is a perfectly stable fixed
+point, just a *wrong* one. Idempotence catches "flip-flops between passes,"
+not "confidently produces the same wrong thing every time" - this class of
+bug needs a real user (or a byte-for-byte diff against known-good
+`purs-tidy` output) to surface at all.
+
+Fixed by generalizing the previous session's own fix rather than inventing
+a second mechanism: renamed `Printer::list_item_head` to the more accurate
+`Printer::glued_floor` (it was never really about "list items" specifically
+- it's "a position an outer construct already committed to as a glue point
+for whatever prints next," which turns out to apply to more than one call
+site) and set it a second place: right before printing each operand in
+`Op`'s multiline branch, in addition to `list()`'s existing per-item mark.
+`Expr::App`'s `own_indent` check (already consulting this field) needed no
+further changes - the exact same condition that made it hang in place for a
+`list()` item now also makes it hang in place for an `Op` operand, for the
+identical reason.
+
+2 existing tests' expected output changed to the newly-correct, glued shape
+(`operator_chain_operand_that_would_break_on_its_own_expands_the_whole_
+chain` and `operator_chain_operand_that_is_itself_a_broken_call_hangs_one_
+level_deeper` - the latter's misleading doc comment rewritten to match).
+No new regression test was added on top of these two updates - between them
+they already exercise both the "chain becomes multiline because an operand
+would break" path and the "chain was already multiline from a source break"
+path this bug could be reached through. Full suite (191 lib + 123 style +
+golden) and clippy clean. Corpus sweep re-run clean (1423/1423, 0 failures)
+- unsurprising given the reasoning above (this bug produces a stable, not a
+flip-flopping, output), but confirms no regression.
+
 ## Testing
 
 - `cargo test --lib print::` — the real test suite, 53 tests in
