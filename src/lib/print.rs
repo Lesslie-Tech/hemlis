@@ -13,7 +13,7 @@
 
 use crate::ast::*;
 use crate::lexer::{SourceToken, Token};
-use crate::source::source_text;
+use crate::source::{line_starts, source_text_with_starts};
 
 const INDENT: usize = 2;
 
@@ -29,6 +29,12 @@ pub fn print_module(source: &str, module: &Module, comments: &[SourceToken<'_>])
 
 struct Printer<'s> {
     source: &'s str,
+    /// Byte offset of the start of each source line, computed once up front -
+    /// `text()`/`lit()` slice a span out of `source` for every leaf AST node
+    /// printed, and recomputing this from scratch (an O(source_len) scan) on
+    /// each of those calls turned printing into an O(source_len * leaf_count)
+    /// pass over large files.
+    line_starts: Vec<usize>,
     comments: &'s [SourceToken<'s>],
     comment_idx: usize,
     out: String,
@@ -83,6 +89,7 @@ impl<'s> Printer<'s> {
     fn new(source: &'s str, comments: &'s [SourceToken<'s>]) -> Self {
         Printer {
             source,
+            line_starts: line_starts(source),
             comments,
             comment_idx: 0,
             out: String::new(),
@@ -425,7 +432,7 @@ impl<'s> Printer<'s> {
     }
 
     fn text(&self, span: Span) -> &'s str {
-        source_text(self.source, &span).unwrap_or("")
+        source_text_with_starts(self.source, &self.line_starts, &span).unwrap_or("")
     }
 
     /// Print a leaf AST node (identifier, literal, ...) by slicing its span out
