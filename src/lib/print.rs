@@ -307,6 +307,18 @@ impl<'s> Printer<'s> {
         would_break
     }
 
+    /// The `Binder` counterpart of `expr_would_break` - used by
+    /// `print_spine_args` over a name/lambda's binders so a binder that's
+    /// itself going to print multi-line (e.g. a record pattern with many
+    /// fields) forces itself and every later binder onto its own line,
+    /// instead of leaving a later binder glued after its closing bracket.
+    fn binder_would_break(&mut self, b: &Binder) -> bool {
+        let comment_idx_before = self.comment_idx;
+        let would_break = self.render_indented(0, |p| p.print_binder(b)).contains('\n');
+        self.comment_idx = comment_idx_before;
+        would_break
+    }
+
     /// The `Typ` counterpart of `paren_would_break`, for the same reason: a
     /// type glued directly after `::`/`->`/`=>` needs to know whether it's
     /// going to print in the block style before deciding whether to break
@@ -1361,10 +1373,13 @@ impl<'s> Printer<'s> {
             }
             Decl::Def(name, binders, ge) => {
                 self.lit(name);
-                for b in binders {
-                    self.raw(" ");
-                    self.print_binder(b);
-                }
+                self.print_spine_args(
+                    name.span(),
+                    binders,
+                    |b| b.span(),
+                    |p, b| p.binder_would_break(b),
+                    |p, b| p.print_binder(b),
+                );
                 let before = binders.last().map_or(name.span(), |b| b.span());
                 self.print_guarded_expr(before, ge, " = ");
             }
@@ -1609,10 +1624,13 @@ impl<'s> Printer<'s> {
             }
             InstBinding::Def(name, binders, ge) => {
                 self.lit(name);
-                for b in binders {
-                    self.raw(" ");
-                    self.print_binder(b);
-                }
+                self.print_spine_args(
+                    name.span(),
+                    binders,
+                    |b| b.span(),
+                    |p, b| p.binder_would_break(b),
+                    |p, b| p.print_binder(b),
+                );
                 let before = binders.last().map_or(name.span(), |b| b.span());
                 self.print_guarded_expr(before, ge, " = ");
             }
@@ -1796,10 +1814,13 @@ impl<'s> Printer<'s> {
             }
             LetBinding::Name(name, binders, ge) => {
                 self.lit(name);
-                for b in binders {
-                    self.raw(" ");
-                    self.print_binder(b);
-                }
+                self.print_spine_args(
+                    name.span(),
+                    binders,
+                    |b| b.span(),
+                    |p, b| p.binder_would_break(b),
+                    |p, b| p.print_binder(b),
+                );
                 let before = binders.last().map_or(name.span(), |b| b.span());
                 self.print_guarded_expr(before, ge, " = ");
             }
@@ -2590,11 +2611,20 @@ impl<'s> Printer<'s> {
             }
             Expr::Lambda(lam, binders, body) => {
                 self.raw("\\");
-                for (i, b) in binders.iter().enumerate() {
-                    if i > 0 {
-                        self.raw(" ");
-                    }
-                    self.print_binder(b);
+                // The first binder stays glued directly after `\` with no
+                // space (unlike a name's binders, which always get a leading
+                // space) - matches this printer's usual "a glued bracket
+                // hangs in place, it never relocates" floor model, so only
+                // binders *after* the first go through `print_spine_args`.
+                if let Some((first, rest)) = binders.split_first() {
+                    self.print_binder(first);
+                    self.print_spine_args(
+                        first.span(),
+                        rest,
+                        |b| b.span(),
+                        |p, b| p.binder_would_break(b),
+                        |p, b| p.print_binder(b),
+                    );
                 }
                 let before_body = binders.last().map_or(*lam, |b| b.span());
                 self.print_arrow_rhs(before_body, " -> ", body);
