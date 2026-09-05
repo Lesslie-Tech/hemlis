@@ -3098,6 +3098,64 @@ mod tests {
         assert_idempotent(src);
     }
 
+    /// Real report: a function definition's binders (unlike `Expr::App`'s
+    /// arguments) never used `print_spine_args` at all, so a binder that
+    /// would itself break (a record pattern with several fields) never
+    /// pushed the name or later binders onto their own line - `y` ended up
+    /// glued right onto the record's own closing `}` line instead of
+    /// following it the way an `App` argument already does. Same fix,
+    /// applied to `Decl::Def`, `InstBinding::Def`, `LetBinding::Name` (below)
+    /// and `Expr::Lambda` (further below) alike.
+    #[test]
+    fn decl_def_binder_that_would_break_pushes_itself_and_later_binders_onto_their_own_line() {
+        let src = "module M where\n\nf x@\n  { a\n  , b\n  }\n  y = 1\n";
+        let out = fmt(src);
+        assert_eq!(out, "module M where\n\nf\n  x@\n    { a\n    , b\n    }\n  y = 1\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn inst_binding_def_binder_that_would_break_pushes_itself_and_later_binders_onto_their_own_line()
+     {
+        let src =
+            "module M where\n\ninstance showFoo :: Show Foo where\n  f x@\n    { a\n    , b\n    }\n    y = 1\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module M where\n\ninstance Show Foo where\n  f\n    x@\n      { a\n      , b\n      }\n    y = 1\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn let_binding_name_binder_that_would_break_pushes_itself_and_later_binders_onto_their_own_line()
+     {
+        let src =
+            "module M where\n\nfoo =\n  let\n    f x@\n      { a\n      , b\n      }\n      y = 1\n  in\n    f\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module M where\n\nfoo =\n  let\n    f\n      x@\n        { a\n        , b\n        }\n      y = 1\n  in\n  f\n"
+        );
+        assert_idempotent(src);
+    }
+
+    /// Same bug and fix as the tests above, but for `Expr::Lambda` - with one
+    /// deliberate asymmetry: the *first* binder stays glued directly after
+    /// `\` (no space, never relocating) both before and after the fix, since
+    /// only binders after the first go through `print_spine_args` (see
+    /// `Expr::Lambda`'s own doc comment).
+    #[test]
+    fn lambda_binder_that_would_break_pushes_later_binders_onto_their_own_line() {
+        let src = "module M where\n\nfoo =\n  \\x@\n     { a\n     , b\n     }\n   y -> 1\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module M where\n\nfoo =\n  \\x@\n    { a\n    , b\n    }\n    y -> 1\n"
+        );
+        assert_idempotent(src);
+    }
+
     /// Regression test for a bug where `case`/`do` nested inside one argument
     /// of a multiline call printed at whatever indent was active before the
     /// call, instead of inheriting the call's own extra indent - so its
