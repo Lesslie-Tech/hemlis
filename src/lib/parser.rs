@@ -1309,11 +1309,11 @@ fn do_statement<'t>(p: &mut P<'t>) -> Option<DoStmt> {
             let b = binder(p)?;
             kw_left_arrow(p)?;
             let e = expr(p)?;
-            Some(Some(DoStmt::Stmt(Some(b), e)))
+            Some(Some(DoStmt::Stmt(Some(b), b!(e))))
         },
         |p: &mut P<'t>| {
             let e = expr(p)?;
-            Some(Some(DoStmt::Stmt(None, e)))
+            Some(Some(DoStmt::Stmt(None, b!(e))))
         },
         |p: &mut P<'t>| {
             let start = p.span();
@@ -2089,10 +2089,10 @@ impl<'s> P<'s> {
             if self.i > self.tokens.len() {
                 break;
             }
-            if let (Some(x), _) = self.peek_() {
-                if f(x) {
-                    return true;
-                }
+            if let (Some(x), _) = self.peek_()
+                && f(x)
+            {
+                return true;
             }
             self.skip();
         }
@@ -2103,11 +2103,11 @@ impl<'s> P<'s> {
     where
         F: Fn(Token<'s>) -> bool,
     {
-        if let (Some(x), _) = self.peek() {
-            if f(x) {
-                self.next();
-                return Some(());
-            }
+        if let (Some(x), _) = self.peek()
+            && f(x)
+        {
+            self.next();
+            return Some(());
         }
         self.raise(Serror::Unexpected(self.span(), self.peekt(), err));
         None

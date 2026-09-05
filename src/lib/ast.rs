@@ -715,7 +715,7 @@ pub struct CaseBranch(pub Vec<Binder>, pub GuardedExpr);
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DoStmt {
-    Stmt(Option<Binder>, Expr),
+    Stmt(Option<Binder>, Box<Expr>),
     /// The `Span` is the `let` keyword's own span - without it, `.span()`
     /// (derived by merging every field) starts at the first binding instead,
     /// which is *after* `let` whenever they print on separate lines (always,

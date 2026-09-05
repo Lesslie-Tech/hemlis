@@ -99,20 +99,15 @@ struct Backend {
     style_mode: RwLock<StyleMode>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum StyleMode {
     /// No style diagnostics or code actions.
     Off,
     /// Style checks only for files open in the editor (default).
+    #[default]
     OpenFilesOnly,
     /// Style checks for all files in the workspace.
     AllFiles,
-}
-
-impl Default for StyleMode {
-    fn default() -> Self {
-        Self::OpenFilesOnly
-    }
 }
 
 impl StyleMode {
@@ -365,7 +360,7 @@ mod tests {
     /// Helper: apply a set of LSP TextEdits to a source string.
     /// Edits are applied in reverse order so that earlier edits don't
     /// shift the positions of later ones.
-    fn apply_edits(source: &str, edits: &mut Vec<TextEdit>) -> String {
+    fn apply_edits(source: &str, edits: &mut [TextEdit]) -> String {
         // Convert (line, col) to byte offset
         let to_offset = |source: &str, line: u32, col: u32| -> usize {
             let mut offset = 0;
@@ -483,16 +478,15 @@ mod tests {
             while let Some(req) = req_stream.next().await {
                 // Capture diagnostics notifications (no id).
                 if req.method() == "textDocument/publishDiagnostics" {
-                    if let Some(params) = req.params() {
-                        if let Ok(p) = serde_json::from_value::<
+                    if let Some(params) = req.params()
+                        && let Ok(p) = serde_json::from_value::<
                             tower_lsp_server::ls_types::PublishDiagnosticsParams,
                         >(params.clone())
-                        {
-                            diagnostics_sink
-                                .lock()
-                                .unwrap()
-                                .insert(p.uri.as_str().to_string(), p.diagnostics);
-                        }
+                    {
+                        diagnostics_sink
+                            .lock()
+                            .unwrap()
+                            .insert(p.uri.as_str().to_string(), p.diagnostics);
                     }
                     continue;
                 }
@@ -3249,10 +3243,10 @@ impl LanguageServer for Backend {
         let _ = self.client_watch_dynamic_registration.set(dynamic_watch);
 
         // Read style mode from initializationOptions
-        if let Some(opts) = params.initialization_options {
-            if let Some(style) = opts.get("style").and_then(|v| v.as_str()) {
-                *self.style_mode.write().unwrap() = StyleMode::from_str(style);
-            }
+        if let Some(opts) = params.initialization_options
+            && let Some(style) = opts.get("style").and_then(|v| v.as_str())
+        {
+            *self.style_mode.write().unwrap() = StyleMode::from_str(style);
         }
 
         Ok(InitializeResult {
@@ -3403,7 +3397,7 @@ impl LanguageServer for Backend {
                                 match event.kind {
                                     EventKind::Create(_) | EventKind::Modify(_) => {
                                         for path in event.paths {
-                                            if path.extension().map_or(false, |e| e == "purs") {
+                                            if path.extension().is_some_and(|e| e == "purs") {
                                                 let _ = tx.send(path);
                                             }
                                         }
@@ -4075,20 +4069,20 @@ impl LanguageServer for Backend {
         delete_all.sort_by_key(|r| (r.start.line, r.start.character));
         let mut merged: Vec<Range> = Vec::new();
         for r in delete_all {
-            if let Some(last) = merged.last_mut() {
-                if (r.start.line, r.start.character) <= (last.end.line, last.end.character) {
-                    if (r.end.line, r.end.character) > (last.end.line, last.end.character) {
-                        last.end = r.end;
-                    }
-                    continue;
+            if let Some(last) = merged.last_mut()
+                && (r.start.line, r.start.character) <= (last.end.line, last.end.character)
+            {
+                if (r.end.line, r.end.character) > (last.end.line, last.end.character) {
+                    last.end = r.end;
                 }
+                continue;
             }
             merged.push(r);
         }
         let delete_all = merged;
         if !delete_all.is_empty() {
             out.push(CodeAction {
-                title: format!("BurnAllUnusedImport"),
+                title: "BurnAllUnusedImport".to_string(),
                 kind: Some(CodeActionKind::SOURCE_FIX_ALL),
                 is_preferred: None,
                 edit: Some(WorkspaceEdit::new(
@@ -4509,7 +4503,7 @@ impl LanguageServer for Backend {
                                         let alias = {
                                             let parts: Vec<&str> = module_str.split('.').collect();
                                             if parts.len() == 2 {
-                                                if parts.get(0) == Some(&"Ctx") {
+                                                if parts.first() == Some(&"Ctx") {
                                                     format!("{}{}", parts[1], parts[0])
                                                 } else {
                                                     format!("{}{}", parts[0], parts[1])
@@ -4825,17 +4819,17 @@ impl LanguageServer for Backend {
                                             },
                                             _ => None,
                                         };
-                                        if let Some(fields) = record_fields {
-                                            if let Some(idx) = fields.iter().position(|f| {
+                                        if let Some(fields) = record_fields
+                                            && let Some(idx) = fields.iter().position(|f| {
                                                 matches!(f, ast::RecordLabelBinder::Pun(n) if n.0 .0 == field_ud)
                                                     || matches!(f, ast::RecordLabelBinder::Field(l, _) if l.0 .0 == field_ud)
-                                            }) {
-                                                let field_spans: Vec<_> = fields.iter().map(|f| f.span()).collect();
-                                                edits.push(TextEdit::new(
-                                                    remove_nth_range(&field_spans, idx, false),
-                                                    "".into(),
-                                                ));
-                                            }
+                                            })
+                                        {
+                                            let field_spans: Vec<_> = fields.iter().map(|f| f.span()).collect();
+                                            edits.push(TextEdit::new(
+                                                remove_nth_range(&field_spans, idx, false),
+                                                "".into(),
+                                            ));
                                         }
                                     }
                                 }
@@ -4891,7 +4885,7 @@ impl LanguageServer for Backend {
         // then stable-sort preferred items to the front without disturbing within-group order.
         let mut seen_titles = std::collections::HashSet::new();
         out.retain(|x| seen_titles.insert(x.title.clone()));
-        out.sort_by(|a, b| b.is_preferred.cmp(&a.is_preferred));
+        out.sort_by_key(|x| std::cmp::Reverse(x.is_preferred));
         Ok(Some(out.into_iter().map(|x| x.into()).collect()))
     }
 
@@ -5035,11 +5029,11 @@ fn similarity_score(ax: &str, bx: &str) -> f32 {
         distances.push(vec![0; 1 + ax.len()]);
     }
 
-    for i in 1..=ax.len() {
-        distances[0][i] = i;
+    for (i, d) in distances[0].iter_mut().enumerate().skip(1) {
+        *d = i;
     }
-    for j in 1..=bx.len() {
-        distances[j][0] = j;
+    for (j, row) in distances.iter_mut().enumerate().skip(1) {
+        row[0] = j;
     }
 
     for (i, a) in ax.iter().enumerate() {
@@ -5333,16 +5327,14 @@ fn as_import(
     match scope {
         _ if is_constructor => format!("{}(..)", name),
 
-        Scope::Kind | Scope::Type if is_identifier => {
-            format!("{}", name)
-        }
+        Scope::Kind | Scope::Type if is_identifier => name.to_string(),
         Scope::Kind | Scope::Type => {
             format!("type ({})", name)
         }
         Scope::Class => format!("class {}", name),
         Scope::Namespace | Scope::Module => format!("module {}", name),
 
-        Scope::Term if is_identifier => format!("{}", name),
+        Scope::Term if is_identifier => name.to_string(),
         Scope::Term => format!("({})", name),
         Scope::Label => "".to_string(),
     }
@@ -5790,7 +5782,7 @@ impl Backend {
         self.resolved.insert(me, resolved);
 
         {
-            let mut us = self.references.entry(me).or_insert(BTreeMap::new());
+            let mut us = self.references.entry(me).or_default();
             for (k, v) in us.iter_mut() {
                 v.retain(|(x, _)| x.fi() != Some(fi));
                 v.append(&mut references.get(k).cloned().unwrap_or_default());
@@ -5838,17 +5830,17 @@ impl Backend {
                 .insert(fi, new.clone())
                 .unwrap_or_default();
             for (name, pos, sort) in old.difference(&new) {
-                if let Some(mut e) = self.references.get_mut(&name.1) {
-                    if let Some(e) = e.get_mut(name) {
-                        e.remove(&(*pos, *sort));
-                    }
+                if let Some(mut e) = self.references.get_mut(&name.1)
+                    && let Some(e) = e.get_mut(name)
+                {
+                    e.remove(&(*pos, *sort));
                 }
             }
 
             for (name, pos, sort) in new.difference(&old) {
-                let mut e = self.references.entry(name.1).or_insert(BTreeMap::new());
+                let mut e = self.references.entry(name.1).or_default();
                 e.entry(*name)
-                    .or_insert(BTreeSet::new())
+                    .or_default()
                     .insert((*pos, *sort));
             }
         }
@@ -5873,12 +5865,12 @@ impl Backend {
             let new_imports: BTreeMap<_, _> = n
                 .imports
                 .into_iter()
-                .map(|(k, v)| (k, v.into_iter().flat_map(|(_, x)| x).collect::<Vec<_>>()))
+                .map(|(k, v)| (k, v.into_values().flatten().collect::<Vec<_>>()))
                 .collect();
             let old_imports = self
                 .imports
                 .insert(me, new_imports.clone())
-                .unwrap_or_else(BTreeMap::new);
+                .unwrap_or_default();
             let new_imports = new_imports
                 .values()
                 .flat_map(|x| {
@@ -5896,13 +5888,13 @@ impl Backend {
             for x in old_imports.difference(&new_imports) {
                 self.importers
                     .entry(*x)
-                    .or_insert(BTreeSet::new())
+                    .or_default()
                     .remove(&me);
             }
             for x in new_imports.difference(&old_imports) {
                 self.importers
                     .entry(*x)
-                    .or_insert(BTreeSet::new())
+                    .or_default()
                     .insert(me);
             }
         }

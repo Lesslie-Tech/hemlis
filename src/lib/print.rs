@@ -1798,12 +1798,13 @@ impl<'s> Printer<'s> {
     /// itself can stay glued to the same line too (`let x = 1 in x`) or
     /// needs its own fresh line below the bindings block.
     fn print_let_kw_bindings(&mut self, let_span: Span, bindings: &[LetBinding]) -> bool {
-        if let [only] = bindings {
-            if !Self::breaks_before(let_span, only.span()) && !self.let_binding_would_break(only) {
-                self.raw(" ");
-                self.print_let_binding(only);
-                return true;
-            }
+        if let [only] = bindings
+            && !Self::breaks_before(let_span, only.span())
+            && !self.let_binding_would_break(only)
+        {
+            self.raw(" ");
+            self.print_let_binding(only);
+            return true;
         }
         self.print_let_bindings(bindings);
         false

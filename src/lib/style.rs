@@ -688,17 +688,17 @@ fn rule_unqualified_do(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
 /// expression positions. The whole-module allowance (when the module defines
 /// its own top-level `pure`) is handled by the caller.
 fn rule_unqualified_pure(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
-    if let ast::Expr::Ident(ast::QName(None, name)) = expr {
-        if (name.0).0 == Ud::new("pure") {
-            let span = expr.span();
-            out.push(StyleDiagnostic {
-                cursor_span: span,
-                expr_span: span,
-                action: StyleAction::Warn {
-                    message: "Unqualified `pure`; use a qualified `Applicative.pure`".into(),
-                },
-            });
-        }
+    if let ast::Expr::Ident(ast::QName(None, name)) = expr
+        && (name.0).0 == Ud::new("pure")
+    {
+        let span = expr.span();
+        out.push(StyleDiagnostic {
+            cursor_span: span,
+            expr_span: span,
+            action: StyleAction::Warn {
+                message: "Unqualified `pure`; use a qualified `Applicative.pure`".into(),
+            },
+        });
     }
 }
 

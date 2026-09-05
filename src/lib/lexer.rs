@@ -57,43 +57,42 @@ fn lex_qual<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> &'t str {
 }
 
 fn lex_symbol<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> &'t str {
-    if let Some(at) = lex.remainder().find(")") {
-        if at != 0
-            && lex
-                .remainder()
-                .get(0..at)
-                .map(|x| {
-                    x.chars().all(|x| {
-                        matches!(
-                            x,
-                            '!' | '#'
-                                | '$'
-                                | '%'
-                                | '&'
-                                | '*'
-                                | '+'
-                                | '.'
-                                | '-'
-                                | '\\'
-                                | '|'
-                                | '/'
-                                | '<'
-                                | '='
-                                | '>'
-                                | '?'
-                                | '@'
-                                | '^'
-                                | '~'
-                                | ':'
-                                | ';'
-                                | '¤'
-                        )
-                    })
+    if let Some(at) = lex.remainder().find(")")
+        && at != 0
+        && lex
+            .remainder()
+            .get(0..at)
+            .map(|x| {
+                x.chars().all(|x| {
+                    matches!(
+                        x,
+                        '!' | '#'
+                            | '$'
+                            | '%'
+                            | '&'
+                            | '*'
+                            | '+'
+                            | '.'
+                            | '-'
+                            | '\\'
+                            | '|'
+                            | '/'
+                            | '<'
+                            | '='
+                            | '>'
+                            | '?'
+                            | '@'
+                            | '^'
+                            | '~'
+                            | ':'
+                            | ';'
+                            | '¤'
+                    )
                 })
-                .unwrap_or(false)
-        {
-            lex.bump(at + 1);
-        }
+            })
+            .unwrap_or(false)
+    {
+        lex.bump(at + 1);
     }
     lex.slice()
 }
@@ -446,10 +445,10 @@ impl<'t> C<'t> {
     where
         P: Fn(Delim) -> bool,
     {
-        if let Some((_, d)) = self.state.last() {
-            if p(*d) {
-                self.state.pop();
-            }
+        if let Some((_, d)) = self.state.last()
+            && p(*d)
+        {
+            self.state.pop();
         }
     }
 

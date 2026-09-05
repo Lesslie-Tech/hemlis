@@ -257,10 +257,10 @@ impl<'s> N<'s> {
             return;
         }
         let from_name = Name(Scope::Module, from.0 .0, from.0 .0, Visibility::Public);
-        if let Some(usages) = self.global_usages.get(&from_name) {
-            if usages.iter().any(|(_, sort)| sort == &Sort::Export) {
-                return;
-            }
+        if let Some(usages) = self.global_usages.get(&from_name)
+            && usages.iter().any(|(_, sort)| sort == &Sort::Export)
+        {
+            return;
         }
         if let Some(to) = to {
             let n = to.0 .0;
@@ -393,14 +393,13 @@ impl<'s> N<'s> {
                                         for m in mem {
                                             if let Some(name) =
                                                 fields.iter().find(|name| name.name() == m.0 .0)
+                                                && !self.is_used(name)
                                             {
-                                                if !self.is_used(name) {
-                                                    self.errors.push(
-                                                        NRerrors::UnusedImportedConstructor(
-                                                            m.0 .0, m.0 .1,
-                                                        ),
-                                                    );
-                                                }
+                                                self.errors.push(
+                                                    NRerrors::UnusedImportedConstructor(
+                                                        m.0 .0, m.0 .1,
+                                                    ),
+                                                );
                                             }
                                         }
                                     } else if all_unused && ty_unused {
