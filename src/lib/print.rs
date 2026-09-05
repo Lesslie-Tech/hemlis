@@ -39,6 +39,17 @@ struct Printer<'s> {
     /// without this, each layer would indent again on top of the last, producing a
     /// staircase instead of every `.`/`=>`/`->` breaking to the same indent level.
     in_broken_sig: bool,
+    /// Byte offset into `out` marking "nothing has been printed for the
+    /// current `list()` item yet" - set by `list()` right before printing
+    /// each item in its expanded branch, consumed by a *nested* `list()`
+    /// call's own `own_indent` check (see there). An item glued directly
+    /// after `open `/`, ` is itself a legitimate glue point the outer list
+    /// already committed to, not a floor to relocate away from - but only
+    /// for as long as nothing has been printed for the item yet; the moment
+    /// `out.len()` no longer matches this offset, something (the item's own
+    /// head token, an earlier sibling construct) has been glued in front of
+    /// whatever's being decided now, and ordinary relocation resumes.
+    list_item_head: Option<usize>,
 }
 
 /// One or more source `ImportDecl`s for the same (module, alias, hiding-ness),
@@ -72,6 +83,7 @@ impl<'s> Printer<'s> {
             out: String::new(),
             indent: 0,
             in_broken_sig: false,
+            list_item_head: None,
         }
     }
 
@@ -869,7 +881,18 @@ impl<'s> Printer<'s> {
             // token first instead" strategy (`paren_would_break` +
             // `print_arrow_rhs`), so by the time `list()` runs, whatever it's
             // glued after either isn't going to move, or already broke.
-            let own_indent = !self.at_fresh_line();
+            //
+            // Exception: if this whole list is itself sitting at exactly the
+            // position an *outer* list() just glued it to (`list_item_head`,
+            // see its own doc comment) - i.e. this list is a sole/first item
+            // like `[ { c: 1\n, d: 2\n} ]` - the outer list already committed
+            // to gluing here, the same way `Button.create {...}` glued after
+            // `[ ` stays glued when it happens to print flat. Relocating
+            // anyway would double up on the outer list's own already-settled
+            // layout instead of just hanging this list's own continuation
+            // lines off the column it's already glued to.
+            let own_indent =
+                !self.at_fresh_line() && self.list_item_head != Some(self.out.len());
             if own_indent {
                 self.indent_in();
                 self.newline();
@@ -911,7 +934,10 @@ impl<'s> Printer<'s> {
                 if item_hang {
                     self.indent_in();
                 }
+                let prev_list_item_head = self.list_item_head;
+                self.list_item_head = Some(self.out.len());
                 print_item(self, item);
+                self.list_item_head = prev_list_item_head;
                 if item_hang {
                     self.indent_out();
                 }
@@ -2291,7 +2317,15 @@ impl<'s> Printer<'s> {
                     })
                     .collect();
                 let multiline = Self::any_breaks(&spans) || arg_texts.iter().any(Option::is_none);
-                let own_indent = multiline && !self.at_fresh_line();
+                // Suppressed when glued directly after an outer list()'s own
+                // `open `/`, ` (`list_item_head`, see its doc comment and
+                // `list()`'s matching check) - that's a glue point the outer
+                // list already committed to, not a floor to relocate away
+                // from, the same reasoning that already applies to a nested
+                // `list()`-based value there.
+                let own_indent = multiline
+                    && !self.at_fresh_line()
+                    && self.list_item_head != Some(self.out.len());
                 if own_indent {
                     self.indent_in();
                     self.newline();
@@ -2729,9 +2763,17 @@ mod tests {
     /// breaking mid-line.
     #[test]
     fn array_item_that_would_break_on_its_own_expands_the_whole_array() {
+        // Expected output updated by "Session: a nested list() item was
+        // relocating its own bracket" (see FORMATTER.md): `c` used to get
+        // stranded on its own line below an orphaned `,` (`Expr::App`'s own
+        // `own_indent` relocating even though `c` was already glued directly
+        // after the list's own `, ` - the same double-relocation bug fixed
+        // there, just via `Expr::App` instead of a nested `list()`). `c`
+        // correctly stays glued to the comma now; only `d`, which genuinely
+        // breaks from `c` in the source, drops to its own line.
         let src = "module Foo where\n\nfoo = [a b, c\n d]\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  [ a b\n  ,\n      c\n        d\n  ]\n");
+        assert_eq!(out, "module Foo where\n\nfoo =\n  [ a b\n  , c\n      d\n  ]\n");
         assert_idempotent(src);
     }
 
@@ -3719,6 +3761,78 @@ mod tests {
             "      # Button.isPrimary\n",
             "      # Button.isFullwidth true\n",
             "      # Button.toHtml\n",
+            "  ]\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression test: a `list()` item that's itself a *nested* `list()`-
+    /// based value (a record, here) glued directly after `[ ` used to
+    /// relocate its own opening brace onto a fresh, deeper line - doubling
+    /// up on `item_hang`'s own extra level instead of just hanging its
+    /// fields off the column it's already glued to (see `list_item_head`).
+    /// The record here has nothing forcing this array to be anything but a
+    /// single item, so the only thing making it expand at all is the
+    /// record's own internal break - exactly the shape that exposed the bug.
+    #[test]
+    fn array_sole_item_record_stays_glued_after_open_bracket() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "a =\n",
+            "  [ { c: 1\n",
+            "    , d: 2\n",
+            "    }\n",
+            "  ]\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression test: the same `list_item_head` bug as
+    /// `array_sole_item_record_stays_glued_after_open_bracket`, but with the
+    /// record as the head of an operator chain (`{...} # f # g`) rather than
+    /// the whole item on its own - confirms the fix composes with
+    /// `item_hang`'s own extra level for the chain's continuations instead
+    /// of stacking a second, spurious level on top of the record's own
+    /// brace.
+    #[test]
+    fn array_sole_item_operator_chain_head_record_stays_glued() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "a =\n",
+            "  x y\n",
+            "    [ { c: 1\n",
+            "      , d: 2\n",
+            "      }\n",
+            "        # f\n",
+            "        # g\n",
+            "    ]\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Same `list_item_head` bug as the two `array_sole_item_*` tests above,
+    /// but for `Expr::App`'s own `own_indent` (see "a call's own multiline
+    /// decision was all-or-nothing" above) instead of a nested `list()`
+    /// call - a real report: a single-item array whose item is a call with
+    /// an argument that itself breaks (a record) used to relocate the whole
+    /// call (head included) onto its own line below an empty `[`, doubling
+    /// up on `item_hang`'s own level exactly like the record case did.
+    #[test]
+    fn array_sole_item_call_head_stays_glued_after_open_bracket() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "a =\n",
+            "  [ g\n",
+            "      { b: 1\n",
+            "      , c: 2\n",
+            "      }\n",
+            "      h\n",
             "  ]\n",
         );
         let out = fmt(src);

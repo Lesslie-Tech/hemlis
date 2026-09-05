@@ -12,7 +12,11 @@ verbatim source-text slice — nothing else does). Verified against all 1423
 real-world `.purs` files in a sibling repo, `../pay-backend/lib` (external,
 read-only reference — never modified): every file formats and reparses
 cleanly and idempotently. 64 unit tests in `src/lib/print.rs`, all passing;
-full suite (166 lib + 123 style + golden) and clippy clean.
+full suite (166 lib + 123 style + golden) and clippy clean. **Stale as of
+"Session: a nested list() item was relocating its own bracket" below**: the
+sibling repo has since moved forward and the sweep now shows 226 pre-existing
+`NOT IDEMPOTENT` files from an unrelated `$`-operator gap - needs a fresh full
+pass to re-baseline, not caused by anything in this repo's recent commits.
 
 A diff of our output against `../pay-backend/lib/Array.purs` (formatted by
 `purs-tidy`, the tool this is meant to replace) shrank from 511 diff lines to
@@ -1423,6 +1427,109 @@ break, then one-per-line for the rest) is unchanged.
 1 new regression test taken directly from the real report (`app_relocates_
 when_a_later_glued_argument_would_break`), on top of the parser test from
 bug 2. Full suite (182 lib + 123 style + golden) and clippy clean.
+
+## Session: a nested list() item was relocating its own bracket, doubling up on `item_hang`
+
+Real report: a single-item array whose sole item is a record that itself
+breaks across lines (`[ { c: 1\n, d: 2\n} ]`), optionally with the record as
+the head of an operator chain (`{...} # f # g`), reformatted with `[` pushed
+onto its own line and the record's `{` relocated a further level below
+*that* - two stacked levels of indent that shouldn't have been there at all;
+the source's own `[ {`-glued style (matching real `purs-tidy` output) should
+have stayed unchanged.
+
+Root cause: `list()`'s `own_indent` (see "Layout philosophy" and the "floor"
+model above) always relocates a list's own opening bracket onto a fresh,
+deeper line whenever it isn't already at a fresh one - correct, and
+extensively tested, for the case it was designed around (`foo = { a: 1,\n
+b: 2 }` → `foo =\n  { a: 1\n  , b: 2\n  }`, a record glued after a
+declaration's own `=`, which is a genuine floor with no other established
+"hang in place instead" convention competing for that column). But `list()`
+is also *recursive*: an array's own item can itself be another `list()`-based
+value (a record, here), and that inner `list()` call makes the exact same
+`own_indent` decision, based only on `self.at_fresh_line()` - with no way to
+tell "I'm glued after an outer list's own `open `/`, `, which already
+committed to gluing me here" apart from "I'm glued after some other
+construct (`=`, an `App` head) that never made any such commitment and
+expects me to relocate". Both read identically as "not at a fresh line," so
+the record dutifully relocated a second time, stacking on top of the outer
+array's own `item_hang` level (already added for exactly this position, per
+"Session: the same missing level, for list items" above) - hence the double
+indent.
+
+Fixed with a new `Printer::list_item_head: Option<usize>` field: `list()`
+records `self.out.len()` right before calling `print_item` for each item in
+its expanded branch (both the `i == 0` item glued after `open ` and every
+`i > 0` item glued after `, `), and restores the previous value after.
+`own_indent`'s check becomes `!self.at_fresh_line() && self.list_item_head !=
+Some(self.out.len())` - a nested `list()` call reached with *nothing else
+printed yet* for the current item (the common case: the item's own value
+*is* the record, or the record is the first thing an operator chain prints)
+sees its own start position still matching the mark, and skips relocating -
+hanging its fields off the column it's already glued to instead, the same
+way `Button.create {...}` already stayed glued when it happened to print
+flat. The mark self-invalidates the moment anything else is printed for the
+item (an identifier, an earlier operand) - reached that way, a nested
+`list()`'s own `own_indent` decision is untouched, matching every existing
+`=`/`App`-argument relocation test unchanged.
+
+Deliberately not a broader "list() items never relocate" rule (that was
+tried once already, for `print_row`/`print_paren_block`, and reverted - see
+the "floor" model session above, `foo = [1,\n  2, 3]` needs the array itself
+to relocate after `=`, and this fix doesn't touch that call site's own
+`own_indent` at all, only what a list() item *nested inside another list()*
+sees).
+
+2 new regression tests, both taken directly from the real report
+(`array_sole_item_record_stays_glued_after_open_bracket`, the plain-record
+case, and `array_sole_item_operator_chain_head_record_stays_glued`, the
+operator-chain-head variant). Full suite (189 lib + 123 style + golden) and
+clippy clean. The external corpus sweep (`../pay-backend/lib`) currently
+shows 226 pre-existing `NOT IDEMPOTENT` files unrelated to this fix (the
+sibling repo has moved forward since the last verified clean sweep and now
+contains an unrelated `$`-operator idempotence gap, confirmed by diffing the
+exact same 226-file set with and without this change) - not a regression
+from this session, but the "1422/1423 clean" claim above is stale and the
+sweep needs a fresh full pass to re-baseline.
+
+## Session: the same `list_item_head` bug, for `Expr::App`'s own relocation
+
+A direct follow-up, found immediately after the previous session by the same
+user against real code: a single-item array whose item is a *call* with an
+argument that itself breaks (`[ g\n    { b: 1\n    , c: 2\n    }\n    h\n
+]`, `UI.viewNavbar { ... } uiModel` in the real report) printed with `[`
+alone on its own line and `g`/`UI.viewNavbar` relocated a further level below
+that - the exact same double-relocation shape as the previous session, just
+through `Expr::App`'s own `own_indent` (added in "a call's own multiline
+decision was all-or-nothing" above) instead of a nested `list()` call.
+`Expr::App`'s `own_indent` has the identical blind spot the previous
+session's `list()` fix closed: it decides purely from `!self.at_fresh_line()`
+and had no way to tell "glued after an outer list's own `open `/`, `, which
+already committed to gluing me here" apart from "glued after `=`/another call
+that expects me to relocate."
+
+Fixed the same way, reusing the same `list_item_head` mark rather than
+inventing a second mechanism: `Expr::App`'s `own_indent` gained the identical
+`&& self.list_item_head != Some(self.out.len())` condition `list()`'s own
+check already has. `Expr::Op` was checked too and doesn't have this bug -
+unlike `list()`/`Expr::App`, it never relocates its own head at all (`first`
+always glues in place unconditionally; only its *continuations* get an extra
+`indent_in`), so there's no relocation decision for `list_item_head` to
+correct there.
+
+One existing test's expected output changed
+(`array_item_that_would_break_on_its_own_expands_the_whole_array`): its
+second item (`c\n d`, an `App` glued after the list's own `, `) used to
+strand `c` on its own line below an orphaned `,` - exactly this bug, just
+already latent in an existing test whose expected value had baked in the
+buggy shape. Now `c` correctly stays glued to the comma and only `d` (which
+genuinely breaks from `c` in the source) drops to its own line - strictly
+more correct, not a behavior change requiring new justification. 1 new
+regression test taken directly from the real report
+(`array_sole_item_call_head_stays_glued_after_open_bracket`). Full suite (190
+lib + 123 style + golden) and clippy clean. External corpus sweep still shows
+the same pre-existing 226 `NOT IDEMPOTENT` files, unrelated to this fix (see
+previous session).
 
 ## Testing
 
