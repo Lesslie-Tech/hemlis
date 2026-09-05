@@ -2403,8 +2403,24 @@ impl<'s> Printer<'s> {
             }
             Expr::Vta(f, t) => {
                 self.print_expr(f);
-                self.raw(" @");
-                self.print_typ(t);
+                // Same shape as `print_sig_typ`/`print_typ_alias_rhs`: `@` is a
+                // fixed-width raw token glued directly onto `f`'s own line, so if
+                // `t` is going to break (a `Row`/`Record` visible type application
+                // is the common case), hanging it under `@`'s own column instead
+                // of relocating to a fresh indented line would inherit however
+                // deep `f` already sits - e.g. as an `App` argument several
+                // levels in - and blow the whole type out to the right instead of
+                // a stable, shallow indent.
+                if Self::breaks_before(f.span(), t.span()) || self.typ_would_break(t) {
+                    self.indent_in();
+                    self.newline();
+                    self.raw("@");
+                    self.print_typ_glued(t);
+                    self.indent_out();
+                } else {
+                    self.raw(" @");
+                    self.print_typ(t);
+                }
             }
             Expr::Op(..) => {
                 let (first, rest) = Self::op_spine(e);
@@ -2738,6 +2754,17 @@ mod tests {
         let once = fmt(src);
         let twice = fmt(&once);
         assert_eq!(once, twice, "formatting is not idempotent");
+    }
+
+    #[test]
+    fn vta_row_type_breaks_to_a_fresh_line_instead_of_hanging_off_a_deep_column() {
+        let src = "module M where\n\nx =\n    ( foo\n        @( aaa :: _\n        , bbb :: _\n        , ccc :: _\n        )\n    )\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module M where\n\nx =\n  ( foo\n      @( aaa :: _\n       , bbb :: _\n       , ccc :: _\n       )\n  )\n"
+        );
+        assert_idempotent(src);
     }
 
     #[test]
