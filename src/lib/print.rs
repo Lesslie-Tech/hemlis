@@ -2541,16 +2541,20 @@ impl<'s> Printer<'s> {
                         // spuriously fail this flat attempt.
                         let prev_glued_floor = self.glued_floor;
                         self.glued_floor = Some(self.out.len());
-                        // Unconditional hang, same reasoning as
-                        // `print_record_field_rhs`: an operand is glued
-                        // directly after its operator, so if the operand
-                        // itself breaks (an `App` call, a `case`), that
-                        // break needs to land one level deeper than the
-                        // chain's own continuation, not at the same level -
-                        // invisible when the operand prints flat.
-                        self.indent_in();
-                        self.print_expr(r);
-                        self.indent_out();
+                        // Hung under the operand's own real column (`op `'s
+                        // width included), not a plain `indent_in()` off the
+                        // chain's stale ambient level - `op ` is a
+                        // fixed-width glued prefix the ambient baseline has
+                        // no memory of, the same reasoning as
+                        // `print_sig_typ`/`print_constraint`'s own
+                        // `hang_glued` calls (see its doc comment). A plain
+                        // ambient bump can land short of the operator's own
+                        // column whenever `op `'s width isn't an exact
+                        // multiple of `INDENT`, letting the operand's own
+                        // break (an `App` call, a `case`) print "behind" the
+                        // operator instead of past it - invisible when the
+                        // operand prints flat.
+                        self.hang_glued(|p| p.print_expr(r));
                         self.glued_floor = prev_glued_floor;
                         if !self.out[mark..].contains('\n') {
                             prev_span = cur_span;
@@ -2566,9 +2570,7 @@ impl<'s> Printer<'s> {
                     self.raw(" ");
                     let prev_glued_floor = self.glued_floor;
                     self.glued_floor = Some(self.out.len());
-                    self.indent_in();
-                    self.print_expr(r);
-                    self.indent_out();
+                    self.hang_glued(|p| p.print_expr(r));
                     self.glued_floor = prev_glued_floor;
                     prev_span = cur_span;
                 }
@@ -4258,6 +4260,34 @@ mod tests {
         // `Expr::Op`'s operand floor" in FORMATTER.md - this test's
         // expected output used to bake in exactly that now-fixed bug).
         let src = "module Foo where\n\nf rs =\n  rs\n    # List.map\n        ( \\r ->\n            r\n              # empty\n        )\n    # List.toArray\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Real report: the operand hang above used a plain `indent_in()` off
+    /// the chain's own ambient level instead of hanging under the operand's
+    /// real column (`op `'s own width included) - invisible for a one-char
+    /// operator like `#` (`"# "` happens to be exactly one `INDENT` wide,
+    /// see the test above), but for a wider operator (`<#>`) the operand's
+    /// own further break (here, a lambda whose body is a `case`) landed
+    /// level with the lambda itself instead of past it - visually "behind"
+    /// the operator instead of hanging off its floor.
+    #[test]
+    fn operator_chain_lambda_operand_case_body_hangs_under_the_lambda_not_the_chain() {
+        let src = "module Foo where\n\nfoo =\n  a\n    <#> \\x ->\n          case y of\n            true -> 1\n            false -> 2\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Same bug, for a call operand whose own argument relocates (see
+    /// `operator_chain_operand_that_is_itself_a_broken_call_hangs_one_level_deeper`
+    /// above) - `f`'s paren argument needs to hang under `f`'s own column,
+    /// not the chain's ambient level.
+    #[test]
+    fn operator_chain_call_operand_paren_arg_hangs_under_the_call_not_the_chain() {
+        let src = "module Foo where\n\nfoo =\n  a\n    <#> f\n          ( b\n              >>> c\n          )\n          d\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
