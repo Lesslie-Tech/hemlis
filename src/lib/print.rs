@@ -528,35 +528,54 @@ impl<'s> Printer<'s> {
         (cur, args)
     }
 
-    /// Flattens an `Op` tree - `Op(a, op1, Op(b, op2, c))`,
-    /// `Op(Op(a, op1, b), op2, c)`, or any other nesting shape precedence
-    /// climbing produces - into the flat in-order sequence of operands and
-    /// operators the source actually wrote: `(a, [(op1, b), (op2, c)])`.
+    /// An operator's precedence *number* (`op_fixity`'s `Prec::L(n)`/`R(n)`/
+    /// `N(n)`, stripped of its associativity direction) - what `op_spine`
+    /// uses to decide whether two adjacent operators bind at the same level.
+    fn op_prec(op: &QOp) -> usize {
+        crate::parser::op_fixity((op.1).0 .0).prec()
+    }
+
+    /// Flattens a *same-precedence* run of an `Op` tree - `Op(a, op1, Op(b,
+    /// op2, c))`, `Op(Op(a, op1, b), op2, c)`, or any other nesting shape
+    /// precedence climbing produces, provided `op1`/`op2`/... all share one
+    /// precedence number - into the flat in-order sequence of operands and
+    /// operators the source actually wrote: `(a, [(op1, b), (op2, c)])`. A
+    /// child `Op` node whose operator binds at a *different* precedence than
+    /// `e`'s own (a tighter or looser sub-chain, e.g. the `&&`s inside `a ||
+    /// b && c || d && e`) is left un-flattened - it stays a single atomic
+    /// operand here, printed later by recursing back into `Expr::Op`'s own
+    /// printing, so it makes its own independent flat/multiline decision
+    /// instead of being dragged into the outer chain's.
     ///
-    /// Needed for the same reason `app_spine` flattens `App`: printing each
-    /// binary `Op` node's multiline decision independently nests one
-    /// `indent_in` inside another whenever the tree leans the "wrong" way for
-    /// its operator's associativity (e.g. right-associative `<>`, which nests
-    /// on the right, puts each subsequent `Op` inside the previous one's own
-    /// `indent_in`/`newline` block) - so a chain of N same-precedence
-    /// operators drifts one indent level deeper per operator instead of
-    /// lining up flush. Flattening first lets the whole chain make one
-    /// multiline decision and print every continuation at the same indent,
-    /// regardless of how precedence happened to shape the tree.
+    /// Flattening a same-precedence run is needed for the same reason
+    /// `app_spine` flattens `App`: printing each binary `Op` node's
+    /// multiline decision independently nests one `indent_in` inside another
+    /// whenever the tree leans the "wrong" way for its operator's
+    /// associativity (e.g. right-associative `<>`, which nests on the right,
+    /// puts each subsequent `Op` inside the previous one's own `indent_in`/
+    /// `newline` block) - so a chain of N same-precedence operators drifts
+    /// one indent level deeper per operator instead of lining up flush.
+    /// Flattening first lets the whole run make one multiline decision and
+    /// print every continuation at the same indent, regardless of how
+    /// precedence happened to shape the tree.
     fn op_spine(e: &Expr) -> (&Expr, Vec<(&QOp, &Expr)>) {
-        fn go<'e>(e: &'e Expr, operands: &mut Vec<&'e Expr>, ops: &mut Vec<&'e QOp>) {
+        fn go<'e>(e: &'e Expr, target: usize, operands: &mut Vec<&'e Expr>, ops: &mut Vec<&'e QOp>) {
             match e {
-                Expr::Op(l, op, r) => {
-                    go(l, operands, ops);
+                Expr::Op(l, op, r) if Printer::op_prec(op) == target => {
+                    go(l, target, operands, ops);
                     ops.push(op);
-                    go(r, operands, ops);
+                    go(r, target, operands, ops);
                 }
                 _ => operands.push(e),
             }
         }
+        let target = match e {
+            Expr::Op(_, op, _) => Self::op_prec(op),
+            _ => return (e, Vec::new()),
+        };
         let mut operands = Vec::new();
         let mut ops = Vec::new();
-        go(e, &mut operands, &mut ops);
+        go(e, target, &mut operands, &mut ops);
         let first = operands.remove(0);
         (first, ops.into_iter().zip(operands).collect())
     }
@@ -638,6 +657,52 @@ impl<'s> Printer<'s> {
                 self.raw(" ");
             }
             print(self, a);
+            prev_span = cur_span;
+        }
+        if broke {
+            self.indent_out();
+        }
+    }
+
+    /// `Expr::App`'s own version of `print_spine_args`: glues each argument
+    /// with a leading space until the first one that either has a real
+    /// source break before it or doesn't fit flat, then moves that argument
+    /// (and every one after it) onto its own line at one shared indent
+    /// level. Whether an argument "doesn't fit flat" is decided by *trying*
+    /// it directly in the real output (mark the position, print it, check
+    /// afterward for a `'\n'`) and rolling back only that one attempt if it
+    /// fails - not by rendering every argument into a scratch buffer up
+    /// front the way `print_spine_args`'s `would_break` callback does
+    /// elsewhere, which is `O(2^depth)` in AST nesting depth once an
+    /// argument can itself be a call whose own arguments need the same
+    /// decision (see `Expr::App`'s own call site for the real report this
+    /// fixed - a `pay-backend` file that used to hang instead of finishing
+    /// in a couple of seconds).
+    fn print_app_args(&mut self, first_span: Span, args: &[&Expr]) {
+        let mut prev_span = first_span;
+        let mut broke = false;
+        for a in args {
+            let cur_span = a.span();
+            if !broke && Self::breaks_before(prev_span, cur_span) {
+                self.indent_in();
+                broke = true;
+            }
+            if !broke {
+                let mark = self.out.len();
+                let comment_idx_before = self.comment_idx;
+                self.raw(" ");
+                self.print_expr(a);
+                if !self.out[mark..].contains('\n') {
+                    prev_span = cur_span;
+                    continue;
+                }
+                self.out.truncate(mark);
+                self.comment_idx = comment_idx_before;
+                self.indent_in();
+                broke = true;
+            }
+            self.newline();
+            self.print_expr(a);
             prev_span = cur_span;
         }
         if broke {
@@ -2290,84 +2355,50 @@ impl<'s> Printer<'s> {
                 // `App` arguments) never moving down even though the array
                 // it heads spans several lines. Without this, only the
                 // argument that actually breaks moved (via
-                // `print_spine_args`, below) - the head, and any args
-                // before whatever breaks, stayed flush on the call's
-                // original line.
-                let mut spans = vec![head.span()];
-                spans.extend(args.iter().map(|a| a.span()));
-                // Check each argument's own `expr_would_break` at most once,
-                // caching its already-rendered flat text when it doesn't
-                // break so it can be reused directly below instead of being
-                // printed a second time. This used to be two separate full
-                // renders per argument (this check, then `print_spine_args`
-                // re-checking - and, either way, re-printing - each one
-                // again) - cheap in isolation, but since an argument can
+                // `print_app_args`, below) - the head, and any args before
+                // whatever breaks, stayed flush on the call's original line.
+                //
+                // Deciding this used to mean rendering every argument into a
+                // scratch buffer up front (to see whether any of them, e.g.
+                // a nested call or a `case`/`do`, is going to break with no
+                // source span to give it away), then unconditionally
+                // re-printing *all* of them for real the moment even one
+                // didn't fit - cheap in isolation, but since an argument can
                 // itself be a call with its own arguments, that doubling
                 // recurses: `O(2^depth)` instead of `O(depth)` for a chain
-                // of calls each wrapping the next (`Ctor { field: [ Ctor
-                // { ... } ] }`, ~15 levels, no forced breaks anywhere - a
-                // real report that never finished printing). Same fix as
-                // `list()`'s own version of this (see its comment).
-                let arg_texts: Vec<Option<String>> = args
-                    .iter()
-                    .map(|a| {
-                        let comment_idx_before = self.comment_idx;
-                        let text = self.render_indented(0, |p| p.print_expr(a));
-                        if text.contains('\n') {
-                            self.comment_idx = comment_idx_before;
-                            None
-                        } else {
-                            Some(text)
-                        }
-                    })
-                    .collect();
-                let multiline = Self::any_breaks(&spans) || arg_texts.iter().any(Option::is_none);
-                // Suppressed when glued directly after an outer list()'s own
-                // `open `/`, ` (`glued_floor`, see its doc comment and
-                // `list()`'s matching check) - that's a glue point the outer
-                // list already committed to, not a floor to relocate away
-                // from, the same reasoning that already applies to a nested
-                // `list()`-based value there.
-                let own_indent = multiline
-                    && !self.at_fresh_line()
-                    && self.glued_floor != Some(self.out.len());
-                if own_indent {
-                    self.indent_in();
-                    self.newline();
+                // of calls each wrapping the next. Fixed the same way
+                // `list()` already fixes its own version of this: try
+                // printing flat directly in the real output first (head
+                // glued, `own_indent` never applied), and only roll the
+                // *whole* attempt back - to redo with the head relocated -
+                // if it turns out not to fit *and* relocating could actually
+                // help. Whether an individual argument itself needs to break
+                // is decided the same way, one level down, inside
+                // `print_app_args`.
+                let could_relocate =
+                    !self.at_fresh_line() && self.glued_floor != Some(self.out.len());
+                let mut boundary_spans = vec![head.span()];
+                boundary_spans.extend(args.iter().map(|a| a.span()));
+                let breaks_from_source = Self::any_breaks(&boundary_spans);
+                if !(could_relocate && breaks_from_source) {
+                    let mark = self.out.len();
+                    let comment_idx_before = self.comment_idx;
+                    self.print_expr(head);
+                    self.print_app_args(head.span(), &args);
+                    if !self.out[mark..].contains('\n') || !could_relocate {
+                        return;
+                    }
+                    self.out.truncate(mark);
+                    self.comment_idx = comment_idx_before;
                 }
+                // Reached because the source already had a break somewhere
+                // in this call, or because the flat attempt above didn't
+                // fit and relocating the head could help.
+                self.indent_in();
+                self.newline();
                 self.print_expr(head);
-                let mut prev_span = head.span();
-                let mut broke = false;
-                for (a, cached) in args.iter().zip(arg_texts) {
-                    let cur_span = a.span();
-                    if !broke {
-                        if Self::breaks_before(prev_span, cur_span) {
-                            self.indent_in();
-                            broke = true;
-                        } else if let Some(text) = cached {
-                            self.raw(" ");
-                            self.raw(&text);
-                            prev_span = cur_span;
-                            continue;
-                        } else {
-                            self.indent_in();
-                            broke = true;
-                        }
-                    }
-                    if broke {
-                        self.newline();
-                    } else {
-                        self.raw(" ");
-                    }
-                    self.print_expr(a);
-                    prev_span = cur_span;
-                }
-                if broke {
-                    self.indent_out();
-                }
-                if own_indent {
-                    self.indent_out();
-                }
+                self.print_app_args(head.span(), &args);
+                self.indent_out();
             }
             Expr::Vta(f, t) => {
                 self.print_expr(f);
@@ -2376,59 +2407,59 @@ impl<'s> Printer<'s> {
             }
             Expr::Op(..) => {
                 let (first, rest) = Self::op_spine(e);
-                let mut spans = vec![first.span()];
-                spans.extend(rest.iter().map(|(_, r)| r.span()));
-                // As well as a source break (`any_breaks`), an operand
-                // needs to force the *whole chain* multiline if it would
-                // print across multiple lines on its own even with no
-                // source break before it - not for the usual "a case/do
-                // always breaks" reason `any_breaks` already can't see, but
-                // because an operand glued flat after `op ` can itself
-                // relocate (`Expr::App`'s own `own_indent`, glued after a
-                // floor exactly the way `op ` is one) independently of
-                // anything Op's own span comparison looks at. Left alone,
-                // that relocation stretches the `first`-to-`rest[0]`
-                // adjacent boundary the moment *this* pass's own output gets
-                // reparsed: flat on pass 1 (matching a source with no real
-                // break there), `any_breaks` flips true on pass 2 once the
-                // relocated operand now visibly starts on a later line -
-                // not idempotent. Decide by rendering instead, the same
-                // `expr_would_break` primitive `list()`/`Expr::App`'s own
-                // equivalent generalizations already use - a pure function
-                // of the AST, stable no matter how many times reformatted.
-                // Cached (like `Expr::App`'s `arg_texts`) so an operand that
-                // stays flat isn't rendered twice.
-                let rest_texts: Vec<Option<String>> = rest
-                    .iter()
-                    .map(|(_, r)| {
-                        let comment_idx_before = self.comment_idx;
-                        let text = self.render_indented(0, |p| p.print_expr(r));
-                        if text.contains('\n') {
-                            self.comment_idx = comment_idx_before;
-                            None
-                        } else {
-                            Some(text)
-                        }
-                    })
-                    .collect();
-                let multiline =
-                    Self::any_breaks(&spans) || rest_texts.iter().any(Option::is_none);
                 self.print_expr(first);
-                if multiline {
-                    self.indent_in();
-                    for (op, r) in &rest {
-                        self.newline();
+                // Same "glue until the first operand that actually needs to
+                // break, then break from there onward" rule
+                // `print_spine_args` already applies to `Expr::App`'s own
+                // arguments - operators before the first forced break stay
+                // glued flat on `first`'s own line; once one operand either
+                // has a real source break before it or would print across
+                // multiple lines on its own, that operand's operator (and
+                // every operator after it) moves onto its own line at one
+                // shared indent level, entered once on the first break, not
+                // per operator - so a same-precedence run of operators lines
+                // up flush instead of staircasing.
+                //
+                // "Would print across multiple lines on its own" is decided
+                // by *trying* each operand glued flat directly in the real
+                // output (mark the position, print it, check afterward for a
+                // `'\n'`) rather than rendering every operand into a
+                // throwaway scratch buffer up front the way an earlier
+                // version of this did - the same "try first, roll back only
+                // if it doesn't fit" trick `list()` already uses, for the
+                // same reason `list()`'s own comment gives: probing every
+                // operand separately, then unconditionally re-printing
+                // *all* of them for real the moment even one doesn't fit,
+                // doubles the cost of every nested `Op`/`App`/`list`
+                // wherever an operand breaks - `O(2^depth)` in AST nesting
+                // depth instead of `O(depth)`. This was a real regression
+                // (commit 48ce09d added the throwaway-probe version), found
+                // hanging real ~2000-4000 line files in `pay-backend/lib`
+                // that used to format in ~1-2s. Rolling back only the one
+                // operand whose attempt failed - not the whole chain - means
+                // an operand that already committed successfully flat is
+                // never re-rendered, and only the one operand that actually
+                // triggers the break pays a local 2x.
+                let mut prev_span = first.span();
+                let mut broke = false;
+                for (op, r) in &rest {
+                    let cur_span = r.span();
+                    if !broke && Self::breaks_before(prev_span, cur_span) {
+                        self.indent_in();
+                        broke = true;
+                    }
+                    if !broke {
+                        let mark = self.out.len();
+                        let comment_idx_before = self.comment_idx;
+                        self.raw(" ");
                         self.lit(*op);
                         self.raw(" ");
-                        // The operand is glued directly after `op ` here -
-                        // `newline()` just made it a genuine floor (see
-                        // `glued_floor`), so a nested `own_indent`-style
-                        // relocation (most commonly `Expr::App`'s, when the
-                        // operand is a call whose own argument breaks)
-                        // needs to hang in place instead of moving further
-                        // away - otherwise the operand ends up stranded on
-                        // its own line below an empty `op`, doubling up on
-                        // the floor this `newline()` already established.
+                        // Glued directly after `op ` - suppress a nested
+                        // `own_indent`-style relocation (most commonly
+                        // `Expr::App`'s, when the operand is a call whose
+                        // own argument breaks) the same way the broken path
+                        // below does, so a self-relocating operand doesn't
+                        // spuriously fail this flat attempt.
                         let prev_glued_floor = self.glued_floor;
                         self.glued_floor = Some(self.out.len());
                         // Unconditional hang, same reasoning as
@@ -2442,21 +2473,28 @@ impl<'s> Printer<'s> {
                         self.print_expr(r);
                         self.indent_out();
                         self.glued_floor = prev_glued_floor;
-                    }
-                    self.indent_out();
-                } else {
-                    for ((op, r), cached) in rest.iter().zip(rest_texts) {
-                        self.raw(" ");
-                        self.lit(*op);
-                        self.raw(" ");
-                        if let Some(text) = cached {
-                            self.raw(&text);
+                        if !self.out[mark..].contains('\n') {
+                            prev_span = cur_span;
                             continue;
                         }
+                        self.out.truncate(mark);
+                        self.comment_idx = comment_idx_before;
                         self.indent_in();
-                        self.print_expr(r);
-                        self.indent_out();
+                        broke = true;
                     }
+                    self.newline();
+                    self.lit(*op);
+                    self.raw(" ");
+                    let prev_glued_floor = self.glued_floor;
+                    self.glued_floor = Some(self.out.len());
+                    self.indent_in();
+                    self.print_expr(r);
+                    self.indent_out();
+                    self.glued_floor = prev_glued_floor;
+                    prev_span = cur_span;
+                }
+                if broke {
+                    self.indent_out();
                 }
             }
             Expr::Access(inner, labels) => {
