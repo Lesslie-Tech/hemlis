@@ -1071,7 +1071,7 @@ impl<'s> N<'s> {
                         self.resolve(Type, None, n.0);
                     }
                 }
-                for c in cs.iter().flatten() {
+                for c in cs.iter().flat_map(|c| c.iter()) {
                     self.constraint(c);
                 }
                 for ast::ClassMember(_, typ) in mem.iter() {
@@ -1144,7 +1144,7 @@ impl<'s> N<'s> {
         for t in ts.iter() {
             self.typ_define_vars(t);
         }
-        for ast::Constraint(_, ts) in cs.iter().flatten() {
+        for ast::Constraint(_, ts) in cs.iter().flat_map(|c| c.iter()) {
             for t in ts.iter() {
                 self.typ_define_vars(t);
             }
@@ -1154,7 +1154,7 @@ impl<'s> N<'s> {
             self.typ(t);
         }
         self.pop(sf, a.span());
-        for c in cs.iter().flatten() {
+        for c in cs.iter().flat_map(|c| c.iter()) {
             self.constraint(c);
         }
         self.resolveq(Class, d.0, d.1 .0)

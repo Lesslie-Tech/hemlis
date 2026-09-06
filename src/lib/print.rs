@@ -1521,14 +1521,14 @@ impl<'s> Printer<'s> {
             }
             Decl::Class(constraints, name, vars, fundeps, members) => {
                 self.raw("class ");
-                if let Some(cs) = constraints {
-                    self.print_constraint_list(cs);
-                    self.raw(" <= ");
-                }
+                let multiline = self.print_constraint_ctx(constraints, name.span(), "<=");
                 self.lit(name);
                 for v in vars {
                     self.raw(" ");
                     self.print_typ_var_binding(v);
+                }
+                if multiline {
+                    self.indent_out();
                 }
                 if let Some(fds) = fundeps {
                     self.raw(" | ");
@@ -1626,9 +1626,62 @@ impl<'s> Printer<'s> {
         });
     }
 
-    fn print_constraint_list(&mut self, cs: &[Constraint]) {
+    /// Prints an `instance`/`class` head's optional constraint context -
+    /// `(A, B) => `/`A => ` for an instance head, `(A, B) <= `/`A <= ` for a
+    /// class - and decides, via `any_breaks` over the constraints' own spans
+    /// plus the bracket spans (when parenthesized) plus `after` (the span of
+    /// whatever comes right after the arrow, e.g. the instance/class name),
+    /// whether the source had this expanded across multiple lines. Mirrors
+    /// `print_typ_constrained_chain`'s decision, generalized from a single
+    /// chained constraint to a comma-separated list - unlike that chain,
+    /// there's no preceding name/`::` to check a "glued mid-line" boundary
+    /// against (`instance`/`class` are fixed keywords, not spans), so on the
+    /// multiline path everything - parens, arrow, and (per the caller, which
+    /// must close the same `indent_in` this opens) whatever follows - is
+    /// unconditionally relocated onto fresh indented lines: one canonical
+    /// shape, always a fixed point on the next parse, the same reasoning as
+    /// `print_sig_typ`'s "both branches produce the same shape" comment.
+    /// Returns whether it took the multiline path, so the caller knows
+    /// whether it must `indent_out` after printing what follows the arrow.
+    fn print_constraint_ctx(
+        &mut self,
+        constraints: &Option<Constraints>,
+        after: Span,
+        arrow: &str,
+    ) -> bool {
+        let Some(Constraints(open, cs, close)) = constraints else {
+            return false;
+        };
+        let mut spans: Vec<Span> = Vec::with_capacity(cs.len() + 3);
+        if *open != Span::zero() {
+            spans.push(*open);
+        }
+        spans.extend(cs.iter().map(|c| c.span()));
+        if *close != Span::zero() {
+            spans.push(*close);
+        }
+        spans.push(after);
+        let multiline = Self::any_breaks(&spans);
+
+        if multiline {
+            self.indent_in();
+            self.newline();
+        }
         if cs.len() == 1 {
             self.print_constraint(&cs[0]);
+        } else if multiline {
+            // Leading-comma style, matching `list()`'s convention for every
+            // other bracketed multi-item construct.
+            self.raw("( ");
+            for (i, c) in cs.iter().enumerate() {
+                if i > 0 {
+                    self.newline();
+                    self.raw(", ");
+                }
+                self.print_constraint(c);
+            }
+            self.newline();
+            self.raw(")");
         } else {
             self.raw("(");
             for (i, c) in cs.iter().enumerate() {
@@ -1639,6 +1692,14 @@ impl<'s> Printer<'s> {
             }
             self.raw(")");
         }
+        if multiline {
+            self.newline();
+        } else {
+            self.raw(" ");
+        }
+        self.raw(arrow);
+        self.raw(" ");
+        multiline
     }
 
     fn print_fun_dep(&mut self, fd: &FunDep) {
@@ -1666,14 +1727,25 @@ impl<'s> Printer<'s> {
 
     fn print_inst_head(&mut self, h: &InstHead) {
         let InstHead(constraints, name, args) = h;
-        if let Some(cs) = constraints {
-            self.print_constraint_list(cs);
-            self.raw(" => ");
-        }
+        let multiline = self.print_constraint_ctx(constraints, name.span(), "=>");
+        // Same unconditional hang reasoning as `print_constraint`'s own args:
+        // `name` is glued directly after `=> ` (or nothing at all), a
+        // fixed-width raw token/absent-token the indent baseline has no
+        // memory of - so a multiline arg needs to hang under `name`'s own
+        // real column, not the ambient baseline.
+        let name_col = self.current_column();
         self.lit(name);
-        for a in args {
-            self.raw(" ");
-            self.print_typ(a);
+        self.with_indent_at(name_col, |p| {
+            p.print_spine_args(
+                name.span(),
+                args,
+                |a| a.span(),
+                |_, _| false,
+                |p, a| p.print_typ(a),
+            );
+        });
+        if multiline {
+            self.indent_out();
         }
     }
 
@@ -3644,6 +3716,78 @@ mod tests {
         );
         let out = fmt(src);
         assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression for a real report: `print_inst_head`/`Decl::Class`'s
+    /// constraint-context printing had no multiline handling at all -
+    /// `instance`/`class` always glued the whole
+    /// `(constraints) => head args... where` onto one line, however long,
+    /// discarding any breaks the source had. Real source (`instance\n  (
+    /// IsSymbol l\n  ) =>\n  Foo ...`) collapsed into one very long line.
+    /// `print_constraint_ctx` now tracks this the same way
+    /// `print_typ_constrained_chain` already did for a signature's `=>`
+    /// chain.
+    #[test]
+    fn instance_head_constraint_relocates_when_source_broke_it() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "instance\n",
+            "  IsSymbol l\n",
+            "  => HeterogeneousFolding.FoldingWithIndex Foo (Proxy l) where\n",
+            "  foldingWithIndex _ _ acc value = acc\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Same bug, the parenthesized multi-constraint shape - expands with
+    /// leading commas, matching `list()`'s convention for every other
+    /// bracketed multi-item construct.
+    #[test]
+    fn instance_head_multi_constraint_relocates_leading_comma_style() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "instance\n",
+            "  ( IsSymbol l\n",
+            "  , Foo l\n",
+            "  )\n",
+            "  => HeterogeneousFolding.FoldingWithIndex Foo (Proxy l) where\n",
+            "  foldingWithIndex _ _ acc value = acc\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `Decl::Class`'s superclass context (`<=`) shares the same fix.
+    #[test]
+    fn class_superclass_constraint_relocates_when_source_broke_it() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "class\n",
+            "  Eq a\n",
+            "  <= MyClass a where\n",
+            "  bar :: a -> a\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A genuinely flat, single-line instance head still drops the
+    /// redundant parens around a singleton constraint - that normalization
+    /// predates this session's fix and is deliberately untouched; only the
+    /// "never breaks, however the source looked" bug above was fixed.
+    #[test]
+    fn instance_head_single_constraint_paren_wrap_collapses_when_flat() {
+        let src = "module Foo where\n\ninstance (IsSymbol l) => Foo (Proxy l) where\n  foo = 1\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\n\ninstance IsSymbol l => Foo (Proxy l) where\n  foo = 1\n"
+        );
         assert_idempotent(src);
     }
 

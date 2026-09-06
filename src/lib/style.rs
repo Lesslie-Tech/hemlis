@@ -1335,7 +1335,7 @@ impl<'a> StyleChecker<'a> {
             }
             ast::Decl::Instance(_, head, bindings) => {
                 if let Some(constraints) = &head.0 {
-                    for c in constraints {
+                    for c in constraints.iter() {
                         self.check_constraint(c);
                     }
                 }
@@ -1351,7 +1351,7 @@ impl<'a> StyleChecker<'a> {
             }
             ast::Decl::Class(constraints, _, _, _, members) => {
                 if let Some(constraints) = constraints {
-                    for c in constraints {
+                    for c in constraints.iter() {
                         self.check_constraint(c);
                     }
                 }

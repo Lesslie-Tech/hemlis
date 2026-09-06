@@ -435,7 +435,7 @@ pub enum Decl {
 
     ClassKind(ProperName, Typ),
     Class(
-        Option<Vec<Constraint>>,
+        Option<Constraints>,
         ProperName,
         Vec<TypVarBinding>,
         Option<Vec<FunDep>>,
@@ -511,13 +511,31 @@ impl InstBinding {
 }
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct InstHead(pub Option<Vec<Constraint>>, pub QProperName, pub Vec<Typ>);
+pub struct InstHead(pub Option<Constraints>, pub QProperName, pub Vec<Typ>);
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClassMember(pub Name, pub Typ);
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Constraint(pub QProperName, pub Vec<Typ>);
+
+/// A comma-separated `(A, B) =>`/`(A, B) <=` constraint context, or the
+/// parenless single-constraint form `A =>`/`A <=`. `Span::zero()` for the
+/// open/close fields marks the parenless form (the single `Constraint`
+/// inside still carries its own real span, so `.span()` is never `Zero`
+/// either way) - carrying real bracket spans (rather than just `Vec<Constraint>`,
+/// which the old shape used and which threw away the parens' own source
+/// position entirely) is what lets the printer tell whether the source had
+/// this expanded across multiple lines, the same reason `Binder::Array`/
+/// `Binder::Record` needed their own brace spans.
+#[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Constraints(pub Span, pub Vec<Constraint>, pub Span);
+
+impl Constraints {
+    pub fn iter(&self) -> std::slice::Iter<'_, Constraint> {
+        self.1.iter()
+    }
+}
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FunDep(pub Vec<Name>, pub Vec<Name>);

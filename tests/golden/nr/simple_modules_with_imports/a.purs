@@ -121,14 +121,17 @@ f =
 -- +          ProperName
 -- +           (7, 18)->(7, 22)
 -- +   Decl::Class
--- +     Constraint
--- +      QProperName
--- +       NULL
--- +       ProperName
--- +        (9, 6)->(9, 8)
--- +       Typ::Var
--- +        Name
--- +         (9, 9)->(9, 10)
+-- +    Constraints
+-- +     (0, 0)->(0, 0)
+-- +      Constraint
+-- +       QProperName
+-- +        NULL
+-- +        ProperName
+-- +         (9, 6)->(9, 8)
+-- +        Typ::Var
+-- +         Name
+-- +          (9, 9)->(9, 10)
+-- +     (0, 0)->(0, 0)
 -- +    ProperName
 -- +     (9, 14)->(9, 17)
 -- +     TypVarBinding

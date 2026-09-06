@@ -1839,21 +1839,23 @@ fn data_cnstr<'t>(p: &mut P<'t>) -> Option<(ProperName, Vec<Typ>)> {
     Some((n, ts))
 }
 
-fn constraints<'t>(p: &mut P<'t>, l: bool) -> Option<Vec<Constraint>> {
+fn constraints<'t>(p: &mut P<'t>, l: bool) -> Option<Constraints> {
     alt!(p: Serror::Info(p.span(), "constraints"),
         |p: &mut P<'t>| {
+            let open = p.span();
             kw_lp(p)?;
             let cs = sep_until(p, "constraints-sep", kw_comma, typ, next_is!(T::RightParen))
                 .into_iter()
                 .map(|x| x.cast_to_constraint())
                 .collect::<Option<Vec<_>>>()?;
+            let close = p.span();
             kw_rp(p)?;
             if l {
                 kw_left_imply(p)?;
             } else {
                 kw_right_imply(p)?;
             }
-            Some(Some(cs))
+            Some(Some(Constraints(open, cs, close)))
         },
         |p: &mut P<'t>| {
             // NOTE: There's just parsing conflicts everywhere :(
@@ -1863,10 +1865,10 @@ fn constraints<'t>(p: &mut P<'t>, l: bool) -> Option<Vec<Constraint>> {
             } else {
                 kw_right_imply(p)?;
             }
-            Some(Some(vec![t]))
+            Some(Some(Constraints(Span::zero(), vec![t], Span::zero())))
         },
         |_: &mut P<'t>| {
-            Some(None::<Vec<Constraint>>)
+            Some(None::<Constraints>)
         }
     )?
 }
