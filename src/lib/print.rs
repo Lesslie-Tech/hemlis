@@ -1667,7 +1667,17 @@ impl<'s> Printer<'s> {
             self.indent_in();
             self.newline();
         }
-        if cs.len() == 1 {
+        // Parens around a lone constraint are syntactically optional, but
+        // whether the source actually wrote them is real information -
+        // `constraints()` (parser.rs) only leaves `open`/`close` as
+        // `Span::zero()` for the genuinely parenless form, never for an
+        // explicit `(A) => `. Printing exactly what's there, rather than
+        // unilaterally normalizing it away, matches how `Expr::Paren`/
+        // `Typ::Paren` are handled everywhere else in this printer -
+        // removing a truly redundant paren is a `style.rs` rule's job
+        // (opt-in), not something the raw printer decides on its own.
+        let has_parens = cs.len() > 1 || *open != Span::zero();
+        if !has_parens {
             self.print_constraint(&cs[0]);
         } else if multiline {
             // Leading-comma style, matching `list()`'s convention for every
@@ -3776,18 +3786,28 @@ mod tests {
         assert_idempotent(src);
     }
 
-    /// A genuinely flat, single-line instance head still drops the
-    /// redundant parens around a singleton constraint - that normalization
-    /// predates this session's fix and is deliberately untouched; only the
-    /// "never breaks, however the source looked" bug above was fixed.
+    /// A singleton constraint's parens are optional syntax, but whether the
+    /// source actually wrote them is real information the printer should
+    /// preserve - same treatment as `Expr::Paren`/`Typ::Paren` everywhere
+    /// else (removing a truly redundant paren is a `style.rs` rule's job,
+    /// not something the raw printer silently decides). An earlier version
+    /// of this fix unconditionally dropped these parens; that was wrong and
+    /// got corrected in the same session.
     #[test]
-    fn instance_head_single_constraint_paren_wrap_collapses_when_flat() {
+    fn instance_head_single_constraint_paren_wrap_is_preserved_when_flat() {
         let src = "module Foo where\n\ninstance (IsSymbol l) => Foo (Proxy l) where\n  foo = 1\n";
         let out = fmt(src);
-        assert_eq!(
-            out,
-            "module Foo where\n\ninstance IsSymbol l => Foo (Proxy l) where\n  foo = 1\n"
-        );
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// The parenless form stays parenless too - this isn't a "always add
+    /// parens" normalization, just "print exactly what's there."
+    #[test]
+    fn instance_head_single_constraint_without_parens_stays_bare() {
+        let src = "module Foo where\n\ninstance IsSymbol l => Foo (Proxy l) where\n  foo = 1\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
         assert_idempotent(src);
     }
 
