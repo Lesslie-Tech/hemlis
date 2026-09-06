@@ -4696,14 +4696,8 @@ impl LanguageServer for Backend {
                                 ast::Decl::Def(name, binders, _)
                                     if name.0.0 == func_ud && binders.len() > param_idx =>
                                 {
-                                    let source = self.fi_to_source.try_get(&fi).try_unwrap();
-                                    let binder_spans: Vec<_> = binders
-                                        .iter()
-                                        .map(|b| match &source {
-                                            Some(s) => correct_binder_span(b, s.value(), fi),
-                                            None => b.span(),
-                                        })
-                                        .collect();
+                                    let binder_spans: Vec<_> =
+                                        binders.iter().map(|b| b.span()).collect();
                                     edits.push(TextEdit::new(
                                         remove_nth_range(&binder_spans, param_idx, true),
                                         "".into(),
@@ -4798,14 +4792,8 @@ impl LanguageServer for Backend {
                                     if name.0.0 == func_ud && binders.len() > param_idx =>
                                 {
                                     if is_last_field {
-                                        let source = self.fi_to_source.try_get(&fi).try_unwrap();
-                                        let binder_spans: Vec<_> = binders
-                                            .iter()
-                                            .map(|b| match &source {
-                                                Some(s) => correct_binder_span(b, s.value(), fi),
-                                                None => b.span(),
-                                            })
-                                            .collect();
+                                        let binder_spans: Vec<_> =
+                                            binders.iter().map(|b| b.span()).collect();
                                         edits.push(TextEdit::new(
                                             remove_nth_range(&binder_spans, param_idx, true),
                                             "".into(),
@@ -5103,32 +5091,6 @@ fn flatten_arr_chain(typ: &ast::Typ) -> Vec<&ast::Typ> {
         }
     }
     result
-}
-
-/// Correct a binder's span to include `{` and `}` for record binders,
-/// whose derived span only covers the inner fields.
-fn correct_binder_span(binder: &ast::Binder, source: &str, fi: ast::Fi) -> ast::Span {
-    let span = binder.span();
-    let is_record = matches!(binder, ast::Binder::Record(..))
-        || matches!(binder, ast::Binder::Typed(inner, _) if matches!(inner.as_ref(), ast::Binder::Record(..)));
-    if !is_record {
-        return span;
-    }
-    let lines: Vec<&str> = source.lines().collect();
-    let (lo_line, lo_col) = span.lo();
-    let (hi_line, hi_col) = span.hi();
-    let brace_lo = lines
-        .get(lo_line)
-        .and_then(|line| line[..lo_col].rfind('{').map(|off| (lo_line, off)));
-    let brace_hi = lines.get(hi_line).and_then(|line| {
-        line[hi_col..]
-            .find('}')
-            .map(|off| (hi_line, hi_col + off + 1))
-    });
-    match (brace_lo, brace_hi) {
-        (Some(lo), Some(hi)) => ast::Span::Known(fi, lo, hi),
-        _ => span,
-    }
 }
 
 /// Compute the Range to delete the `idx`-th item from a spanned list,
