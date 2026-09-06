@@ -2662,9 +2662,12 @@ impl<'s> Printer<'s> {
                 self.print_expr(inner);
             }
             Expr::Typed(inner, t) => {
+                // Same `name :: Typ` convention as every other signature site
+                // (`print_sig_typ`'s 9 other call sites) - `::` relocates
+                // onto its own line when there's a source break or `t` would
+                // break, instead of always gluing `t` flat after `inner`.
                 self.print_expr(inner);
-                self.raw(" :: ");
-                self.print_typ(t);
+                self.print_sig_typ(inner.span(), t);
             }
             Expr::App(..) => {
                 let (head, args) = Self::app_spine(e);
@@ -5070,6 +5073,27 @@ mod tests {
             "module Foo where\n\n",
             "reInsert event =\n",
             "  BookkeepingStore store { store = Map.insert (bookkeepingId event) (NotWritten event) store.store }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn expr_typed_relocates_the_double_colon_like_a_signature_when_the_type_would_break() {
+        // Real report: `(fromSerializable :: VariantStorable (...) -> Variant
+        // (...))` always glued `:: Typ` flat after the expression, unlike
+        // every other `name :: Typ` site in this printer (`print_sig_typ`) -
+        // so a multi-line arrow type just extended rightward instead of
+        // relocating.
+        let src = concat!(
+            "module Foo where\n\n",
+            "foo =\n",
+            "  bar\n",
+            "    # ( fromSerializable\n",
+            "          :: VariantStorable (pending :: ProxyStorable \"pending\")\n",
+            "          -> Variant (pending :: Proxy \"pending\")\n",
+            "      )\n",
         );
         let out = fmt(src);
         assert_eq!(out, src);
