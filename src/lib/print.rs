@@ -1675,9 +1675,31 @@ impl<'s> Printer<'s> {
                     self.raw("else ");
                 }
                 self.raw("instance ");
+                let mark = self.out.len();
                 self.print_inst_head(head);
                 if !bindings.is_empty() {
-                    self.raw(" where");
+                    // `where` glues flat (` where`) unless the head - the
+                    // constraint context, the class/args spine, or both -
+                    // printed across more than one line, in which case it
+                    // relocates onto its own line at the same indent level
+                    // `=>` sits at (one `indent_in`, matching
+                    // `print_constraint_ctx`'s own), rather than staying
+                    // glued to whatever the head's last printed token
+                    // happens to be (e.g. a spine arg like `to`). Checked by
+                    // looking for a real `'\n'` in what was just printed
+                    // (the same rendered-output check `paren_would_break`/
+                    // `typ_would_break` use), not a span comparison - the
+                    // head's own multiline-ness already accounts for every
+                    // reason it could break, so this doesn't need its own
+                    // parallel decision.
+                    if self.out[mark..].contains('\n') {
+                        self.indent_in();
+                        self.newline();
+                        self.raw("where");
+                        self.indent_out();
+                    } else {
+                        self.raw(" where");
+                    }
                     self.print_indented_siblings(
                         bindings,
                         |b| b.span(),
@@ -1867,11 +1889,14 @@ impl<'s> Printer<'s> {
         let name_col = self.current_column();
         self.lit(name);
         self.with_indent_at(name_col, |p| {
+            // See `print_constraint`/`Typ::App` - a `Typ::Paren` arg that
+            // would itself break relocates it and every arg after it, same
+            // as `Expr::App`; `Record`/`Row` args keep hanging in place.
             p.print_spine_args(
                 name.span(),
                 args,
                 |a| a.span(),
-                |_, _| false,
+                |p, a| p.typ_paren_would_break(a),
                 |p, a| p.print_typ(a),
             );
         });
@@ -2291,19 +2316,30 @@ impl<'s> Printer<'s> {
             Typ::App(..) => {
                 let (head, args) = Self::typ_app_spine(t);
                 self.print_typ(head);
-                // No `would_break` check here (unlike `Expr::App`'s spine,
-                // see `expr_would_break`'s doc comment): the "floor" model
-                // (FORMATTER.md) means a glued type-level bracket that
-                // breaks hangs in place at its own column instead of
-                // relocating (see `print_row`/`print_paren_block`), so a
-                // `Typ` argument that would break is never itself a reason
-                // to move it, or its successors, onto a fresh line - only a
-                // real source break is.
+                // `Typ::Record`/`Typ::Row` arguments still use the "floor"
+                // model unconditionally (see `print_row`/`print_paren_block`
+                // - they hang glued in place under their own bracket,
+                // matching `needs_hang` elsewhere) - but a `Typ::Paren` arg
+                // is different: a real report showed the earlier "no
+                // would_break check at all" version only looked right
+                // because every case it was tested against already had a
+                // real source break *before* the multiline argument.
+                // Without one (a parenthesized arg glued right after the
+                // head that only breaks because of its own internal source
+                // breaks), hanging it in place left every sibling argument
+                // that follows it - `from`, `to`, ... - glued onto its
+                // closing line instead of getting pushed down with it,
+                // which reads as those siblings belonging to the paren's
+                // last line rather than being their own arguments. So a
+                // `Typ::Paren` arg gets the same `would_break` treatment as
+                // `Expr::App`'s own spine (see `expr_would_break`'s doc
+                // comment); `Record`/`Row` don't need it since they already
+                // hang correctly on their own.
                 self.print_spine_args(
                     head.span(),
                     &args,
                     |a| a.span(),
-                    |_, _| false,
+                    |p, a| p.typ_paren_would_break(a),
                     |p, a| p.print_typ(a),
                 );
             }
@@ -2426,14 +2462,14 @@ impl<'s> Printer<'s> {
         let name_col = self.current_column();
         self.lit(name);
         self.with_indent_at(name_col, |p| {
-            // See the matching note on `Typ::App` - the floor model means a
-            // `Typ` arg that would break is never itself a reason to
-            // relocate it or its successors.
+            // See the matching note on `Typ::App` - a `Typ::Paren` arg that
+            // would itself break relocates it and every arg after it, same
+            // as `Expr::App`; `Record`/`Row` args keep hanging in place.
             p.print_spine_args(
                 name.span(),
                 args,
                 |a| a.span(),
-                |_, _| false,
+                |p, a| p.typ_paren_would_break(a),
                 |p, a| p.print_typ(a),
             );
         });
@@ -4085,7 +4121,11 @@ mod tests {
     /// IsSymbol l\n  ) =>\n  Foo ...`) collapsed into one very long line.
     /// `print_constraint_ctx` now tracks this the same way
     /// `print_typ_constrained_chain` already did for a signature's `=>`
-    /// chain.
+    /// chain. `where` also relocates onto its own line here (see
+    /// `Decl::Instance`'s own comment) - the source glued it flat after
+    /// `(Proxy l)`, but once anything between `instance` and `where` is
+    /// multiline, `where` moves to line up with `=>` regardless of where the
+    /// source itself put it.
     #[test]
     fn instance_head_constraint_relocates_when_source_broke_it() {
         let src = concat!(
@@ -4096,8 +4136,18 @@ mod tests {
             "  foldingWithIndex _ _ acc value = acc\n",
         );
         let out = fmt(src);
-        assert_eq!(out, src);
-        assert_idempotent(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "instance\n",
+                "  IsSymbol l\n",
+                "  => HeterogeneousFolding.FoldingWithIndex Foo (Proxy l)\n",
+                "  where\n",
+                "  foldingWithIndex _ _ acc value = acc\n",
+            )
+        );
+        assert_idempotent(out.as_str());
     }
 
     /// Same bug, the parenthesized multi-constraint shape - expands with
@@ -4115,8 +4165,20 @@ mod tests {
             "  foldingWithIndex _ _ acc value = acc\n",
         );
         let out = fmt(src);
-        assert_eq!(out, src);
-        assert_idempotent(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "instance\n",
+                "  ( IsSymbol l\n",
+                "  , Foo l\n",
+                "  )\n",
+                "  => HeterogeneousFolding.FoldingWithIndex Foo (Proxy l)\n",
+                "  where\n",
+                "  foldingWithIndex _ _ acc value = acc\n",
+            )
+        );
+        assert_idempotent(out.as_str());
     }
 
     /// `Decl::Class`'s superclass context (`<=`) shares the same fix.
@@ -4157,6 +4219,126 @@ mod tests {
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
+    }
+
+    /// Regression for a real report: `Decl::Instance` always glued `where`
+    /// flat after whatever the head's last-printed token was (`self.raw("
+    /// where")`, unconditional), including when the head's own class-args
+    /// spine broke onto several lines with no relocated constraint context
+    /// forcing it. Real source had `where` on its own line, lined up with
+    /// `=>`; reformatting glued it back onto the last spine arg's line
+    /// (`to where`) instead of preserving that.
+    #[test]
+    fn instance_where_relocates_when_head_spine_args_break() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "instance\n",
+            "  ( IsSymbol name\n",
+            "  , WriteForeign ty\n",
+            "  )\n",
+            "  => WriteQueryFields\n",
+            "       ( Cons namea\n",
+            "           (Maybe ty)\n",
+            "           tail\n",
+            "       )\n",
+            "       row\n",
+            "       from\n",
+            "       to\n",
+            "  where\n",
+            "  writeQueryFields _ _ = 1\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Regression for a real report, a follow-up to the one above:
+    /// `print_spine_args`'s `Typ` call sites (`Typ::App`, `print_constraint`,
+    /// `print_inst_head`) had no `would_break` check at all, so a
+    /// `Typ::Paren` argument glued right after the head with no source break
+    /// before it - but whose own contents break internally - hung in place
+    /// at its own column instead of relocating, leaving every sibling
+    /// argument after it (`from`, `to`) glued onto its closing line. Now a
+    /// `Typ::Paren` arg that would itself break is treated the same as
+    /// `Expr::App`'s own would-break args: it (and everything after it)
+    /// relocates onto its own line, even with no real source break before
+    /// it.
+    #[test]
+    fn inst_head_paren_arg_with_no_source_break_before_it_still_relocates_when_it_would_break() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "instance\n",
+            "  ( IsSymbol name\n",
+            "  , ReadForeign ty\n",
+            "  )\n",
+            "  => ReadForeignFields (Cons name\n",
+            "                          ty\n",
+            "                          tail\n",
+            "                       )\n",
+            "       from\n",
+            "       to\n",
+            "  where\n",
+            "  readForeignFields _ _ = 1\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "instance\n",
+                "  ( IsSymbol name\n",
+                "  , ReadForeign ty\n",
+                "  )\n",
+                "  => ReadForeignFields\n",
+                "       ( Cons name\n",
+                "           ty\n",
+                "           tail\n",
+                "       )\n",
+                "       from\n",
+                "       to\n",
+                "  where\n",
+                "  readForeignFields _ _ = 1\n",
+            )
+        );
+        assert_idempotent(out.as_str());
+    }
+
+    /// Same fix, `print_constraint`'s own spine - a constraint's `Typ::Paren`
+    /// argument (not `Typ::Row`/`Typ::Record`, which keep hanging in place,
+    /// see `row_type_expands_one_field_per_line_when_source_has_a_newline`)
+    /// relocates the same way when it would break, even glued with no
+    /// source break before it.
+    #[test]
+    fn constraint_paren_arg_with_no_source_break_before_it_still_relocates_when_it_would_break() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "empty\n",
+            "  :: forall a b\n",
+            "   . Union (Cons name\n",
+            "              ty\n",
+            "              tail\n",
+            "           ) b\n",
+            "  => Record b\n",
+            "empty = x\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "empty\n",
+                "  :: forall a b\n",
+                "   . Union\n",
+                "       ( Cons name\n",
+                "           ty\n",
+                "           tail\n",
+                "       )\n",
+                "       b\n",
+                "  => Record b\n",
+                "empty = x\n",
+            )
+        );
+        assert_idempotent(out.as_str());
     }
 
     #[test]
