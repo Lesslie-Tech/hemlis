@@ -1290,8 +1290,25 @@ impl<'s> Printer<'s> {
     }
 
     fn dedup_sort_imports(&self, items: &mut Vec<Import>) {
-        items.sort_by_key(|a| self.import_display_text(a));
+        items.sort_by_key(|a| self.import_sort_key(a));
         items.dedup_by(|a, b| self.import_display_text(a) == self.import_display_text(b));
+    }
+
+    /// Sorting key for an import item - the bare name only, never the `type `/
+    /// `class ` keyword that prefixes its printed form. Those keywords start
+    /// with a lowercase letter, so folding them into the sort key would sort
+    /// every `class`/`type`-prefixed symbol import by that keyword rather than
+    /// by the (usually capitalized) name itself, scattering classes away from
+    /// where their name would otherwise place them.
+    fn import_sort_key(&self, i: &Import) -> &str {
+        match i {
+            Import::Value(_, n) => self.text(n.span()),
+            Import::Symbol(_, s) => self.text(s.span()),
+            Import::Typ(_, n) => self.text(n.span()),
+            Import::TypDat(_, n, _) => self.text(n.span()),
+            Import::TypSymbol(_, s) => self.text(s.span()),
+            Import::Class(_, n) => self.text(n.span()),
+        }
     }
 
     fn import_display_text(&self, i: &Import) -> String {
@@ -3971,6 +3988,21 @@ mod tests {
                 "import Data.Array (head, tail)\n\n",
                 "foo = 1\n",
             )
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn import_class_sorts_by_bare_name_not_by_the_class_keyword() {
+        // `class Eq`'s sort key must be "Eq", not "class Eq" - otherwise the
+        // literal keyword (lowercase `c`) sorts it away from where its
+        // (typically capitalized) name belongs, here after `Foo` instead of
+        // before it.
+        let src = "module Foo where\n\nimport Data.Foo (Foo, class Eq, bar)\n\nx = 1\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module Foo where\nimport Data.Foo (class Eq, Foo, bar)\n\nx = 1\n"
         );
         assert_idempotent(src);
     }
