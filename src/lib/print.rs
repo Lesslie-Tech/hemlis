@@ -2512,7 +2512,16 @@ impl<'s> Printer<'s> {
         if let Some(t) = tail {
             spans.push(t.span());
         }
-        let multiline = Self::any_breaks(&spans);
+        // `any_breaks` can't see a break right before `close` when there's
+        // only one field (no adjacent pair to compare) - that still has to
+        // force block style, same reasoning as `Expr::Paren`'s `force_block`.
+        // (Not checked symmetrically on the `open` side: a leading comment
+        // between `open` and the first field isn't flushed until the loop
+        // below, which shifts the first field's *printed* line across
+        // passes without any real source-layout change - comparing against
+        // `open`'s line would flip this decision and break idempotence.)
+        let force_block = spans.last().is_some_and(|l| l.hi().0 != close_line);
+        let multiline = force_block || Self::any_breaks(&spans);
 
         if !multiline {
             self.raw(open);
@@ -4120,6 +4129,42 @@ mod tests {
                 "  }\n",
             )
         );
+        assert_idempotent(src);
+    }
+
+    /// A comment between a ctor's name and its record-type argument isn't
+    /// flushed until `print_row`'s field loop reaches the first field -
+    /// which lands the field on a different *output* line than `{` even
+    /// though nothing in the *source* put a real break there. A single-field
+    /// record's block-style decision must not treat that shifted position as
+    /// a genuine source break on a later pass, or it flips to block style
+    /// and never stabilizes.
+    #[test]
+    fn comment_before_ctor_record_arg_does_not_flip_flat_row_to_block_on_reformat() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "data D\n",
+            "  = C\n",
+            "      -- TODO comment\n",
+            "      { a :: Int, b :: Int }\n",
+        );
+        assert_idempotent(src);
+    }
+
+    /// A single-field record can't show a source break via `any_breaks`
+    /// (there's no adjacent field pair to compare) - the break right before
+    /// `}` still has to force block style, or it silently collapses to one
+    /// line and loses the source's intended shape.
+    #[test]
+    fn single_field_record_with_a_break_before_close_brace_stays_block_style() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "type Model =\n",
+            "  { page :: PageModel\n",
+            "  }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
         assert_idempotent(src);
     }
 

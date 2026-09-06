@@ -79,6 +79,18 @@ arguments hang glued in place under their own bracket rather than relocating
 onto a fresh line (`print_row`/`print_paren_block`'s "own_indent" hang), the
 opposite of how a value's own bracket behaves.
 
+`print_row`'s own block-vs-flat choice (independent of the "own_indent"
+question above) also treats a source break right before `close` as forcing
+block style, the same `Expr::Paren`-style span check - needed because
+`any_breaks` can't see a break at the bracket boundary when there's only one
+field (no adjacent pair to compare). This is deliberately *not* checked
+symmetrically on the `open` side: a comment sitting between a ctor's name
+and its record-type argument isn't flushed until `print_row`'s field loop
+reaches the first field, which shifts that field's *printed* line across
+formatting passes with no real source-layout change behind it - checking
+`open`'s line the same way would flip the decision on the next pass and
+never stabilize.
+
 Because of this, `print_spine_args` — the shared "glue each argument until
 something forces a break, then one-per-line from there" helper used by
 `Typ::App`, `print_constraint`, and `print_inst_head` — treats a
