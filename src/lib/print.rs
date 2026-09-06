@@ -511,15 +511,19 @@ impl<'s> Printer<'s> {
     /// whatever comes next - glue it onto the current line instead of
     /// `flush_comments_before`'s always-its-own-leading-line treatment.
     /// A no-op, leaving the comment for the next `flush_comments_before` to
-    /// pick up as a leading comment, if it starts on any other line.
-    fn flush_trailing_comment(&mut self, hi_line: usize) {
+    /// pick up as a leading comment, if it starts on any other line. Returns
+    /// whether a comment was actually flushed - callers that decide their own
+    /// break state per-item (`Expr::Op`'s operand loop) need to know a
+    /// trailing comment just ended the current line even when no source span
+    /// gap says so, so the next item can't stay glued after it.
+    fn flush_trailing_comment(&mut self, hi_line: usize) -> bool {
         let Some((Ok(Token::LineComment(s) | Token::BlockComment(s)), span)) =
             self.comments.get(self.comment_idx)
         else {
-            return;
+            return false;
         };
         if span.lo().0 != hi_line {
-            return;
+            return false;
         }
         self.raw(" ");
         self.raw(s);
@@ -530,6 +534,7 @@ impl<'s> Printer<'s> {
         // become part of the comment, corrupting the output, without this.
         // Safe/harmless for a block comment too, just not strictly required.
         self.newline();
+        true
     }
 
     fn flush_all_comments(&mut self) {
@@ -2771,9 +2776,28 @@ impl<'s> Printer<'s> {
                 let mut broke = false;
                 for (op, r) in &rest {
                     let cur_span = r.span();
+                    // A comment can trail `prev_span`'s own line (`x # f --
+                    // like this\n  <#> g`) - previously left pending for
+                    // whatever printed next to pick up, and the next thing is
+                    // always `print_expr(r)`, whose own unconditional
+                    // `flush_comments_before` at entry has no way to tell
+                    // "this comment trails the *previous* operand" from
+                    // "this comment leads *this* operand", so it silently
+                    // misattached as a leading comment on `r` instead,
+                    // prying it away from the operator it trails. Only safe
+                    // to claim it here, once `breaks_before` has confirmed
+                    // `prev_span` really is the last thing on its own source
+                    // line - checking any earlier (e.g. right after `first`,
+                    // before even trying to glue `op r` after it) can't tell
+                    // "trails `prev_span`" apart from "trails whatever *else*
+                    // still shares this same physical line", the same
+                    // ambiguity `trailing_comment_does_not_attach_to_an_earlier_token_on_the_same_line`
+                    // already covers for a flat multi-token expression.
+                    let mut just_flushed_comment = false;
                     if !broke && Self::breaks_before(prev_span, cur_span) {
                         self.indent_in();
                         broke = true;
+                        just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
                     }
                     if !broke {
                         let mark = self.out.len();
@@ -2812,8 +2836,15 @@ impl<'s> Printer<'s> {
                         self.comment_idx = comment_idx_before;
                         self.indent_in();
                         broke = true;
+                        just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
                     }
-                    self.newline();
+                    // `flush_trailing_comment` already ended the line itself
+                    // (and, since `indent_in()` ran above, at the new broken
+                    // indent) - an explicit `newline()` here too would leave
+                    // a blank line behind it.
+                    if !just_flushed_comment {
+                        self.newline();
+                    }
                     self.lit(*op);
                     self.raw(" ");
                     let prev_glued_floor = self.glued_floor;
@@ -2821,6 +2852,14 @@ impl<'s> Printer<'s> {
                     self.hang_glued(|p| p.print_expr(r));
                     self.glued_floor = prev_glued_floor;
                     prev_span = cur_span;
+                    // Only reachable once `prev_span` (now `r`) is confirmed
+                    // the last thing on its own line - either the chain just
+                    // broke onto its own line above, or it was already
+                    // broken from an earlier iteration - so a comment
+                    // pending on `cur_span`'s own line unambiguously trails
+                    // it, not some later operand still to come on the same
+                    // physical line the way `first`/a still-flat `r` could.
+                    self.flush_trailing_comment(cur_span.hi().0);
                 }
                 if broke {
                     self.indent_out();
@@ -2908,7 +2947,22 @@ impl<'s> Printer<'s> {
             }
             Expr::Update(target, open, updates, close) => {
                 self.print_expr(target);
-                self.raw(" ");
+                // Record update binds tighter than application - `target {
+                // ... }` is one atom, so `App`'s own spine-arg breaking
+                // (`print_app_args`) only ever sees this whole node's span,
+                // never the gap between `target` and `{` inside it. A
+                // source break there (`f x\n  { y = z }`) was silently
+                // dropped, re-gluing onto `f x { y = z }` on every reformat
+                // - this is the one place that gap can be represented at
+                // all, so it has to be checked here, not left to the
+                // caller.
+                let broke = Self::breaks_before(target.span(), *open);
+                if broke {
+                    self.indent_in();
+                    self.newline();
+                } else {
+                    self.raw(" ");
+                }
                 self.list(
                     "{",
                     "}",
@@ -2920,6 +2974,9 @@ impl<'s> Printer<'s> {
                     |x| x.span(),
                     |p, x| p.print_record_update(x),
                 );
+                if broke {
+                    self.indent_out();
+                }
             }
             Expr::Do(qual, _, stmts) => {
                 if let Some(q) = qual {
@@ -3533,6 +3590,42 @@ mod tests {
         // something later on the same line" - `Tuple a b -- c` would end up
         // as `Tuple -- c a b`, injecting the comment mid-expression.
         let src = "module Foo where\n\nfoo = Tuple a b -- trailing\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn op_chain_trailing_comment_stays_on_the_operand_it_trails() {
+        // Real report: an `Op` chain never called `flush_trailing_comment`
+        // for its own operands, so a comment trailing one operand's line
+        // (`# f arg -- comment`) fell through to the next operand's own
+        // unconditional `flush_comments_before` and got misattached as a
+        // *leading* comment on that next operand instead, prying the
+        // comment away from what it actually trails and pushing the next
+        // operand down onto its own separate line.
+        let src = concat!(
+            "module Foo where\n\n",
+            "foo x =\n",
+            "  x\n",
+            "    # f arg -- comment\n",
+            "    <#> (\\y -> y)\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn op_chain_trailing_comment_on_a_still_flat_operand_does_not_misattach_earlier() {
+        // Regression test for a bug introduced while fixing the above: an
+        // earlier version of the fix checked for a trailing comment right
+        // after the chain's first operand unconditionally, before it was
+        // known whether more of the chain still shared that same physical
+        // source line - misattaching `a <> b -- comment` as `a -- comment\n
+        // <> b` instead. Only safe to claim a trailing comment once a real
+        // break confirms the preceding operand truly ends its own line.
+        let src = "module Foo where\n\nfoo = a <> b -- comment\n  <> d\n";
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -4888,5 +4981,54 @@ mod tests {
         let out = fmt(&src);
         assert_eq!(out, src);
         assert_idempotent(&src);
+    }
+
+    #[test]
+    fn record_update_target_relocates_away_from_its_braces_on_a_source_break() {
+        // Real report: a record update (`BookkeepingStore store { store =
+        // ... }`) whose source already broke between `store` and `{` kept
+        // re-gluing back onto one line on reformat. Record update binds
+        // tighter than application (`store { ... }` is one `Expr::Update`
+        // atom, applied to as `App`'s single argument) - so `App`'s own
+        // spine-arg breaking only ever sees this whole node's span, never a
+        // break between `target` and its own `{`; nothing checked that gap
+        // at all, so it silently collapsed on every format pass regardless
+        // of source. Once `Expr::Update` reports that internal break, the
+        // existing "an argument that would break relocates the whole call"
+        // rule (`app_record_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line`)
+        // takes over from there, same as it already does for a `Record`
+        // argument - matching the real corpus's own already-formatted
+        // `deleteId` (`BookkeepingStore\n    store\n      { store = ...
+        // }`), a different call to the same constructor in the same file.
+        let src = concat!(
+            "module Foo where\n\n",
+            "reInsert event =\n",
+            "  BookkeepingStore store\n",
+            "    { store = Map.insert (bookkeepingId event) (NotWritten event) store.store }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "reInsert event =\n",
+                "  BookkeepingStore\n",
+                "    store\n",
+                "      { store = Map.insert (bookkeepingId event) (NotWritten event) store.store }\n",
+            )
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn record_update_target_stays_glued_when_source_had_no_break() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "reInsert event =\n",
+            "  BookkeepingStore store { store = Map.insert (bookkeepingId event) (NotWritten event) store.store }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
     }
 }
