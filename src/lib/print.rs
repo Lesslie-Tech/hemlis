@@ -1530,7 +1530,17 @@ impl<'s> Printer<'s> {
                     return;
                 }
                 let ctor_spans: Vec<Span> = ctors.iter().map(|c| c.span()).collect();
-                let multiline = Self::any_breaks(&ctor_spans);
+                // `any_breaks` alone only catches breaking *between* two or
+                // more constructors - a lone constructor has no adjacent pair
+                // to compare, so it never fired even when that constructor's
+                // own args would break (e.g. a record with enough fields),
+                // leaving `= Ctor` glued flat while its args relocated out
+                // from under it. Checking the sole constructor's own args
+                // here closes that gap, matching the "= Ctor" line always
+                // moving down together with its args, the same one true
+                // shape the multi-constructor case already uses.
+                let multiline = Self::any_breaks(&ctor_spans)
+                    || (ctors.len() == 1 && ctors[0].1.iter().any(|a| self.typ_would_break(a)));
                 self.indent_in();
                 for (i, (cname, cargs)) in ctors.iter().enumerate() {
                     if multiline {
@@ -1574,14 +1584,41 @@ impl<'s> Printer<'s> {
                     self.raw(" ");
                     self.print_typ_var_binding(v);
                 }
-                self.raw(" = ");
+                // Unlike `Decl::Data`, a newtype constructor always wraps
+                // exactly one `Typ` - never a space-separated arg list - so
+                // this is its own direct relocation, not a borrowed call into
+                // `print_ctor_args` (built for that plural case). The two
+                // constructs are genuinely different (a newtype constructor
+                // isn't a data constructor with one field), but land on the
+                // same visual shape when the wrapped type would break: the
+                // whole `= Ctor` line moves down together with it, rather
+                // than leaving `= Ctor` glued flat while only `typ` relocates
+                // out from under it.
+                let multiline = self.typ_would_break(typ);
+                self.indent_in();
+                if multiline {
+                    self.newline();
+                } else {
+                    self.raw(" ");
+                }
+                self.raw("= ");
                 self.lit(ctor);
-                // Same relocation as `Decl::Data`'s own (single) constructor
-                // argument - previously this always glued `typ` flat right
-                // after `ctor `, so a record-typed argument that needed to
-                // break just extended rightward from wherever that landed
-                // instead of relocating onto its own indented line.
-                self.print_ctor_args(ctor.span(), std::slice::from_ref(typ));
+                if multiline {
+                    // Two levels past the `= Ctor` line, matching
+                    // `print_ctor_args`'s own double indent for a relocated
+                    // data-constructor argument - same visual depth for the
+                    // same kind of jump, even though this is separate code.
+                    self.indent_in();
+                    self.indent_in();
+                    self.newline();
+                    self.print_typ(typ);
+                    self.indent_out();
+                    self.indent_out();
+                } else {
+                    self.raw(" ");
+                    self.print_typ(typ);
+                }
+                self.indent_out();
             }
 
             Decl::ClassKind(name, kind) => {
@@ -3763,6 +3800,37 @@ mod tests {
         assert_idempotent(src);
     }
 
+    /// A single constructor's `any_breaks` check has no adjacent pair to
+    /// compare (there's only one constructor, no `|` alternative), so it
+    /// never caught a record-typed arg that would break on its own account
+    /// while still glued flat after the constructor name in source - the
+    /// constructor name stayed on the `=` line while only its args
+    /// relocated out from under it. Now the whole `= Ctor` line relocates
+    /// together with its args, matching the shape a multi-constructor
+    /// break already used.
+    #[test]
+    fn data_single_ctor_arg_that_would_break_relocates_whole_line() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "data Store = Store { a :: Int\n",
+            "  , b :: Int\n",
+            "  }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "data Store\n",
+                "  = Store\n",
+                "      { a :: Int\n",
+                "      , b :: Int\n",
+                "      }\n",
+            )
+        );
+        assert_idempotent(src);
+    }
+
     /// Real report: a data constructor's own fields (unlike a name's own
     /// binders or a call's own arguments) had no relocation logic at all -
     /// always glued flat regardless of source breaks. Also caught, while
@@ -3783,15 +3851,18 @@ mod tests {
     }
 
     /// Real report: `newtype`'s single constructor argument had no
-    /// relocation logic at all - unlike `Decl::Data`'s constructors (see
-    /// `data_ctor_fields_that_would_break_relocate_two_levels_past_the_bullet`
-    /// above), which already relocate when the source itself has a break
-    /// before the arg. Fixed by routing `newtype` through the same
-    /// `print_ctor_args` helper, and by teaching that helper to *also*
-    /// relocate when the arg would break on its own account (a record type
-    /// with enough fields) even when the source glued it flat right after
-    /// the constructor name - which turned out to be a real gap for
-    /// `Decl::Data`'s single-constructor case too.
+    /// relocation logic at all. `Decl::Data`'s own constructors had a
+    /// related but narrower gap: `print_ctor_args` only relocated an arg
+    /// when the source already had a break before it - not when the arg
+    /// would break on its own account (a record type with enough fields)
+    /// while glued flat in source, which is the common case (confirmed in
+    /// the real corpus). A newtype constructor always wraps exactly one
+    /// `Typ`, never a space-separated arg list like a data constructor can,
+    /// so this got its own direct relocation logic rather than a borrowed
+    /// call into `print_ctor_args` - but lands on the same visual shape
+    /// `Decl::Data`'s single-constructor case now uses: the whole `= Ctor`
+    /// line moves down together with the arg, two levels past the bullet,
+    /// not just the arg relocating out from under a still-glued `= Ctor`.
     #[test]
     fn newtype_ctor_arg_that_would_break_relocates_even_when_source_glued_it_flat() {
         let src = concat!(
@@ -3805,10 +3876,11 @@ mod tests {
             out,
             concat!(
                 "module Foo where\n\n",
-                "newtype Store = Store\n",
-                "    { a :: Int\n",
-                "    , b :: Int\n",
-                "    }\n",
+                "newtype Store\n",
+                "  = Store\n",
+                "      { a :: Int\n",
+                "      , b :: Int\n",
+                "      }\n",
             )
         );
         assert_idempotent(src);
