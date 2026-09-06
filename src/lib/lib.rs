@@ -134,6 +134,7 @@ pub enum Flag {
     Resolved,
     Format,
     Write,
+    Check,
 }
 
 pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
@@ -317,7 +318,89 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
     }
 }
 
+enum CheckOutcome {
+    Formatted,
+    Unformatted,
+    ParseError,
+    ReadError(String),
+}
+
+fn check_one_file(i: usize, arg: &str) -> CheckOutcome {
+    let src = match fs::read_to_string(arg) {
+        Ok(s) => s,
+        Err(e) => return CheckOutcome::ReadError(format!("{:?}", e)),
+    };
+
+    let (l, comments) = lexer::lex(&src, ast::Fi(i));
+    let n = DashMap::new();
+    let mut p = parser::P::new(&l, &n);
+    let out = parser::module(&mut p);
+    if p.i < p.tokens.len() {
+        p.errors.push(parser::Serror::NotAtEOF(p.span(), p.peekt()));
+    }
+
+    match (&out, p.errors.is_empty()) {
+        (Some(m), true) => {
+            let formatted = print::print_module(&src, m, &comments);
+            if formatted == src {
+                CheckOutcome::Formatted
+            } else {
+                CheckOutcome::Unformatted
+            }
+        }
+        _ => CheckOutcome::ParseError,
+    }
+}
+
+/// Checks whether each file is already formatted, without writing anything.
+/// Files are checked in parallel (one rayon task per file). Prints which
+/// files are not formatted and exits with status 1 if any file is
+/// unformatted, fails to parse, or fails to read.
+fn check_format(files: Vec<String>) {
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
+    let outcomes: Vec<CheckOutcome> = files
+        .par_iter()
+        .enumerate()
+        .map(|(i, arg)| check_one_file(i, arg))
+        .collect();
+
+    let mut any_bad = false;
+    for (arg, outcome) in files.iter().zip(outcomes.iter()) {
+        match outcome {
+            CheckOutcome::Unformatted => {
+                println!("not formatted: {}", arg);
+                any_bad = true;
+            }
+            CheckOutcome::ParseError => {
+                eprintln!("ERR: {} did not parse cleanly, cannot format", arg);
+                any_bad = true;
+            }
+            CheckOutcome::ReadError(e) => {
+                let abs = env::current_dir()
+                    .map(|cwd| cwd.join(arg).display().to_string())
+                    .unwrap_or_else(|_| arg.clone());
+                eprintln!(
+                    "ERR: could not read '{}': {} (looked relative to the current directory, at '{}')",
+                    arg, e, abs
+                );
+                any_bad = true;
+            }
+            CheckOutcome::Formatted => {}
+        }
+    }
+
+    if any_bad {
+        std::process::exit(1);
+    }
+}
+
 pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
+    if flags.contains(&Flag::Format) && flags.contains(&Flag::Check) {
+        check_format(files);
+        return;
+    }
+
     files
         .iter()
         .enumerate()
