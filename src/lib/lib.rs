@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self},
+    io::{self, Read},
 };
 
 use dashmap::DashMap;
@@ -318,6 +319,19 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
     }
 }
 
+/// Reads `arg` as a file path, except the literal `"-"`, which reads all of
+/// stdin instead - lets `-f`/`-c` take piped input the same way `purs-tidy`
+/// and most other CLI formatters treat a bare `-`.
+fn read_source(arg: &str) -> io::Result<String> {
+    if arg == "-" {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    } else {
+        fs::read_to_string(arg)
+    }
+}
+
 enum CheckOutcome {
     Formatted,
     Unformatted,
@@ -326,7 +340,7 @@ enum CheckOutcome {
 }
 
 fn check_one_file(i: usize, arg: &str) -> CheckOutcome {
-    let src = match fs::read_to_string(arg) {
+    let src = match read_source(arg) {
         Ok(s) => s,
         Err(e) => return CheckOutcome::ReadError(format!("{:?}", e)),
     };
@@ -404,7 +418,7 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
     files
         .iter()
         .enumerate()
-        .for_each(|(i, arg)| match fs::read_to_string(arg.clone()) {
+        .for_each(|(i, arg)| match read_source(arg) {
             Err(e) => {
                 let abs = env::current_dir()
                     .map(|cwd| cwd.join(arg).display().to_string())
@@ -431,7 +445,9 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
                         (Some(m), true) => {
                             let formatted = print::print_module(&src, m, &comments);
                             if flags.contains(&Flag::Write) {
-                                if formatted != src {
+                                if arg == "-" {
+                                    eprintln!("ERR: cannot use -w with stdin ('-') input");
+                                } else if formatted != src {
                                     match fs::write(arg, &formatted) {
                                         Ok(()) => println!("formatted {}", arg),
                                         Err(e) => {

@@ -15,7 +15,9 @@ and clippy clean.
 Usage: `hemlis -f file.purs` prints formatted output to stdout; `hemlis -f
 -w file.purs` writes in place (skips the write if already formatted);
 `hemlis -f -c file.purs...` checks whether files are already formatted,
-without writing, in parallel. This is the debug `hemlis` binary, not
+without writing, in parallel. A file argument of `-` reads from stdin
+instead of a path (`-w` can't be combined with it, since there's no file to
+write back to). This is the debug `hemlis` binary, not
 `hemlis-language-server`.
 
 ## Architecture

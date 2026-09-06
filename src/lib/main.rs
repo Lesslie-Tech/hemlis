@@ -19,7 +19,7 @@ fn main() {
             parsing_options = true;
             continue;
         }
-        if parsing_options && arg.starts_with("-") {
+        if parsing_options && arg.starts_with("-") && arg != "-" {
             match arg.as_ref() {
                 "-t" | "--tokens" => lib_flags.insert(LibFlag::Tokens),
                 "-a" | "--tree" => lib_flags.insert(LibFlag::Tree),
