@@ -1294,20 +1294,29 @@ impl<'s> Printer<'s> {
         items.dedup_by(|a, b| self.import_display_text(a) == self.import_display_text(b));
     }
 
-    /// Sorting key for an import item - the bare name only, never the `type `/
-    /// `class ` keyword that prefixes its printed form. Those keywords start
-    /// with a lowercase letter, so folding them into the sort key would sort
-    /// every `class`/`type`-prefixed symbol import by that keyword rather than
-    /// by the (usually capitalized) name itself, scattering classes away from
-    /// where their name would otherwise place them.
-    fn import_sort_key(&self, i: &Import) -> &str {
+    /// Sorting key for an import item - a (tier, bare name) pair, not just
+    /// rendered text. purs-tidy doesn't sort import-list items in one flat
+    /// alphabetical pass: its `ordImportComparison` (confirmed by reading the
+    /// vendored `purs-tidy` bundle at
+    /// `../pay-backend/tools/purescript-tidy/bundle/Main/index.js`, function
+    /// `sortImportsIde`/`ordImportComparison`) ranks by *kind* first - class
+    /// imports, then type-operator imports (`type (~>)`), then plain type
+    /// imports, then plain value imports, then value-operator imports last -
+    /// and only alphabetically by name *within* each tier. That's why e.g.
+    /// `type (..)` sorts before a plain type name even when its symbol text
+    /// wouldn't win a flat compare, and why a value operator like `(>>=)`
+    /// sorts after `bind`/`discard`/`join` rather than before them (`(` is
+    /// low ASCII, which a flat sort would put first). A flat sort - whether
+    /// on the rendered `"class "/"type "`-prefixed text or on the bare name
+    /// alone - cannot reproduce this; the tier has to be its own key column.
+    fn import_sort_key(&self, i: &Import) -> (u8, &str) {
         match i {
-            Import::Value(_, n) => self.text(n.span()),
-            Import::Symbol(_, s) => self.text(s.span()),
-            Import::Typ(_, n) => self.text(n.span()),
-            Import::TypDat(_, n, _) => self.text(n.span()),
-            Import::TypSymbol(_, s) => self.text(s.span()),
-            Import::Class(_, n) => self.text(n.span()),
+            Import::Class(_, n) => (0, self.text(n.span())),
+            Import::TypSymbol(_, s) => (1, self.text(s.span())),
+            Import::Typ(_, n) => (2, self.text(n.span())),
+            Import::TypDat(_, n, _) => (2, self.text(n.span())),
+            Import::Value(_, n) => (3, self.text(n.span())),
+            Import::Symbol(_, s) => (4, self.text(s.span())),
         }
     }
 
@@ -3993,16 +4002,42 @@ mod tests {
     }
 
     #[test]
-    fn import_class_sorts_by_bare_name_not_by_the_class_keyword() {
-        // `class Eq`'s sort key must be "Eq", not "class Eq" - otherwise the
-        // literal keyword (lowercase `c`) sorts it away from where its
-        // (typically capitalized) name belongs, here after `Foo` instead of
-        // before it.
+    fn import_class_sorts_before_types_as_its_own_tier() {
+        // Class imports are their own leading tier (purs-tidy's
+        // `ImportClassCmp`), always ahead of plain type/value names -
+        // not merely alphabetical among "class Eq"/"Foo"/"bar" as rendered
+        // or bare text (both would put `Foo` before `class Eq` here).
         let src = "module Foo where\n\nimport Data.Foo (Foo, class Eq, bar)\n\nx = 1\n";
         let out = fmt(src);
         assert_eq!(
             out,
             "module Foo where\nimport Data.Foo (class Eq, Foo, bar)\n\nx = 1\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn import_sort_follows_purs_tidys_five_tier_kind_order() {
+        // purs-tidy's `ordImportComparison` ranks import items by kind before
+        // name: class, then type-operator (`type (~>)`), then plain type,
+        // then plain value, then value-operator - each tier alphabetical
+        // within itself. A flat alphabetical sort (on either the rendered
+        // "class "/"type "-prefixed text or the bare name alone) would put
+        // `(>>=)` first (low-ASCII `(`) instead of last, and wouldn't place
+        // `type (..)` ahead of the plain type names.
+        let src = concat!(
+            "module Foo where\n\n",
+            "import Kanon.Type (Name, class GetPk, type (..), toSqlValue, (>>=), class GetIndex, fromSqlValue)\n\n",
+            "x = 1\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n",
+                "import Kanon.Type (class GetIndex, class GetPk, type (..), Name, fromSqlValue, toSqlValue, (>>=))\n\n",
+                "x = 1\n",
+            )
         );
         assert_idempotent(src);
     }
