@@ -292,6 +292,19 @@ impl<'s> Printer<'s> {
         matches!(e, Expr::Paren(..)) && self.expr_would_break(e)
     }
 
+    /// True if `e` is an `ado` block with no statements (just `ado in
+    /// result`) that isn't eligible to print glued flat on one line (see
+    /// `Expr::Ado`'s own glue-vs-block decision) - used the same way
+    /// `paren_would_break` is, to break the glued arrow/`=` onto its own
+    /// line first instead of leaving `ado` glued with nothing but `in`
+    /// dangling under it. Narrowed to the no-statements case: an `ado` with
+    /// real statements already has visible content directly under `ado`
+    /// itself (same as a `do` block), so it keeps `do`'s always-glued
+    /// convention instead.
+    fn ado_would_break(&mut self, e: &Expr) -> bool {
+        matches!(e, Expr::Ado(_, _, stmts, _) if stmts.is_empty()) && self.expr_would_break(e)
+    }
+
     /// `paren_would_break`'s unrestricted counterpart: true if printing `e`
     /// at the current indent produces any line break at all, whatever kind
     /// of node it is - a `Record`/`Array` with its own multiline items
@@ -1939,7 +1952,7 @@ impl<'s> Printer<'s> {
     /// would rewrite that paren's own source position and flip `Expr::App`'s
     /// (span-based) multiline decision on the very next formatting pass.
     fn print_arrow_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
-        if self.paren_would_break(e) || Self::breaks_before(before, e.span()) {
+        if self.paren_would_break(e) || self.ado_would_break(e) || Self::breaks_before(before, e.span()) {
             self.raw(arrow.trim_end());
             self.indent_in();
             self.newline();
@@ -2011,6 +2024,15 @@ impl<'s> Printer<'s> {
     fn let_binding_would_break(&mut self, b: &LetBinding) -> bool {
         let comment_idx_before = self.comment_idx;
         let would_break = self.render_indented(0, |p| p.print_let_binding(b)).contains('\n');
+        self.comment_idx = comment_idx_before;
+        would_break
+    }
+
+    /// The `DoStmt` counterpart of `let_binding_would_break`, used the same
+    /// way by `Expr::Ado`'s own single-statement glue check.
+    fn do_stmt_would_break(&mut self, s: &DoStmt) -> bool {
+        let comment_idx_before = self.comment_idx;
+        let would_break = self.render_indented(0, |p| p.print_do_stmt(s)).contains('\n');
         self.comment_idx = comment_idx_before;
         would_break
     }
@@ -2893,17 +2915,46 @@ impl<'s> Printer<'s> {
                 self.raw("do");
                 self.print_indented_siblings(stmts, |s| s.span(), |p, s| p.print_do_stmt(s));
             }
-            Expr::Ado(qual, _, stmts, result) => {
+            Expr::Ado(qual, kw, stmts, result) => {
                 if let Some(q) = qual {
                     self.print_qual(q);
                 }
                 self.raw("ado");
-                self.indent_in();
-                self.print_siblings_body(stmts, |s| s.span(), |p, s| p.print_do_stmt(s));
-                self.newline();
-                self.raw("in ");
-                self.print_expr(result);
-                self.indent_out();
+                // A 0-or-1-statement `ado` glued flat on one source line in
+                // the original (`ado in x`, `ado x <- pure 1 in x`) stays
+                // flat here too, the same "single simple binding stays glued"
+                // convention `print_let_kw_bindings` applies to `let`.
+                // Stricter than that convention though (no tolerance for a
+                // one-line gap): unlike `let ... in`, an `ado` with no
+                // statements has nothing else to visually anchor `in` to, so
+                // any real source break here instead falls through to the
+                // block form below and lets `ado_would_break` relocate the
+                // whole thing (see its own doc comment).
+                let flat = match stmts.as_slice() {
+                    [] => !Self::breaks_before(*kw, result.span()),
+                    [only] => {
+                        !Self::breaks_before(*kw, only.span())
+                            && !self.do_stmt_would_break(only)
+                            && !Self::breaks_before(only.span(), result.span())
+                    }
+                    _ => false,
+                } && !self.expr_would_break(result);
+                if flat {
+                    self.raw(" ");
+                    if let [only] = stmts.as_slice() {
+                        self.print_do_stmt(only);
+                        self.raw(" ");
+                    }
+                    self.raw("in ");
+                    self.print_expr(result);
+                } else {
+                    self.indent_in();
+                    self.print_siblings_body(stmts, |s| s.span(), |p, s| p.print_do_stmt(s));
+                    self.newline();
+                    self.raw("in ");
+                    self.print_expr(result);
+                    self.indent_out();
+                }
             }
             Expr::Let(kw, bindings, body) => {
                 self.raw("let");
@@ -3735,6 +3786,43 @@ mod tests {
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
+    }
+
+    #[test]
+    fn ado_notation_with_statements_stays_glued_like_a_do_block() {
+        let src = "module Foo where\n\nfoo = ado\n  x <- bar\n  in x\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn ado_with_no_statements_stays_flat_when_the_source_had_it_on_one_line() {
+        let src = "module Foo where\n\nfoo = ado in 1\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn ado_with_one_statement_stays_flat_when_the_source_had_it_on_one_line() {
+        let src = "module Foo where\n\nfoo = ado x <- pure 1 in x\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn ado_with_no_statements_and_a_source_break_relocates_the_whole_block() {
+        // Unlike a populated `ado`/`do` block (which always stays glued to
+        // `=`, real statements or not), an empty `ado` has nothing but `in`
+        // to show under it - so once it can't stay flat on one line, the
+        // whole `ado ... in ...` unit moves onto its own indented line
+        // instead of leaving `ado` glued with just `in` dangling under it.
+        let src = "module Foo where\n\nfoo = ado\n  in 1\n";
+        let out = fmt(src);
+        assert_eq!(out, "module Foo where\n\nfoo =\n  ado\n    in 1\n");
+        assert_idempotent(&out);
     }
 
     #[test]
