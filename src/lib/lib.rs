@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     fs::{self},
 };
 
@@ -322,7 +323,13 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
         .enumerate()
         .for_each(|(i, arg)| match fs::read_to_string(arg.clone()) {
             Err(e) => {
-                panic!("ERR: {} {:?}", arg, e);
+                let abs = env::current_dir()
+                    .map(|cwd| cwd.join(arg).display().to_string())
+                    .unwrap_or_else(|_| arg.clone());
+                eprintln!(
+                    "ERR: could not read '{}': {} (looked relative to the current directory, at '{}')",
+                    arg, e, abs
+                );
             }
             Ok(src) => {
                 use std::io::BufWriter;
