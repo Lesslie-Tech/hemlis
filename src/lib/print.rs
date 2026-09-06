@@ -748,7 +748,16 @@ impl<'s> Printer<'s> {
         let mut broke = false;
         for a in cargs {
             let cur_span = a.span();
-            if !broke && Self::breaks_before(prev_span, cur_span) {
+            // Also relocate when this arg would break on its own account
+            // (e.g. a record type with enough fields to need its own
+            // multiple lines) even though the source glued it flat right
+            // after the constructor name - otherwise it just extends
+            // rightward from wherever the ctor name's own text ended
+            // instead of landing on a clean, indented line of its own.
+            // Same fixed-point reasoning as `print_sig_typ`'s dual check:
+            // once relocated, the *next* format pass sees a real source
+            // break here too, so both conditions settle on one shape.
+            if !broke && (Self::breaks_before(prev_span, cur_span) || self.typ_would_break(a)) {
                 self.indent_in();
                 self.indent_in();
                 broke = true;
@@ -882,6 +891,37 @@ impl<'s> Printer<'s> {
             self.indent_out();
         } else {
             self.raw(" = ");
+            self.print_typ(typ);
+        }
+    }
+
+    /// A record/row field's own `label :: Typ` - like `print_typ_alias_rhs`,
+    /// not `print_sig_typ`: a field's `::` stays glued to its label (unlike a
+    /// top-level signature's `::`, which relocates to its own line), only
+    /// `typ` itself moves to a fresh indented line when it would break. Real
+    /// report: a field whose type was a multi-line application (`action ::
+    /// VariantStorable (...)`) printed with `VariantStorable` glued right
+    /// after `:: `, so its own parenthesized row just extended rightward
+    /// from wherever that landed instead of relocating - `print_row`
+    /// previously had no relocation logic here at all, unlike every other
+    /// `name :: Typ`/`name = Typ` site in this printer.
+    fn print_field_typ(&mut self, before: Span, typ: &Typ) {
+        if Self::breaks_before(before, typ.span()) || self.typ_would_break(typ) {
+            self.raw(" ::");
+            self.indent_in();
+            self.newline();
+            let outer = self.in_broken_sig;
+            self.in_broken_sig = true;
+            let needs_hang = matches!(typ, Typ::App(..) | Typ::Record(..) | Typ::Row(..));
+            if needs_hang {
+                self.hang_glued(|p| p.print_typ(typ));
+            } else {
+                self.print_typ(typ);
+            }
+            self.in_broken_sig = outer;
+            self.indent_out();
+        } else {
+            self.raw(" :: ");
             self.print_typ(typ);
         }
     }
@@ -1536,8 +1576,12 @@ impl<'s> Printer<'s> {
                 }
                 self.raw(" = ");
                 self.lit(ctor);
-                self.raw(" ");
-                self.print_typ(typ);
+                // Same relocation as `Decl::Data`'s own (single) constructor
+                // argument - previously this always glued `typ` flat right
+                // after `ctor `, so a record-typed argument that needed to
+                // break just extended rightward from wherever that landed
+                // instead of relocating onto its own indented line.
+                self.print_ctor_args(ctor.span(), std::slice::from_ref(typ));
             }
 
             Decl::ClassKind(name, kind) => {
@@ -2475,8 +2519,7 @@ impl<'s> Printer<'s> {
                     self.raw(", ");
                 }
                 self.lit(label);
-                self.raw(" :: ");
-                self.print_typ(typ);
+                self.print_field_typ(label.span(), typ);
             }
             if let Some(tail) = tail {
                 if !fields.is_empty() {
@@ -2511,8 +2554,7 @@ impl<'s> Printer<'s> {
                     self.raw(", ");
                 }
                 self.lit(label);
-                self.raw(" :: ");
-                self.print_typ(typ);
+                self.print_field_typ(label.span(), typ);
                 self.flush_trailing_comment(typ.span().hi().0);
             }
             if let Some(tail) = tail {
@@ -3737,6 +3779,74 @@ mod tests {
         let src = "module Foo where\n\ndata D\n  = C\n      A\n      B\n  | E\n";
         let out = fmt(src);
         assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Real report: `newtype`'s single constructor argument had no
+    /// relocation logic at all - unlike `Decl::Data`'s constructors (see
+    /// `data_ctor_fields_that_would_break_relocate_two_levels_past_the_bullet`
+    /// above), which already relocate when the source itself has a break
+    /// before the arg. Fixed by routing `newtype` through the same
+    /// `print_ctor_args` helper, and by teaching that helper to *also*
+    /// relocate when the arg would break on its own account (a record type
+    /// with enough fields) even when the source glued it flat right after
+    /// the constructor name - which turned out to be a real gap for
+    /// `Decl::Data`'s single-constructor case too.
+    #[test]
+    fn newtype_ctor_arg_that_would_break_relocates_even_when_source_glued_it_flat() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "newtype Store = Store { a :: Int\n",
+            "  , b :: Int\n",
+            "  }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "newtype Store = Store\n",
+                "    { a :: Int\n",
+                "    , b :: Int\n",
+                "    }\n",
+            )
+        );
+        assert_idempotent(src);
+    }
+
+    /// Real report: a record/row field's own type (`print_row`) never
+    /// relocated when it would break, unlike every other `name :: Typ`/
+    /// `name = Typ` site in this printer (`print_sig_typ`,
+    /// `print_typ_alias_rhs`) - a field whose type was itself a multi-line
+    /// application just extended rightward from wherever `:: ` landed.
+    /// Unlike a top-level signature, a field's `::` stays glued to its
+    /// label (`print_field_typ` mirrors `print_typ_alias_rhs`'s shape, not
+    /// `print_sig_typ`'s) - only the type itself drops to a fresh line.
+    #[test]
+    fn record_field_typ_that_would_break_relocates_with_double_colon_staying_put() {
+        let src = concat!(
+            "module Foo where\n\n",
+            "type T =\n",
+            "  { a :: Int\n",
+            "  , action :: Foo\n",
+            "      Bar\n",
+            "      Baz\n",
+            "  }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "type T =\n",
+                "  { a :: Int\n",
+                "  , action ::\n",
+                "    Foo\n",
+                "      Bar\n",
+                "      Baz\n",
+                "  }\n",
+            )
+        );
         assert_idempotent(src);
     }
 
