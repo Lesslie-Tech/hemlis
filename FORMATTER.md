@@ -1759,10 +1759,19 @@ flip-flopping, output), but confirms no regression.
 - No `textDocument/formatting` LSP handler yet (`src/main.rs`, the LSP
   binary) — `-f`/`-w` on the debug `hemlis` CLI only. This was next on the
   original plan (see "Original plan" below) but hasn't been started.
-- Import merging concatenates name lists and sorts them, but doesn't attempt
-  to match `purs-tidy`'s exact sort semantics beyond "sort by rendered text,
-  case-sensitive" — verified consistent with observed real-world examples,
-  not derived from `purs-tidy` source.
+- Import merging concatenates name lists and sorts them within a single
+  import's name list to match `purs-tidy`'s real sort semantics: a 5-tier
+  kind order (class, type-operator, plain type, plain value, value-operator,
+  each tier alphabetical case-sensitive within itself), not a flat sort on
+  rendered or bare text — confirmed by reading `ordImportComparison` in the
+  vendored `purs-tidy` bundle
+  (`../pay-backend/tools/purescript-tidy/bundle/Main/index.js`) and verified
+  against the full 1423-file corpus (see `import_sort_key` in `print.rs`).
+  Not extended to reordering *between* separate import declarations/blocks
+  (e.g. `import Foo (A)` vs `import Bar (B)` relative to each other beyond
+  the existing bare-vs-rest grouping) — hasn't shown up as a real diff or
+  corpus-sweep failure beyond a couple of same-text lines that just moved
+  position, not sort-order mismatches.
 - No semantic-preservation check (parse(format(x)) AST == parse(x) AST,
   modulo spans) — only idempotence and clean-reparse are checked. Idempotence
   plus the 1422-file sweep catches almost everything in practice, but a
