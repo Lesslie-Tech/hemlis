@@ -2735,10 +2735,21 @@ impl<'s> Printer<'s> {
                         broke = true;
                         just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
                     }
-                    // `flush_trailing_comment` already ended the line itself
-                    // (and, since `indent_in()` ran above, at the new broken
-                    // indent) - an explicit `newline()` here too would leave
-                    // a blank line behind it.
+                    // A comment on its own line right before the operator
+                    // (`x\n  -- comment\n  <#> y`) is a leading comment for
+                    // this `op r` unit, not for `r` alone - claim it here,
+                    // before `op` prints, so it lands above the operator
+                    // instead of `print_expr(r)`'s own unconditional
+                    // `flush_comments_before` claiming it as a leading
+                    // comment on `r`, which would force `r` onto its own
+                    // line under the comment even though nothing about `r`
+                    // itself needed to break. A no-op when the comment was
+                    // already claimed above as trailing `prev_span`'s line.
+                    self.flush_comments_before(cur_span.lo().0);
+                    // `flush_trailing_comment`/`flush_comments_before` above
+                    // already ended the line itself (and, since `indent_in()`
+                    // ran above, at the new broken indent) - an explicit
+                    // `newline()` here too would leave a blank line behind it.
                     if !just_flushed_comment {
                         self.newline();
                     }
@@ -3510,6 +3521,27 @@ mod tests {
         // <> b` instead. Only safe to claim a trailing comment once a real
         // break confirms the preceding operand truly ends its own line.
         let src = "module Foo where\n\nfoo = a <> b -- comment\n  <> d\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn op_chain_leading_comment_before_an_operator_stays_above_it_instead_of_forcing_the_operand_down() {
+        // A comment on its own line right before an operator (`x\n  --
+        // comment\n  <#> y`) belongs to the `op y` unit as a whole, not to
+        // `y` alone. `print_expr(y)`'s own unconditional
+        // `flush_comments_before` would otherwise claim it as a leading
+        // comment on `y`, forcing `y` onto its own line under the comment
+        // even though `y` itself never needed to break.
+        let src = concat!(
+            "module Foo where\n\n",
+            "foo =\n",
+            "  a b c\n",
+            "    -- comment\n",
+            "    <#> List.map d\n",
+            "    # e f\n",
+        );
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
