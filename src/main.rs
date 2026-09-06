@@ -4742,9 +4742,9 @@ impl LanguageServer for Backend {
                         if let ast::Decl::Def(name, binders, _) = decl {
                             binders.iter().enumerate().find_map(|(param_idx, binder)| {
                                 let record_fields = match binder {
-                                    ast::Binder::Record(fields) => fields,
+                                    ast::Binder::Record(_, fields, _) => fields,
                                     ast::Binder::Typed(inner, _) => match inner.as_ref() {
-                                        ast::Binder::Record(fields) => fields,
+                                        ast::Binder::Record(_, fields, _) => fields,
                                         _ => return None,
                                     },
                                     _ => return None,
@@ -4777,9 +4777,9 @@ impl LanguageServer for Backend {
                                     return false;
                                 }
                                 let fields = match &binders[param_idx] {
-                                    ast::Binder::Record(f) => f,
+                                    ast::Binder::Record(_, f, _) => f,
                                     ast::Binder::Typed(inner, _) => match inner.as_ref() {
-                                        ast::Binder::Record(f) => f,
+                                        ast::Binder::Record(_, f, _) => f,
                                         _ => return false,
                                     },
                                     _ => return false,
@@ -4812,9 +4812,9 @@ impl LanguageServer for Backend {
                                         ));
                                     } else {
                                         let record_fields = match &binders[param_idx] {
-                                            ast::Binder::Record(fields) => Some(fields),
+                                            ast::Binder::Record(_, fields, _) => Some(fields),
                                             ast::Binder::Typed(inner, _) => match inner.as_ref() {
-                                                ast::Binder::Record(fields) => Some(fields),
+                                                ast::Binder::Record(_, fields, _) => Some(fields),
                                                 _ => None,
                                             },
                                             _ => None,
@@ -5109,8 +5109,8 @@ fn flatten_arr_chain(typ: &ast::Typ) -> Vec<&ast::Typ> {
 /// whose derived span only covers the inner fields.
 fn correct_binder_span(binder: &ast::Binder, source: &str, fi: ast::Fi) -> ast::Span {
     let span = binder.span();
-    let is_record = matches!(binder, ast::Binder::Record(_))
-        || matches!(binder, ast::Binder::Typed(inner, _) if matches!(inner.as_ref(), ast::Binder::Record(_)));
+    let is_record = matches!(binder, ast::Binder::Record(..))
+        || matches!(binder, ast::Binder::Typed(inner, _) if matches!(inner.as_ref(), ast::Binder::Record(..)));
     if !is_record {
         return span;
     }

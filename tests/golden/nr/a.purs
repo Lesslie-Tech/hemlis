@@ -63,9 +63,11 @@ f =
 -- +      (6, 4)->(6, 7)
 -- +       LetBinding::Pattern
 -- +        Binder::Record
+-- +         (6, 8)->(6, 9)
 -- +          RecordLabelBinder::Pun
 -- +           Name
 -- +            (6, 10)->(6, 11)
+-- +         (6, 12)->(6, 13)
 -- +        Expr::Number
 -- +         Number
 -- +          (6, 16)->(6, 17)

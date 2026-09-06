@@ -607,7 +607,12 @@ pub enum Binder {
     /// this case branch" from that span then can't tell `[]` was ever there
     /// at all, silently losing an entire source row from the calculation.
     Array(Span, Vec<Binder>, Span),
-    Record(Vec<RecordLabelBinder>),
+    /// Same reasoning as `Array` above - without the `{`/`}` brace spans,
+    /// `.span()` reduces to `Span::Zero` for the empty binder `{}`, which
+    /// `print_case_branch`'s "was there a blank line before this" (and "does
+    /// the RHS need to break") calculation reads as an unrelated-to-any-real-
+    /// position value instead of `{}`'s real, single-line position.
+    Record(Span, Vec<RecordLabelBinder>, Span),
     Paren(Span, Box<Binder>, Span),
 }
 

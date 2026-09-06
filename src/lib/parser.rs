@@ -1428,6 +1428,7 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
             Some(Binder::Array(start, bs, end))
         }
         (Some(T::LeftBrace), _) => {
+            let start = p.span();
             kw_lb(p)?;
             let bs = sep_until(
                 p,
@@ -1436,8 +1437,9 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
                 record_binder,
                 next_is!(T::RightBrace),
             );
+            let end = p.span();
             kw_rb(p)?;
-            Some(Binder::Record(bs))
+            Some(Binder::Record(start, bs, end))
         }
         (Some(T::LeftParen), _) => {
             let start = p.span();

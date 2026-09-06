@@ -2028,12 +2028,12 @@ impl<'s> Printer<'s> {
                     |p, x| p.print_binder(x),
                 );
             }
-            Binder::Record(fields) => {
+            Binder::Record(open, fields, close) => {
                 self.list(
                     "{",
                     "}",
-                    Span::zero(),
-                    Span::zero(),
+                    *open,
+                    *close,
                     true,
                     true,
                     fields,
@@ -3419,6 +3419,26 @@ mod tests {
             out,
             "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n"
         );
+        assert_idempotent(src);
+    }
+
+    /// Real report (`Erp/Types.purs`): an empty-record binder `{}` had no
+    /// `.span()` at all (the `Ast` derive merges only over its (empty) field
+    /// list), reducing to `Span::Zero` - the exact same class of bug already
+    /// fixed for `Binder::Array`'s `[]` (see its doc comment in `ast.rs`),
+    /// just never applied to `Binder::Record`. `print_case_branch`'s
+    /// `breaks_before` check then compared the branch's real line number
+    /// against `Span::Zero`'s `(0, 0)`, always reading as "a break", so
+    /// `{} -> 0` relocated its body onto its own line even glued flat in the
+    /// source - and since that changed what line the branch's own body
+    /// really ended on, a second formatting pass then saw a (spurious) gap
+    /// before the next branch and inserted a blank line there too. Fixed by
+    /// giving `Binder::Record` real `{`/`}` brace spans, same as `Array`.
+    #[test]
+    fn empty_record_binder_case_branch_does_not_relocate_or_flip() {
+        let src = "module Foo where\n\nfoo x = case x of\n  y | y > 0 -> y\n  {} -> 0\n";
+        let out = fmt(src);
+        assert_eq!(out, src);
         assert_idempotent(src);
     }
 

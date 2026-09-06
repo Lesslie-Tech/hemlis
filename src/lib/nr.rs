@@ -1491,7 +1491,7 @@ impl<'s> N<'s> {
                     self.binder(b);
                 }
             }
-            ast::Binder::Record(bs) => {
+            ast::Binder::Record(_, bs, _) => {
                 for b in bs.iter() {
                     match b {
                         ast::RecordLabelBinder::Pun(l) => {

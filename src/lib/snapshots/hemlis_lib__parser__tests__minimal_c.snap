@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_module(r\"\nmodule AccessRight where\n\nf x =\n  let\n    a b =\n      case b of\n        ABC { a } -> 1\n        _ -> 1\n  in 1\n            \")"
 ---
 31 of 31
@@ -42,9 +42,11 @@ Module
                ProperName
                 (7, 8)->(7, 11)
              Binder::Record
+              (7, 12)->(7, 13)
                RecordLabelBinder::Pun
                 Name
                  (7, 14)->(7, 15)
+              (7, 16)->(7, 17)
            GuardedExpr::Unconditional
             Expr::Number
              Number
