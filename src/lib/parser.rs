@@ -832,7 +832,7 @@ fn row_label<'t>(p: &mut P<'t>) -> Option<(Label, Typ)> {
     // `row`'s stop condition treats a `String`/`RawString` as a possible row
     // label start (quoted labels, e.g. `("my-label" :: Int)`), so this also
     // has to recognize a *non*-label string - a `Typ::Str` used as an
-    // ordinary type, e.g. `Kanon.Pk ("key")` - and bail out without
+    // ordinary type, e.g. `Foo.Bar ("key")` - and bail out without
     // consuming it. Committing via `label(p)?` first and only then checking
     // for `::` would consume the string on the way to failing, and that
     // partial consumption doesn't roll back: `sep_until` sees this row-field
