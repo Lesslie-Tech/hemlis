@@ -59,7 +59,19 @@ between two adjacent pieces, which doesn't have this problem.
 ### Types are a floor; values relocate
 
 A value's `=`/`->`/`<-`/an operator can and does move to its own line when
-what follows would look bad glued (`paren_would_break` + `print_arrow_rhs`).
+what follows would look bad glued (`print_arrow_rhs`, generalized over
+`paren_would_break` for a parenthesized value and `keyword_block_would_break`
+for a `case`/`do`/`ado`/`let` that's going to print multi-line - these have no
+closing delimiter of their own to relocate around, so leaving their keyword
+glued while their block's content hangs underneath looks just as wrong as a
+paren's `)` regressing would). `Expr::Paren`'s own block-vs-flat choice stays
+mostly content-driven (rendering `inner` and checking for a line break, so a
+nested always-multiline construct still forces it regardless of layout) but
+also treats a source break right after `(` or before `)` as forcing block
+style too, even for trivial content that would otherwise print flat -
+`print_paren_block`'s `force_block` parameter, computed by the caller from
+the original span gap, not by `Expr::Paren` guessing at its own reprinted
+position.
 A type's `::`/`=>`/`->`/`.` never works that way: it is only ever a **floor**
 that whatever comes right after it glues onto, permanently, no matter how
 much that thing expands internally. Concretely: `Typ::Record`/`Typ::Row`

@@ -292,17 +292,20 @@ impl<'s> Printer<'s> {
         matches!(e, Expr::Paren(..)) && self.expr_would_break(e)
     }
 
-    /// True if `e` is an `ado` block with no statements (just `ado in
-    /// result`) that isn't eligible to print glued flat on one line (see
-    /// `Expr::Ado`'s own glue-vs-block decision) - used the same way
-    /// `paren_would_break` is, to break the glued arrow/`=` onto its own
-    /// line first instead of leaving `ado` glued with nothing but `in`
-    /// dangling under it. Narrowed to the no-statements case: an `ado` with
-    /// real statements already has visible content directly under `ado`
-    /// itself (same as a `do` block), so it keeps `do`'s always-glued
-    /// convention instead.
-    fn ado_would_break(&mut self, e: &Expr) -> bool {
-        matches!(e, Expr::Ado(_, _, stmts, _) if stmts.is_empty()) && self.expr_would_break(e)
+    /// True if `e` is one of the keyword-block expressions - `case`/`of`,
+    /// `do`, `ado`, `let`/`in` - that has no closing delimiter of its own to
+    /// regress a column when glued flat doesn't work out, and is going to
+    /// print across multiple lines. Used the same way `paren_would_break` is
+    /// (see `print_arrow_rhs`): relocate the glued arrow/`=` onto its own
+    /// line first, instead of leaving the keyword glued with its block's
+    /// content dangling underneath. `case`/`do` always break once they have
+    /// real branches/statements (both require at least one); `let`/`ado` can
+    /// still print glued flat when they're trivial enough (a single simple
+    /// binding, a statement-less `ado in result`) - `expr_would_break`
+    /// naturally answers false for those on its own.
+    fn keyword_block_would_break(&mut self, e: &Expr) -> bool {
+        matches!(e, Expr::Case(..) | Expr::Do(..) | Expr::Ado(..) | Expr::Let(..))
+            && self.expr_would_break(e)
     }
 
     /// `paren_would_break`'s unrestricted counterpart: true if printing `e`
@@ -351,19 +354,32 @@ impl<'s> Printer<'s> {
     }
 
     /// Prints `(` `print_inner` `)`, using the `( ` ... `)`-on-its-own-line
-    /// block style when `inner` would print across multiple lines - shared by
-    /// `Expr::Paren` and `Typ::Paren` so a parenthesized type wraps exactly
-    /// the same way a parenthesized value does.
+    /// block style when `inner` would print across multiple lines, or when
+    /// `force_block` says the source itself had a break right after `(` or
+    /// right before `)` - shared by `Expr::Paren` and `Typ::Paren` so a
+    /// parenthesized type wraps exactly the same way a parenthesized value
+    /// does.
     ///
-    /// The block-vs-flat decision can't be made from source spans the way
-    /// most other multiline decisions here are: `inner` might contain a
-    /// `case`/`do`/`let`, which always prints across multiple lines
-    /// regardless of its own source layout, so a span-based check would flip
+    /// The *content*-driven half of this can't be replaced by a span-based
+    /// check: `inner` might contain a `case`/`do`/`let`, which always prints
+    /// across multiple lines regardless of its own source layout, so
+    /// deciding block-style from "did `inner`'s own span move" would flip
     /// between formatting passes (flat on pass one, block-style on pass two
-    /// once the close paren visibly lands on a later line than the open one).
-    /// Instead, render `inner` into a scratch buffer and check whether the
-    /// result actually contains a line break - a pure function of the AST,
-    /// stable across repeated formatting.
+    /// once the close paren visibly lands on a later line than the open
+    /// one). Render `inner` into a scratch buffer and check whether the
+    /// result actually contains a line break instead - a pure function of
+    /// the AST, stable across repeated formatting.
+    ///
+    /// `force_block` (`Expr::Paren` only - `Typ::Paren` always passes
+    /// `false`, keeping types' own "never relocate" convention untouched)
+    /// additionally preserves a source break the content alone wouldn't have
+    /// asked for (`( \n 1)` - trivial content, but the source still chose to
+    /// spread it across lines). Computed once, from the *original* source
+    /// span gap around `(`/`)`, by the caller - safe to OR in here without
+    /// reintroducing the pass-to-pass instability above, because once block
+    /// style is chosen for any reason, the closing paren always lands on its
+    /// own fresh line, which keeps the same gap (and the same `force_block`
+    /// value) true again on every subsequent pass.
     ///
     /// `(` is always glued in place here, never relocated onto its own fresh
     /// line even when that would leave `)` looking like it moved back past
@@ -389,7 +405,7 @@ impl<'s> Printer<'s> {
     ///   first instead" strategy (`paren_would_break` + `print_arrow_rhs`),
     ///   so by the time this runs, whatever `(` is glued after either isn't
     ///   going to move, or already broke onto its own fresh line.
-    fn print_paren_block(&mut self, print_inner: impl FnOnce(&mut Self)) {
+    fn print_paren_block(&mut self, force_block: bool, print_inner: impl FnOnce(&mut Self)) {
         // A paren is its own bracketed context, unrelated to whatever signature
         // it happens to be nested inside - a chain inside it that was written
         // flat shouldn't inherit an enclosing broken-signature's forced
@@ -408,7 +424,7 @@ impl<'s> Printer<'s> {
         let inner_text = self.render_at_column(open_col + 2, print_inner);
         self.in_broken_sig = outer_in_broken_sig;
         self.raw("(");
-        if inner_text.contains('\n') {
+        if inner_text.contains('\n') || force_block {
             self.raw(" ");
             self.raw(&inner_text);
             self.with_indent_at(open_col, Self::newline);
@@ -1905,7 +1921,7 @@ impl<'s> Printer<'s> {
     /// with `label`'s own column instead of visibly past it. Two levels are
     /// needed there.
     fn print_record_field_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
-        if self.paren_would_break(e) || Self::breaks_before(before, e.span()) {
+        if self.paren_would_break(e) || self.keyword_block_would_break(e) || Self::breaks_before(before, e.span()) {
             self.raw(arrow.trim_end());
             self.indent_in();
             self.indent_in();
@@ -1931,28 +1947,39 @@ impl<'s> Printer<'s> {
     /// statement it's embedded in, which is invalid PureScript layout - the
     /// parser reads it as that enclosing block ending early.
     ///
-    /// One extra case forces a break even when the source didn't have one:
-    /// `e` is a parenthesized expression that's going to print in the
-    /// `( ` ... `)`-on-its-own-line block style (see `Expr::Paren`). Gluing
-    /// `arrow` straight to `(` there would put the closing `)` back at
-    /// `arrow`'s own (or an even shallower) column once printed - visually
-    /// "moving back" past where this subexpression started, which a reader
-    /// reasonably reads as the expression having ended early. Decided by
-    /// actually rendering `e` at the current indent and checking for a line
-    /// break, the same "don't trust a span here, trust what got printed"
-    /// approach `Expr::Paren` itself uses and for the same reason (`e`'s
-    /// paren can wrap a `case`/`do` that always breaks regardless of source
-    /// layout, which would make a source-span check for this unstable across
-    /// formatting passes). This check is deliberately narrow (only
-    /// `Expr::Paren`, not e.g. `case`/`do`/`let`, which have no closing
-    /// delimiter to regress to a shallower column) and deliberately lives
-    /// here rather than as a general "am I at a fresh line" check inside
-    /// `Expr::Paren` itself - `Expr::Paren` is also reached as one
-    /// space-separated argument of a flat `Expr::App`, where relocating
-    /// would rewrite that paren's own source position and flip `Expr::App`'s
-    /// (span-based) multiline decision on the very next formatting pass.
+    /// Two extra cases force a break even when the source didn't have one -
+    /// `e` is going to print across multiple lines, and gluing `arrow`
+    /// straight onto it would look wrong for one of two different reasons:
+    /// - `e` is a parenthesized expression printing in the `( ` ...
+    ///   `)`-on-its-own-line block style (see `Expr::Paren`, `paren_would_break`).
+    ///   Gluing `arrow` straight to `(` there would put the closing `)` back
+    ///   at `arrow`'s own (or an even shallower) column once printed -
+    ///   visually "moving back" past where this subexpression started, which
+    ///   a reader reasonably reads as the expression having ended early.
+    /// - `e` is a `case`/`do`/`ado`/`let` block that's going to print
+    ///   multi-line (`keyword_block_would_break`). These have no closing
+    ///   delimiter to regress like a paren does, but leaving their keyword
+    ///   glued to `arrow` while their own content (and, for an empty `ado`,
+    ///   nothing at all) hangs underneath reads just as oddly.
+    ///
+    /// Both are decided by actually rendering `e` at the current indent and
+    /// checking for a line break, the same "don't trust a span here, trust
+    /// what got printed" approach `Expr::Paren` itself uses and for the same
+    /// reason (`e` can be, or contain, a `case`/`do` that always breaks
+    /// regardless of source layout, which would make a source-span check for
+    /// this unstable across formatting passes). This lives here rather than
+    /// as a general "am I at a fresh line" check inside `Expr::Paren`/
+    /// `Expr::Case`/etc. themselves - `Expr::Paren` in particular is also
+    /// reached as one space-separated argument of a flat `Expr::App`, where
+    /// relocating would rewrite that paren's own source position and flip
+    /// `Expr::App`'s own (span-based) multiline decision on the very next
+    /// formatting pass. `Expr::App`, `Array`/`Record` (`list()`), and `Op`
+    /// chains are deliberately left out of both checks - they already decide
+    /// their own relocation internally (`own_indent`/`glued_floor`), glueing
+    /// what they can and only relocating what actually needs it, so forcing
+    /// a break here on top would double up instead of helping.
     fn print_arrow_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
-        if self.paren_would_break(e) || self.ado_would_break(e) || Self::breaks_before(before, e.span()) {
+        if self.paren_would_break(e) || self.keyword_block_would_break(e) || Self::breaks_before(before, e.span()) {
             self.raw(arrow.trim_end());
             self.indent_in();
             self.newline();
@@ -2211,7 +2238,7 @@ impl<'s> Printer<'s> {
             }
             Typ::Hole(h) => self.lit(h),
             Typ::Paren(_, inner, _) => {
-                self.print_paren_block(|p| p.print_typ(inner));
+                self.print_paren_block(false, |p| p.print_typ(inner));
             }
             Typ::Arr(a, b) => self.print_typ_arrow_chain(a, b),
             Typ::App(..) => {
@@ -2582,8 +2609,10 @@ impl<'s> Printer<'s> {
             Expr::HexInt(x) => self.lit(x),
             Expr::Hole(x) => self.lit(x),
             Expr::Section(_) => self.raw("_"),
-            Expr::Paren(_, inner, _) => {
-                self.print_paren_block(|p| p.print_expr(inner));
+            Expr::Paren(open, inner, close) => {
+                let force_block =
+                    Self::breaks_before(*open, inner.span()) || Self::breaks_before(inner.span(), *close);
+                self.print_paren_block(force_block, |p| p.print_expr(inner));
             }
             Expr::Negate(inner) => {
                 self.raw("-");
@@ -2928,8 +2957,10 @@ impl<'s> Printer<'s> {
                 // one-line gap): unlike `let ... in`, an `ado` with no
                 // statements has nothing else to visually anchor `in` to, so
                 // any real source break here instead falls through to the
-                // block form below and lets `ado_would_break` relocate the
-                // whole thing (see its own doc comment).
+                // block form below, which `keyword_block_would_break` (see
+                // its own doc comment) then relocates as a whole via
+                // `print_arrow_rhs`/`print_record_field_rhs` - same as it
+                // does for any non-flat `case`/`do`/`let`.
                 let flat = match stmts.as_slice() {
                     [] => !Self::breaks_before(*kw, result.span()),
                     [only] => {
@@ -2969,12 +3000,19 @@ impl<'s> Printer<'s> {
                     self.newline();
                 }
                 self.raw("in");
-                // There's no separate span for the `in` keyword itself (the parser
-                // doesn't capture one), but it always sits on the line right after
-                // the last binding's own last line - so a gap of exactly one line
-                // means body shares `in`'s line (`in x`); a gap of two or more
-                // means `in` had a line of its own and body breaks onto another.
-                let multiline = self.paren_would_break(body)
+                // A bindings block that broke onto its own indented lines
+                // always puts the body on its own fresh line below `in` too
+                // (at `in`'s own level, not indented further under it) - only
+                // a glued single binding can still share `in`'s line. There's
+                // no separate span for the `in` keyword itself (the parser
+                // doesn't capture one), but when bindings did glue, it always
+                // sits on the line right after the single binding's own last
+                // line - so a gap of exactly one line means body shares
+                // `in`'s line (`in x`); a gap of two or more means `in` had a
+                // line of its own and body breaks onto another.
+                let multiline = !glued
+                    || self.paren_would_break(body)
+                    || self.keyword_block_would_break(body)
                     || bindings.last().is_some_and(|b| body.span().lo().0 > b.span().hi().0 + 1);
                 if multiline {
                     self.newline();
@@ -3460,7 +3498,10 @@ mod tests {
     fn case_branches_preserve_a_blank_line_between_groups() {
         let src = "module Foo where\n\nfoo x = case x of\n  A -> 1\n\n  B -> 2\n  C -> 3\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo x =\n  case x of\n    A -> 1\n\n    B -> 2\n    C -> 3\n"
+        );
         assert_idempotent(src);
     }
 
@@ -3518,7 +3559,19 @@ mod tests {
             "    _ -> pure y\n",
         );
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "foo =\n",
+                "  do\n",
+                "    let\n",
+                "      y = 1\n",
+                "    -- comment\n",
+                "    case y of\n",
+                "      _ -> pure y\n",
+            )
+        );
         assert_idempotent(src);
     }
 
@@ -3658,11 +3711,13 @@ mod tests {
 
     #[test]
     fn case_of_with_multiple_branches() {
+        // `case` always breaks (it needs at least one branch), so it always
+        // relocates off of a glued `=` - see `keyword_block_would_break`.
         let src = "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n";
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n"
+            "module Foo where\n\nfoo =\n  case 1 of\n    0 -> \"zero\"\n    x -> \"other\"\n"
         );
         assert_idempotent(src);
     }
@@ -3680,7 +3735,10 @@ mod tests {
     fn empty_record_binder_case_branch_does_not_relocate_or_flip() {
         let src = "module Foo where\n\nfoo x = case x of\n  y | y > 0 -> y\n  {} -> 0\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo x =\n  case x of\n    y | y > 0 -> y\n    {} -> 0\n"
+        );
         assert_idempotent(src);
     }
 
@@ -3692,7 +3750,10 @@ mod tests {
     fn case_scrutinee_that_would_break_relocates_case_and_of_onto_their_own_lines() {
         let src = "module Foo where\n\nfoo = case\n  a\n    && b\n  of\n  true -> 1\n  false -> 2\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo =\n  case\n    a\n      && b\n    of\n    true -> 1\n    false -> 2\n"
+        );
         assert_idempotent(src);
     }
 
@@ -3704,21 +3765,28 @@ mod tests {
         let src =
             "module Foo where\n\nfoo = case\n  a\n  , b\n  of\n  true, e -> 1\n  _, _ -> 2\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo =\n  case\n    a\n    , b\n    of\n    true, e -> 1\n    _, _ -> 2\n"
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_field_with_case_value_hangs_one_level_deeper() {
-        // A record field's value sits one level deeper than the field itself,
-        // on top of whatever the value's own construct does - so `case`'s
-        // branches (its own +1) land two levels below the field, not one.
-        // Unlike top-level `=` (see `case_of_with_multiple_branches`), this
-        // hang applies even though `case` stays glued to the field's `:`.
+        // A record field's value always relocates a `case` (or `do`/`ado`/
+        // `let`) off the field's own `:`, the same as a top-level `=` does
+        // (`case_of_with_multiple_branches`) - `print_record_field_rhs` uses
+        // two `indent_in`s for that relocated position instead of one, so
+        // the value still sits one full level past the field itself, not
+        // flush with it.
         let src =
             "module Foo where\n\nfoo =\n  { a: 1\n  , b: case x of\n      0 -> 1\n      _ -> 2\n  }\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo =\n  { a: 1\n  , b:\n      case x of\n        0 -> 1\n        _ -> 2\n  }\n"
+        );
         assert_idempotent(src);
     }
 
@@ -3726,7 +3794,10 @@ mod tests {
     fn record_update_field_with_case_value_hangs_one_level_deeper() {
         let src = "module Foo where\n\nfoo =\n  r\n    { a = 1\n    , b = case x of\n        0 -> 1\n        _ -> 2\n    }\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo =\n  r\n    { a = 1\n    , b =\n        case x of\n          0 -> 1\n          _ -> 2\n    }\n"
+        );
         assert_idempotent(src);
     }
 
@@ -3774,9 +3845,11 @@ mod tests {
 
     #[test]
     fn do_notation() {
+        // A `do` block always breaks (it needs at least one statement), so
+        // it always relocates off of a glued `=` - see `keyword_block_would_break`.
         let src = "module Foo where\n\nfoo = do\n  x <- bar\n  pure x\n";
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = do\n  x <- bar\n  pure x\n");
+        assert_eq!(out, "module Foo where\n\nfoo =\n  do\n    x <- bar\n    pure x\n");
         assert_idempotent(src);
     }
 
@@ -3789,10 +3862,57 @@ mod tests {
     }
 
     #[test]
-    fn ado_notation_with_statements_stays_glued_like_a_do_block() {
+    fn let_in_relocates_and_separates_in_from_body_when_bindings_block() {
+        // A `let`'s bindings that don't collapse flat (see `let_in`) force
+        // the whole `let ... in ...` off of a glued `=` (`keyword_block_would_break`),
+        // the same as `case`/`do`/`ado` - and once the bindings printed as a
+        // block, `in` and the body split onto their own lines too (both at
+        // `in`'s own level), rather than leaving `in <body>` glued as if the
+        // bindings had stayed flat.
+        let src = "module A where\n\na = let\n  b = 2\n  in b\n";
+        let out = fmt(src);
+        assert_eq!(out, "module A where\n\na =\n  let\n    b = 2\n  in\n  b\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn case_relocates_off_a_glued_arrow_even_for_a_single_trivial_branch() {
+        let src = "module A where\n\na = case 1 of\n  _ -> 1\n";
+        let out = fmt(src);
+        assert_eq!(out, "module A where\n\na =\n  case 1 of\n    _ -> 1\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn nested_case_branch_body_also_relocates_off_its_glued_arrow() {
+        let src = "module A where\n\na =\n  case 1 of\n    _ -> case 1 of\n      _ -> 1\n";
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            "module A where\n\na =\n  case 1 of\n    _ ->\n      case 1 of\n        _ -> 1\n"
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn paren_preserves_a_source_break_around_trivial_content() {
+        // Unlike `case`/`do`/`let`/`ado`, `Expr::Paren`'s own block-vs-flat
+        // choice stays content-driven first (a nested always-multiline
+        // construct must still force block style) but now also treats a
+        // source break right after `(` or right before `)` as forcing it
+        // too, even for content that would otherwise happily print flat -
+        // see `print_paren_block`'s `force_block` parameter.
+        let src = "module A where\n\na = (\n 1)\n";
+        let out = fmt(src);
+        assert_eq!(out, "module A where\n\na =\n  ( 1\n  )\n");
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn ado_notation_with_statements_relocates_off_a_glued_arrow_like_do_does() {
         let src = "module Foo where\n\nfoo = ado\n  x <- bar\n  in x\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(out, "module Foo where\n\nfoo =\n  ado\n    x <- bar\n    in x\n");
         assert_idempotent(src);
     }
 
@@ -3840,9 +3960,15 @@ mod tests {
 
     #[test]
     fn let_multiple_bindings_still_break() {
+        // `do` (the decl's own RHS here) always relocates off a glued `=`
+        // now - see `keyword_block_would_break` - so everything inside it,
+        // including this `let`-statement, shifts down one level too.
         let src = "module A where\n\na = do\n  let\n    x = 1\n    y = 2\n  pure (x + y)\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module A where\n\na =\n  do\n    let\n      x = 1\n      y = 2\n    pure (x + y)\n"
+        );
         assert_idempotent(src);
     }
 
@@ -3850,7 +3976,7 @@ mod tests {
     fn let_binding_on_its_own_source_line_still_breaks() {
         let src = "module A where\n\na = do\n  let\n    x = 1\n  pure x\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(out, "module A where\n\na =\n  do\n    let\n      x = 1\n    pure x\n");
         assert_idempotent(src);
     }
 
