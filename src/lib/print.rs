@@ -913,6 +913,14 @@ impl<'s> Printer<'s> {
     fn print_field_typ(&mut self, before: Span, typ: &Typ) {
         if Self::breaks_before(before, typ.span()) || self.typ_would_break(typ) {
             self.raw(" ::");
+            // Two levels, not one - same reasoning as
+            // `print_record_field_rhs`'s own two-levels branch: `label ::`/
+            // `, ` is always exactly `INDENT` characters wide, so a single
+            // `indent_in()` lands the relocated type flush with the field's
+            // own label column instead of visibly past it (real report:
+            // `action ::\n  VariantStorable (...)` had `VariantStorable`
+            // landing at the exact same column as `action` itself).
+            self.indent_in();
             self.indent_in();
             self.newline();
             let outer = self.in_broken_sig;
@@ -924,6 +932,7 @@ impl<'s> Printer<'s> {
                 self.print_typ(typ);
             }
             self.in_broken_sig = outer;
+            self.indent_out();
             self.indent_out();
         } else {
             self.raw(" :: ");
@@ -4006,9 +4015,44 @@ mod tests {
                 "type T =\n",
                 "  { a :: Int\n",
                 "  , action ::\n",
-                "    Foo\n",
-                "      Bar\n",
-                "      Baz\n",
+                "      Foo\n",
+                "        Bar\n",
+                "        Baz\n",
+                "  }\n",
+            )
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn record_field_typ_app_with_paren_row_arg_indents_two_levels_past_label() {
+        // Real report: `label ::`/`, ` is exactly `INDENT` characters wide,
+        // so a single `indent_in()` for the relocated type landed it flush
+        // with the field's own label column - looking like it merely
+        // continued `action` instead of nesting under it. User's own words:
+        // "It should be 2 spaces in."
+        let src = concat!(
+            "module Foo where\n\n",
+            "type T =\n",
+            "  { other :: Int\n",
+            "  , action :: VariantStorable\n",
+            "      ( conversion :: ProxyStorable \"conversion\"\n",
+            "      , funding :: ProxyStorable \"funding\"\n",
+            "      )\n",
+            "  }\n",
+        );
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            concat!(
+                "module Foo where\n\n",
+                "type T =\n",
+                "  { other :: Int\n",
+                "  , action ::\n",
+                "      VariantStorable\n",
+                "        ( conversion :: ProxyStorable \"conversion\"\n",
+                "        , funding :: ProxyStorable \"funding\"\n",
+                "        )\n",
                 "  }\n",
             )
         );
