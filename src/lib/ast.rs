@@ -380,6 +380,14 @@ pub struct Header(
     pub Vec<ImportDecl>,
     pub Span,
     pub Span,
+    /// Span of the export list's `(`, or `Span::zero()` when there's no
+    /// export list - lets the printer detect a source break right after
+    /// `(` the same way `Typ::Record`/`Expr::Array` do, instead of only
+    /// ever seeing breaks between adjacent exports.
+    pub Span,
+    /// Span of the export list's `)`, or `Span::zero()` when there's no
+    /// export list.
+    pub Span,
 );
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]

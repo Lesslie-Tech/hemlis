@@ -1,8 +1,6 @@
 ---
 source: src/lib/parser.rs
-assertion_line: 2111
 expression: "p_module(r#\"\nmodule A.B.C (a, class B, C, D(..), E(F, G), \n (+), type (+), module H) where\n\nimport A\nimport A as A\nimport A.B.C as A.C\nimport A.B.C (a, class B, \n C, D(..), E(F, G), (+), type (+))\nimport A.B.C hiding (foo)\n        \"#)"
-snapshot_kind: text
 ---
 81 of 81
 ===
@@ -118,4 +116,6 @@ Module
     (9, 24)->(9, 25)
   (1, 0)->(1, 6)
   (2, 26)->(2, 31)
+  (1, 13)->(1, 14)
+  (2, 24)->(2, 25)
 ===

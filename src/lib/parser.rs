@@ -234,7 +234,10 @@ fn header<'t>(p: &mut P<'t>) -> Option<Header> {
     let m = p.span();
     kw_module(p)?;
     let name = mname(p)?;
-    let exports = exports(p);
+    let (exports, exports_open, exports_close) = match exports(p) {
+        Some((open, exports, close)) => (Some(exports), open, close),
+        None => (None, Span::zero(), Span::zero()),
+    };
     p.recover();
     let w = p.span();
     kw_where(p)?;
@@ -242,7 +245,15 @@ fn header<'t>(p: &mut P<'t>) -> Option<Header> {
         p.skip();
     }
     let imports = imports(p);
-    Some(Header(name, exports, imports, m, w))
+    Some(Header(
+        name,
+        exports,
+        imports,
+        m,
+        w,
+        exports_open,
+        exports_close,
+    ))
 }
 
 // TODO: pick the errros from the branch that moved the most consumed tokens
@@ -395,12 +406,14 @@ where
     Some(out)
 }
 
-fn exports<'t>(p: &mut P<'t>) -> Option<Vec<Export>> {
+fn exports<'t>(p: &mut P<'t>) -> Option<(Span, Vec<Export>, Span)> {
     if matches!(p.peekt(), Some(T::LeftParen)) {
+        let open = p.span();
         kw_lp(p);
         let exports = sep_until(p, "export", kw_comma, export, next_is!(T::RightParen));
+        let close = p.span();
         kw_rp(p);
-        Some(exports)
+        Some((open, exports, close))
     } else {
         None
     }

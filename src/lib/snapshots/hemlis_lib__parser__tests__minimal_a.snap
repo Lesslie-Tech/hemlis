@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_module(r\"\nmodule A.C (a) where\n\nt :: T\nt =\n  T.d\n    [ T.d\n        let\n          q a b =\n            a\n              { a: _.o\n              , b: _.id\n              , c\n              , d: 1\n              , e\n              }\n\n          q a b c =\n            A\n              { a:\n                  case b of\n                    true -> Nothing\n                    false -> Just (page + 1)\n              , b: b # c\n              }\n\n          q = a b []\n        in \\_ -> 123\n    ]\n            \")"
 ---
 96 of 96
@@ -13,6 +13,8 @@ Module
      (1, 12)->(1, 13)
   (1, 0)->(1, 6)
   (1, 15)->(1, 20)
+  (1, 11)->(1, 12)
+  (1, 13)->(1, 14)
   Decl::Sig
    Name
     (3, 0)->(3, 1)

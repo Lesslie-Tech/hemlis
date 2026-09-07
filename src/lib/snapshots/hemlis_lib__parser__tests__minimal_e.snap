@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_module(r\"\nmodule E () where\n\ndata E\n  = E\n      { e :: E\n      }\n  | E E\n            \")"
 ---
 19 of 19
@@ -10,6 +10,8 @@ Module
    (1, 7)->(1, 8)
   (1, 0)->(1, 6)
   (1, 12)->(1, 17)
+  (1, 9)->(1, 10)
+  (1, 10)->(1, 11)
   Decl::Data
    ProperName
     (3, 5)->(3, 6)

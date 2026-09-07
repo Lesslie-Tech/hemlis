@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_module(r\"\nmodule Test where\n\nf :: forall n. Compare n (-1) GT => P n\n\")"
 ---
 20 of 20
@@ -11,6 +11,8 @@ Module
   NULL
   (1, 0)->(1, 6)
   (1, 12)->(1, 17)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Sig
    Name
     (3, 0)->(3, 1)

@@ -1,8 +1,6 @@
 ---
 source: src/lib/parser.rs
-assertion_line: 2243
 expression: "p_typ(\" ( a :: {} , a :: {}) \")"
-snapshot_kind: text
 ---
 18 of 18
 ===
@@ -13,6 +11,8 @@ Module
   NULL
   (0, 0)->(0, 6)
   (0, 11)->(0, 16)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Sig
    Name
     (2, 0)->(2, 1)

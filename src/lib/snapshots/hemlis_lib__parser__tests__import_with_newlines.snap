@@ -1,8 +1,6 @@
 ---
 source: src/lib/parser.rs
-assertion_line: 2142
 expression: "p_import(\"import A (foo\\n , bar\\n , baz)\")"
-snapshot_kind: text
 ---
 14 of 14
 ===
@@ -31,4 +29,6 @@ Module
     (4, 6)->(4, 7)
   (0, 0)->(0, 6)
   (0, 14)->(0, 19)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
 ===

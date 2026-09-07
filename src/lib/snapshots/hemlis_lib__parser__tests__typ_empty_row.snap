@@ -1,8 +1,6 @@
 ---
 source: src/lib/parser.rs
-assertion_line: 2154
 expression: "p_typ(\"()\")"
-snapshot_kind: text
 ---
 9 of 9
 ===
@@ -13,6 +11,8 @@ Module
   NULL
   (0, 0)->(0, 6)
   (0, 11)->(0, 16)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Sig
    Name
     (2, 0)->(2, 1)

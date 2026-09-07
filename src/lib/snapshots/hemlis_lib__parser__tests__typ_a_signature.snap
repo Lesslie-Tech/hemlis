@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_typ(\"forall a. Monoid a => a -> a -> a\")"
 ---
 18 of 18
@@ -11,6 +11,8 @@ Module
   NULL
   (0, 0)->(0, 6)
   (0, 11)->(0, 16)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Sig
    Name
     (2, 0)->(2, 1)

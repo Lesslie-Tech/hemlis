@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_module(r\"\nmodule Test where\n\nf = do\n  a <- g $ h <<< j <$> [1, 2, 3]\n  k $ b 1\n\")"
 ---
 30 of 30
@@ -11,6 +11,8 @@ Module
   NULL
   (1, 0)->(1, 6)
   (1, 12)->(1, 17)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Def
    Name
     (3, 0)->(3, 1)

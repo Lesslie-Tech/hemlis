@@ -1171,7 +1171,7 @@ impl<'s> Printer<'s> {
 
     fn print_header(&mut self, h: &Header) {
         self.flush_comments_before(h.span().lo().0);
-        let Header(name, exports, imports, ..) = h;
+        let Header(name, exports, imports, _, _, exports_open, exports_close) = h;
         self.raw("module ");
         self.lit(name);
         self.raw(" ");
@@ -1179,8 +1179,8 @@ impl<'s> Printer<'s> {
             self.list(
                 "(",
                 ")",
-                Span::zero(),
-                Span::zero(),
+                *exports_open,
+                *exports_close,
                 false,
                 true,
                 exports,
@@ -4165,6 +4165,21 @@ mod tests {
         );
         let out = fmt(src);
         assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A single-export list has the same "no adjacent pair to compare" gap as
+    /// a single-field record: `Header` didn't carry the export list's paren
+    /// spans at all, so a break right after `(` had no way to force block
+    /// style, and the list silently collapsed onto one line. Once the list
+    /// does break, the module head itself must relocate too (`module Name`
+    /// onto its own line, `where` trailing the closing paren) rather than
+    /// leaving `module Name (` glued while the export hangs underneath.
+    #[test]
+    fn module_header_export_list_relocates_on_a_source_break_after_open_paren() {
+        let src = "module A (\na) where\n";
+        let out = fmt(src);
+        assert_eq!(out, "module A\n  ( a\n  ) where\n\n");
         assert_idempotent(src);
     }
 

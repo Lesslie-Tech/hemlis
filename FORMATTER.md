@@ -93,6 +93,23 @@ formatting passes with no real source-layout change behind it - checking
 `open`'s line the same way would flip the decision on the next pass and
 never stabilize.
 
+`list()` (the shared multi-item bracket-printing helper used by arrays,
+record expressions, import name lists, ctor field lists, and a module
+header's export list) already folds `open_span`/`close_span` into the same
+boundary check, so it doesn't have `print_row`'s single-field blind spot -
+but only for callers that pass it real spans instead of `Span::zero()`. A
+module header's export list is one such caller: `Header` carries the export
+list's `(`/`)` spans (`Span::zero()` when there's no export list) so
+`module A (\na) where` sees the break right after `(` and switches to block
+style, which - via `list()`'s existing `own_indent` relocation, the same one
+described below - also moves `module A` onto its own line and leaves `where`
+trailing the closing paren, with no extra relocation logic of its own needed
+in `print_header`. Safe to reuse `list()`'s *open*-side check here (unlike
+`print_row`'s field loop) because it's a pure span comparison computed before
+any printing happens, not a comparison against the printer's live output
+position - it can't be shifted by an unrelated comment-flush timing quirk the
+way `print_row`'s flat-branch check was.
+
 Because of this, `print_spine_args` — the shared "glue each argument until
 something forces a break, then one-per-line from there" helper used by
 `Typ::App`, `print_constraint`, and `print_inst_head` — treats a
