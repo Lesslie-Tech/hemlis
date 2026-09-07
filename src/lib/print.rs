@@ -308,20 +308,11 @@ impl<'s> Printer<'s> {
             && self.expr_would_break(e)
     }
 
-    /// True if `e` is an `Expr::Op` chain that's going to print across
-    /// multiple lines - used the same way `paren_would_break`/
-    /// `keyword_block_would_break` are (see `print_arrow_rhs`): relocate the
-    /// glued arrow/`=` onto its own line first, instead of leaving the
-    /// chain's first operand glued right after it while the rest of the
-    /// chain hangs underneath at the same column. Unlike `Expr::App`/
-    /// `Array`/`Record`, an `Op` chain's own internal glue/relocate decisions
-    /// (`op_spine`'s `glued_floor`) only decide where *within* the chain to
-    /// start breaking - they don't relocate the chain's first operand off of
-    /// a glued arrow the way `Expr::Paren`'s own block style or a keyword
-    /// block's `own_indent` do, so without this the arrow stays glued to the
-    /// first operand while later operators break underneath it. Confirmed by
-    /// the user as the wanted shape even for a chain that only needs to break
-    /// once.
+    /// True if `e` is an `Expr::Op` chain that would print multi-line -
+    /// relocates it off a glued arrow/`=`, same as `paren_would_break`/
+    /// `keyword_block_would_break` (see `print_arrow_rhs`). The chain still
+    /// decides *where within itself* to break (`glued_floor`); this only
+    /// stops its first operand from staying glued to the arrow.
     fn op_chain_would_break(&mut self, e: &Expr) -> bool {
         matches!(e, Expr::Op(..)) && self.expr_would_break(e)
     }
@@ -1983,13 +1974,9 @@ impl<'s> Printer<'s> {
     ///   delimiter to regress like a paren does, but leaving their keyword
     ///   glued to `arrow` while their own content (and, for an empty `ado`,
     ///   nothing at all) hangs underneath reads just as oddly.
-    /// - `e` is an `Expr::Op` chain that's going to print multi-line
-    ///   (`op_chain_would_break`). The chain still decides internally where
-    ///   *within itself* to start breaking (`glued_floor`/"glue until the
-    ///   first operand that needs it"), but the chain as a whole no longer
-    ///   glues its first operand directly to `arrow` - confirmed by the user
-    ///   as the wanted shape even for a chain that only needs to break once
-    ///   (`foo = a\n  >>> b` now relocates to `foo =\n  a\n    >>> b`).
+    /// - `e` is an `Expr::Op` chain that would print multi-line
+    ///   (`op_chain_would_break`) - relocates even if only one break is
+    ///   needed (`foo = a\n  >>> b` becomes `foo =\n  a\n    >>> b`).
     ///
     /// All three are decided by actually rendering `e` at the current indent
     /// and checking for a line break, the same "don't trust a span here,
@@ -2002,11 +1989,9 @@ impl<'s> Printer<'s> {
     /// reached as one space-separated argument of a flat `Expr::App`, where
     /// relocating would rewrite that paren's own source position and flip
     /// `Expr::App`'s own (span-based) multiline decision on the very next
-    /// formatting pass. `Expr::App` and `Array`/`Record` (`list()`) are still
-    /// left out of all three checks - they already decide their own
-    /// relocation internally (`own_indent`), glueing what they can and only
-    /// relocating what actually needs it, so forcing a break here on top
-    /// would double up instead of helping.
+    /// formatting pass. `Expr::App` and `Array`/`Record` (`list()`) are left
+    /// out of all three checks - they already relocate internally
+    /// (`own_indent`).
     fn print_arrow_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
         if self.paren_would_break(e)
             || self.keyword_block_would_break(e)
@@ -3185,6 +3170,7 @@ mod tests {
     use crate::lexer;
     use crate::parser;
     use dashmap::DashMap;
+    use indoc::indoc;
 
     fn fmt(src: &str) -> String {
         let (toks, comments) = lexer::lex(src, Fi(0));
@@ -3659,18 +3645,24 @@ mod tests {
 
     #[test]
     fn op_chain_trailing_comment_on_a_still_flat_operand_does_not_misattach_earlier() {
-        // Regression test for a bug introduced while fixing the above: an
-        // earlier version of the fix checked for a trailing comment right
-        // after the chain's first operand unconditionally, before it was
-        // known whether more of the chain still shared that same physical
-        // source line - misattaching `a <> b -- comment` as `a -- comment\n
-        // <> b` instead. Only safe to claim a trailing comment once a real
-        // break confirms the preceding operand truly ends its own line.
-        let src = "module Foo where\n\nfoo = a <> b -- comment\n  <> d\n";
+        // A trailing comment must not misattach until a real break confirms
+        // the operand before it truly ends its own line.
+        let src = indoc! {"
+            module Foo where
+
+            foo = a <> b -- comment
+              <> d
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  a <> b -- comment\n    <> d\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  a <> b -- comment
+                    <> d
+            "}
         );
         assert_idempotent(src);
     }
@@ -5177,12 +5169,23 @@ mod tests {
 
     #[test]
     fn multiline_operator_chain_relocates_off_a_glued_equals() {
-        // Even a chain that only needs to break once relocates its first
-        // operand off of `=` entirely (`op_chain_would_break`), rather than
-        // leaving it glued while just the one continuation hangs underneath.
-        let src = "module Foo where\n\nfoo = a\n  >>> b\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = a
+              >>> b
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  a\n    >>> b\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  a
+                    >>> b
+            "}
+        );
         assert_idempotent(src);
     }
 
@@ -5200,11 +5203,27 @@ mod tests {
     #[test]
     fn operator_chain_operand_that_would_break_on_its_own_expands_the_whole_chain() {
         // `b` stays glued right after `$` - see `glued_floor`.
-        let src = "module Foo where\n\nfoo = a $ b\n  { x: 1\n  , y: 2\n  }\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = a $ b
+              { x: 1
+              , y: 2
+              }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  a\n    $ b\n        { x: 1\n        , y: 2\n        }\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  a
+                    $ b
+                        { x: 1
+                        , y: 2
+                        }
+            "}
         );
         assert_idempotent(src);
     }
