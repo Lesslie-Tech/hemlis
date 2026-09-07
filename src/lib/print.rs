@@ -308,6 +308,24 @@ impl<'s> Printer<'s> {
             && self.expr_would_break(e)
     }
 
+    /// True if `e` is an `Expr::Op` chain that's going to print across
+    /// multiple lines - used the same way `paren_would_break`/
+    /// `keyword_block_would_break` are (see `print_arrow_rhs`): relocate the
+    /// glued arrow/`=` onto its own line first, instead of leaving the
+    /// chain's first operand glued right after it while the rest of the
+    /// chain hangs underneath at the same column. Unlike `Expr::App`/
+    /// `Array`/`Record`, an `Op` chain's own internal glue/relocate decisions
+    /// (`op_spine`'s `glued_floor`) only decide where *within* the chain to
+    /// start breaking - they don't relocate the chain's first operand off of
+    /// a glued arrow the way `Expr::Paren`'s own block style or a keyword
+    /// block's `own_indent` do, so without this the arrow stays glued to the
+    /// first operand while later operators break underneath it. Confirmed by
+    /// the user as the wanted shape even for a chain that only needs to break
+    /// once.
+    fn op_chain_would_break(&mut self, e: &Expr) -> bool {
+        matches!(e, Expr::Op(..)) && self.expr_would_break(e)
+    }
+
     /// `paren_would_break`'s unrestricted counterpart: true if printing `e`
     /// at the current indent produces any line break at all, whatever kind
     /// of node it is - a `Record`/`Array` with its own multiline items
@@ -1921,7 +1939,11 @@ impl<'s> Printer<'s> {
     /// with `label`'s own column instead of visibly past it. Two levels are
     /// needed there.
     fn print_record_field_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
-        if self.paren_would_break(e) || self.keyword_block_would_break(e) || Self::breaks_before(before, e.span()) {
+        if self.paren_would_break(e)
+            || self.keyword_block_would_break(e)
+            || self.op_chain_would_break(e)
+            || Self::breaks_before(before, e.span())
+        {
             self.raw(arrow.trim_end());
             self.indent_in();
             self.indent_in();
@@ -1947,9 +1969,9 @@ impl<'s> Printer<'s> {
     /// statement it's embedded in, which is invalid PureScript layout - the
     /// parser reads it as that enclosing block ending early.
     ///
-    /// Two extra cases force a break even when the source didn't have one -
+    /// Three extra cases force a break even when the source didn't have one -
     /// `e` is going to print across multiple lines, and gluing `arrow`
-    /// straight onto it would look wrong for one of two different reasons:
+    /// straight onto it would look wrong for one of three different reasons:
     /// - `e` is a parenthesized expression printing in the `( ` ...
     ///   `)`-on-its-own-line block style (see `Expr::Paren`, `paren_would_break`).
     ///   Gluing `arrow` straight to `(` there would put the closing `)` back
@@ -1961,11 +1983,18 @@ impl<'s> Printer<'s> {
     ///   delimiter to regress like a paren does, but leaving their keyword
     ///   glued to `arrow` while their own content (and, for an empty `ado`,
     ///   nothing at all) hangs underneath reads just as oddly.
+    /// - `e` is an `Expr::Op` chain that's going to print multi-line
+    ///   (`op_chain_would_break`). The chain still decides internally where
+    ///   *within itself* to start breaking (`glued_floor`/"glue until the
+    ///   first operand that needs it"), but the chain as a whole no longer
+    ///   glues its first operand directly to `arrow` - confirmed by the user
+    ///   as the wanted shape even for a chain that only needs to break once
+    ///   (`foo = a\n  >>> b` now relocates to `foo =\n  a\n    >>> b`).
     ///
-    /// Both are decided by actually rendering `e` at the current indent and
-    /// checking for a line break, the same "don't trust a span here, trust
-    /// what got printed" approach `Expr::Paren` itself uses and for the same
-    /// reason (`e` can be, or contain, a `case`/`do` that always breaks
+    /// All three are decided by actually rendering `e` at the current indent
+    /// and checking for a line break, the same "don't trust a span here,
+    /// trust what got printed" approach `Expr::Paren` itself uses and for the
+    /// same reason (`e` can be, or contain, a `case`/`do` that always breaks
     /// regardless of source layout, which would make a source-span check for
     /// this unstable across formatting passes). This lives here rather than
     /// as a general "am I at a fresh line" check inside `Expr::Paren`/
@@ -1973,13 +2002,17 @@ impl<'s> Printer<'s> {
     /// reached as one space-separated argument of a flat `Expr::App`, where
     /// relocating would rewrite that paren's own source position and flip
     /// `Expr::App`'s own (span-based) multiline decision on the very next
-    /// formatting pass. `Expr::App`, `Array`/`Record` (`list()`), and `Op`
-    /// chains are deliberately left out of both checks - they already decide
-    /// their own relocation internally (`own_indent`/`glued_floor`), glueing
-    /// what they can and only relocating what actually needs it, so forcing
-    /// a break here on top would double up instead of helping.
+    /// formatting pass. `Expr::App` and `Array`/`Record` (`list()`) are still
+    /// left out of all three checks - they already decide their own
+    /// relocation internally (`own_indent`), glueing what they can and only
+    /// relocating what actually needs it, so forcing a break here on top
+    /// would double up instead of helping.
     fn print_arrow_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
-        if self.paren_would_break(e) || self.keyword_block_would_break(e) || Self::breaks_before(before, e.span()) {
+        if self.paren_would_break(e)
+            || self.keyword_block_would_break(e)
+            || self.op_chain_would_break(e)
+            || Self::breaks_before(before, e.span())
+        {
             self.raw(arrow.trim_end());
             self.indent_in();
             self.newline();
@@ -3635,7 +3668,10 @@ mod tests {
         // break confirms the preceding operand truly ends its own line.
         let src = "module Foo where\n\nfoo = a <> b -- comment\n  <> d\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(
+            out,
+            "module Foo where\n\nfoo =\n  a <> b -- comment\n    <> d\n"
+        );
         assert_idempotent(src);
     }
 
@@ -5140,10 +5176,13 @@ mod tests {
     }
 
     #[test]
-    fn multiline_operator_chain_flat_after_equals_stays_flat() {
+    fn multiline_operator_chain_relocates_off_a_glued_equals() {
+        // Even a chain that only needs to break once relocates its first
+        // operand off of `=` entirely (`op_chain_would_break`), rather than
+        // leaving it glued while just the one continuation hangs underneath.
         let src = "module Foo where\n\nfoo = a\n  >>> b\n";
         let out = fmt(src);
-        assert_eq!(out, src);
+        assert_eq!(out, "module Foo where\n\nfoo =\n  a\n    >>> b\n");
         assert_idempotent(src);
     }
 
@@ -5165,7 +5204,7 @@ mod tests {
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = a\n  $ b\n      { x: 1\n      , y: 2\n      }\n"
+            "module Foo where\n\nfoo =\n  a\n    $ b\n        { x: 1\n        , y: 2\n        }\n"
         );
         assert_idempotent(src);
     }
