@@ -256,10 +256,8 @@ impl Delim {
     }
 }
 
-/// Lexes `content`, returning the layout-processed token stream (used by the parser) and,
-/// separately, every comment token with its source span. Comments are not fed into the
-/// offside-rule/layout state machine below - they're collected in an independent pass so they
-/// can never influence layout decisions.
+/// Lexes `content` into the layout-processed token stream plus every comment token
+/// (with its span), collected separately so comments never influence layout decisions.
 pub fn lex(content: &str, fi: Fi) -> (Vec<SourceToken<'_>>, Vec<SourceToken<'_>>) {
     let comments = lex_comments(content, fi);
 
@@ -277,9 +275,8 @@ fn lex_comments(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
         let line_after = line + content[token_start..s.end].matches('\n').count();
         scanned_to = s.end;
 
-        // See the matching comment in lex_tokens: a multi-line block comment needs
-        // its own last line's start computed directly, since no separate Indent
-        // token exists for the lines inside it.
+        // A multi-line block comment has no separate Indent token for its inner
+        // lines, so its last line's start must be computed directly (see lex_tokens).
         let start_indent = indent;
         let end_indent = if line_after != line {
             let last_nl = content[token_start..s.end].rfind('\n').unwrap();
@@ -345,15 +342,9 @@ fn lex_tokens(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
         let line_after = line + content[token_start..s.end].matches('\n').count();
         scanned_to = s.end;
 
-        // Most tokens are single-line, so `indent` (the byte offset of the start of
-        // the current line) is already correct for both endpoints. A token that
-        // itself contains embedded newlines - a multi-line raw string or block
-        // comment, which the lexer consumes as one token without emitting separate
-        // Indent tokens for the lines inside it - needs its own last line's start
-        // computed directly here, and `indent` brought forward so whatever token
-        // comes right after it also gets the right column. `rfind` searches the
-        // same [token_start..s.end) range used above to detect multi-line-ness
-        // (which can include skipped whitespace before the token itself starts).
+        // A token with embedded newlines (multi-line raw string/block comment) gets no
+        // Indent token for its inner lines, so its last line's start is computed here
+        // directly and carried forward as `indent` for whatever token follows it.
         let start_indent = indent;
         let end_indent = if line_after != line {
             let last_nl = content[token_start..s.end].rfind('\n').unwrap();
@@ -918,6 +909,7 @@ fn process(c: &mut C<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use insta::assert_snapshot;
 
     fn p(s: &'static str) -> String {
@@ -941,7 +933,13 @@ mod tests {
 
     #[test]
     fn comments_are_captured_separately() {
-        let (toks, comments) = lex("foo = 1 -- hi\n{- block -}\nbar = 2", Fi(0));
+        let (toks, comments) = lex(
+            indoc! {"
+                foo = 1 -- hi
+                {- block -}
+                bar = 2"},
+            Fi(0),
+        );
         assert!(
             toks.iter()
                 .all(|(t, _)| !matches!(t, Ok(Token::LineComment(_) | Token::BlockComment(_)))),
@@ -964,8 +962,12 @@ mod tests {
 
     #[test]
     fn comments_do_not_affect_layout() {
-        let with = p("foo = 1 -- hi\nbar = 2");
-        let without = p("foo = 1\nbar = 2");
+        let with = p(indoc! {"
+            foo = 1 -- hi
+            bar = 2"});
+        let without = p(indoc! {"
+            foo = 1
+            bar = 2"});
         assert_eq!(with, without);
     }
 

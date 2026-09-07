@@ -1,15 +1,10 @@
 //! A PureScript pretty-printer.
 //!
-//! This is a skeleton: it covers module headers, imports/exports, simple value
-//! declarations, and the common expression/type/binder forms. Anything not yet
-//! implemented falls back to slicing the original source text verbatim for that
-//! node's span, so printing never panics or drops content - it just leaves
-//! unsupported constructs unformatted until they're implemented.
-//!
-//! Layout decisions (whether a bracketed list prints on one line or one entry
-//! per line) are made eagerly from the source spans already on every AST node:
-//! if a list's first and last element don't start/end on the same source line,
-//! it is printed expanded. No line-fitting/backtracking is involved.
+//! Skeleton: unimplemented constructs fall back to slicing the original
+//! source text for that node's span, so printing never panics or drops
+//! content. Layout (one-line vs. expanded) is decided eagerly from source
+//! spans - if a list's first/last element don't start/end on the same
+//! source line, it prints expanded. No line-fitting/backtracking.
 
 use crate::ast::*;
 use crate::lexer::{SourceToken, Token};
@@ -29,36 +24,24 @@ pub fn print_module(source: &str, module: &Module, comments: &[SourceToken<'_>])
 
 struct Printer<'s> {
     source: &'s str,
-    /// Byte offset of the start of each source line, computed once up front -
-    /// `text()`/`lit()` slice a span out of `source` for every leaf AST node
-    /// printed, and recomputing this from scratch (an O(source_len) scan) on
-    /// each of those calls turned printing into an O(source_len * leaf_count)
-    /// pass over large files.
+    /// Byte offset of the start of each source line, precomputed - avoids an
+    /// O(source_len) rescan on every leaf node's `text()`/`lit()` call.
     line_starts: Vec<usize>,
     comments: &'s [SourceToken<'s>],
     comment_idx: usize,
     out: String,
     indent: usize,
-    /// Set while printing the type of a signature that's already been decided to
-    /// print expanded (see `print_sig_typ`). A forall/constraint/arrow chain is
-    /// typically nested several layers deep (`Forall(Constrained(Arr(Arr(...))))`) -
-    /// without this, each layer would indent again on top of the last, producing a
-    /// staircase instead of every `.`/`=>`/`->` breaking to the same indent level.
+    /// Set while printing an already-expanded signature type (see
+    /// `print_sig_typ`), so a nested forall/constraint/arrow chain breaks
+    /// all its `.`/`=>`/`->` to one indent level instead of staircasing.
     in_broken_sig: bool,
-    /// Byte offset into `out` marking a position some outer construct has
-    /// already committed to as a glue point for whatever comes next - set
-    /// right before printing that "whatever's next" (a `list()` item glued
-    /// after `open `/`, `; an `Expr::Op` operand glued after `op ` once the
-    /// chain's own `newline()` already put the operator on a fresh line of
-    /// its own), consumed by a *nested* construct's own `own_indent`-style
-    /// relocation check (`list()`'s own, `Expr::App`'s). Relocating there
-    /// anyway would double up on a floor the outer construct already
-    /// established - the same "floor" idea documented in FORMATTER.md,
-    /// just for a value-side glue point rather than a type-side one. Valid
-    /// only for as long as nothing has been printed since the mark was set;
-    /// the moment `out.len()` no longer matches it, something (the current
-    /// construct's own head token, an earlier sibling) has been glued in
-    /// front of whatever's being decided now, and ordinary relocation
+    /// Byte offset in `out` marking a glue point an outer construct already
+    /// committed to (e.g. after `open `/`, `, or after an Op chain's own
+    /// operator newline) - a nested construct's relocation check
+    /// (`own_indent`-style) reads this to avoid double-indenting on top of
+    /// a floor the outer construct already established (see FORMATTER.md).
+    /// Only valid while `out.len()` still matches the recorded offset;
+    /// once something else has been glued in front, ordinary relocation
     /// resumes.
     glued_floor: Option<usize>,
 }
@@ -113,39 +96,22 @@ impl<'s> Printer<'s> {
         trimmed_len == 0 || self.out[..trimmed_len].ends_with('\n')
     }
 
-    /// The column (in characters, 0-based) of wherever printing continues
-    /// right now on the current line - i.e. how much has already been
-    /// written since the last line break. At a fresh line (see
-    /// `at_fresh_line`) this is always exactly `self.indent`, since a fresh
-    /// line consists of nothing but that many indent spaces; mid-line
-    /// (something's been glued directly onto this line - `:: `, `-> `, a
-    /// class name, ...) it's the real width of everything glued so far,
-    /// which `self.indent` alone has no memory of. See `hang_at_column` and
-    /// the "floor" model in FORMATTER.md.
+    /// Column of wherever printing continues on the current line. At a
+    /// fresh line this equals `self.indent`; mid-line (something glued
+    /// after `:: `/`-> `/etc.) it's the real width printed so far.
     fn current_column(&self) -> usize {
         match self.out.rfind('\n') {
             Some(i) => self.out[i + 1..].chars().count(),
-            // No newline anywhere in `self.out` - either this is truly the
-            // start of the whole print (`self.indent` is 0 here too, so
-            // returning it is the same as before), or `self.out` is a fresh
-            // scratch buffer just swapped in by `render_indented`/
-            // `render_at_column` (`with_indent_at` already set `self.indent`
-            // to the intended starting column, but swapping the buffer never
-            // physically writes those indent spaces the way a real
-            // `newline()` would). Without this case, a fresh empty buffer
-            // reads as column 0 regardless of `self.indent` - a nested
-            // glued `Paren`'s own column capture would land at 0 instead of
-            // its real column.
+            // Empty `out` (start of print, or a fresh scratch buffer
+            // swapped in by `render_indented`/`render_at_column`, whose
+            // `with_indent_at` set `self.indent` without writing spaces).
             None if self.out.is_empty() => self.indent,
             None => self.out.chars().count(),
         }
     }
 
-    /// Runs `f` with the indent baseline set to `col` (an exact column, not
-    /// necessarily a multiple of `INDENT`) instead of whatever it currently
-    /// is, restoring the previous baseline afterward. `indent_in`/
-    /// `indent_out` calls inside `f` still add/remove `INDENT` on top of
-    /// `col` as usual - this only changes what they're relative to.
+    /// Runs `f` with the indent baseline set to `col` (not necessarily a
+    /// multiple of `INDENT`), restoring the previous baseline after.
     fn with_indent_at<R>(&mut self, col: usize, f: impl FnOnce(&mut Self) -> R) -> R {
         let saved = self.indent;
         self.indent = col;
@@ -154,43 +120,22 @@ impl<'s> Printer<'s> {
         r
     }
 
-    /// `with_indent_at(current_column(), f)` - runs `f` (printing something
-    /// glued directly onto the current line: a nesting shape right after
-    /// `:: `/`-> `/`=> `) with the indent baseline set to exactly the real
-    /// column that glued prefix landed at, instead of leaving whatever
-    /// *ambient* baseline was active before the prefix was printed. The
-    /// ambient value has no memory of the prefix's own width - `:: `/`=> `
-    /// are 3 characters, `INDENT` is a fixed 2 - so a plain `indent_in`
-    /// bumping the stale ambient value lands one column short of lining up
-    /// under the glued prefix's own text once something inside `f` (e.g.
-    /// `print_spine_args`) does its own further `indent_in` when it breaks.
-    /// Call this immediately before `f` would otherwise start printing -
-    /// nothing may be written in between, or the captured column is wrong.
-    /// See the "floor" model in FORMATTER.md.
+    /// `with_indent_at(current_column(), f)` for printing something glued
+    /// right after a prefix like `:: `/`-> `/`=> `, so a later `indent_in`
+    /// inside `f` lines up under the glued text instead of the stale
+    /// ambient indent. Call immediately before `f` prints anything.
     fn hang_glued<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let col = self.current_column();
         self.with_indent_at(col, f)
     }
 
-    /// Break to a new line at the current indent. If we're already at the start
-    /// of one (nothing but indent spaces written since the last '\n' - typically
-    /// because an outer construct just broke here too, and what it's printing
-    /// next is itself something that always opens with its own break), this
-    /// reuses that line instead of leaving a blank one: two `newline()` calls in a
-    /// row with no content between them never inserts a blank line by accident.
-    /// A deliberate blank-line separator is always written directly as `raw("\n")`
-    /// and is unaffected by this.
+    /// Break to a new line at the current indent. Reuses an already-fresh
+    /// line instead of adding a blank one, so back-to-back `newline()`
+    /// calls never insert a blank line by accident (a deliberate blank
+    /// line is written directly via `raw("\n")`).
     fn newline(&mut self) {
         let trimmed_len = self.out.trim_end_matches(' ').len();
         if self.at_fresh_line() {
-            // Already at the start of a line (possibly with indent already
-            // written by an earlier newline() call with nothing printed since -
-            // typically because whatever we're about to print also always opens
-            // with its own break). Leave it exactly as-is: re-indenting to
-            // whatever level we're at *now* would let an inner construct's own
-            // indent_in() retroactively re-indent a line an outer context already
-            // started, which is wrong - the outer context owns this line's
-            // margin, not whichever construct happens to share it.
             return;
         }
         self.out.truncate(trimmed_len);
@@ -237,11 +182,9 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// Insert a genuinely blank line right before whatever prints next, given
-    /// that `newline()` was just called (so the current line already carries
-    /// this indent's leading spaces). Trims those back off first so the blank
-    /// line itself has no trailing whitespace, then re-writes the indent for
-    /// the line that follows.
+    /// Insert a blank line before whatever prints next (call right after
+    /// `newline()`); trims the just-written indent so the blank line has no
+    /// trailing whitespace, then re-writes it for the following line.
     fn insert_blank_line(&mut self) {
         let trimmed = self.out.trim_end_matches(' ').len();
         self.out.truncate(trimmed);
@@ -249,14 +192,9 @@ impl<'s> Printer<'s> {
         self.write_indent();
     }
 
-    /// Prints `e` in isolation, `levels` indent levels deeper than wherever
-    /// this is called from, and returns the resulting text without touching
-    /// the real output. Used to render a subexpression "on paper" first -
-    /// either to inspect what it would look like before committing to a
-    /// layout choice (see `Expr::Paren`), or to get it indented at a level
-    /// that depends on a choice made *after* it would otherwise have started
-    /// printing (re-render at the right level rather than patching baked-in
-    /// indent spaces after the fact).
+    /// Renders `print_inner` in isolation (into a scratch buffer, `levels`
+    /// indents deeper) without touching the real output - lets a layout
+    /// decision inspect what a subexpression would look like first.
     fn render_indented(&mut self, levels: usize, print_inner: impl FnOnce(&mut Self)) -> String {
         let saved = std::mem::take(&mut self.out);
         for _ in 0..levels {
@@ -269,40 +207,28 @@ impl<'s> Printer<'s> {
         std::mem::replace(&mut self.out, saved)
     }
 
-    /// `render_indented`'s counterpart for an exact column rather than a
-    /// level count - see `with_indent_at`. Used by `print_paren_block` so a
-    /// glued `( `'s own content hangs under its real column (however much
-    /// text it's glued after) instead of an approximate level bump.
+    /// `render_indented`'s counterpart for an exact column (see
+    /// `with_indent_at`), used by `print_paren_block` for a glued `(`.
     fn render_at_column(&mut self, col: usize, print_inner: impl FnOnce(&mut Self)) -> String {
         let saved = std::mem::take(&mut self.out);
         self.with_indent_at(col, print_inner);
         std::mem::replace(&mut self.out, saved)
     }
 
-    /// True if `e` is a parenthesized expression that's going to print in the
-    /// `( ` ... `)`-on-its-own-line block style (see `Expr::Paren`) at the
-    /// current indent - checked by actually rendering it into a scratch
-    /// buffer (discarded either way) and looking for a line break, not by
-    /// comparing spans (see the long comment on `print_arrow_rhs` for why).
-    /// Callers that glue something directly in front of `e` (an `arrow`, an
-    /// `in`) use this to decide whether to break *before* `e` instead, so
-    /// its closing `)` doesn't end up looking like it "moved back" past
-    /// whatever precedes it once printed.
+    /// True if `e` is an `Expr::Paren` that would print in the `( ` ...
+    /// `)`-on-its-own-line block style at the current indent - rendered
+    /// into a scratch buffer rather than checked via spans (see
+    /// `print_arrow_rhs`). Callers glue something in front of `e` (an
+    /// arrow, an `in`) and use this to break before `e` instead, so its
+    /// closing `)` doesn't look like it "moved back" past what precedes it.
     fn paren_would_break(&mut self, e: &Expr) -> bool {
         matches!(e, Expr::Paren(..)) && self.expr_would_break(e)
     }
 
-    /// True if `e` is one of the keyword-block expressions - `case`/`of`,
-    /// `do`, `ado`, `let`/`in` - that has no closing delimiter of its own to
-    /// regress a column when glued flat doesn't work out, and is going to
-    /// print across multiple lines. Used the same way `paren_would_break` is
-    /// (see `print_arrow_rhs`): relocate the glued arrow/`=` onto its own
-    /// line first, instead of leaving the keyword glued with its block's
-    /// content dangling underneath. `case`/`do` always break once they have
-    /// real branches/statements (both require at least one); `let`/`ado` can
-    /// still print glued flat when they're trivial enough (a single simple
-    /// binding, a statement-less `ado in result`) - `expr_would_break`
-    /// naturally answers false for those on its own.
+    /// True if `e` is a `case`/`do`/`ado`/`let` block that would print
+    /// multi-line - used like `paren_would_break` (see `print_arrow_rhs`).
+    /// `let`/`ado` can still print flat when trivial enough, which
+    /// `expr_would_break` already accounts for.
     fn keyword_block_would_break(&mut self, e: &Expr) -> bool {
         matches!(e, Expr::Case(..) | Expr::Do(..) | Expr::Ado(..) | Expr::Let(..))
             && self.expr_would_break(e)
@@ -317,15 +243,9 @@ impl<'s> Printer<'s> {
         matches!(e, Expr::Op(..)) && self.expr_would_break(e)
     }
 
-    /// `paren_would_break`'s unrestricted counterpart: true if printing `e`
-    /// at the current indent produces any line break at all, whatever kind
-    /// of node it is - a `Record`/`Array` with its own multiline items
-    /// breaks just as well as a `Paren` does. Used where the *reason* a
-    /// glued argument breaks doesn't matter, only whether it does (see
-    /// `print_spine_args`'s `would_break` callback) - unlike
-    /// `paren_would_break`'s two call sites, there's no "closing delimiter
-    /// regresses to a shallower column" concern to narrow this to parens
-    /// for.
+    /// True if printing `e` at the current indent produces any line break,
+    /// regardless of node kind - used where only whether it breaks matters,
+    /// not why (see `print_spine_args`'s `would_break` callback).
     fn expr_would_break(&mut self, e: &Expr) -> bool {
         let comment_idx_before = self.comment_idx;
         let would_break = self.render_indented(0, |p| p.print_expr(e)).contains('\n');
@@ -333,11 +253,9 @@ impl<'s> Printer<'s> {
         would_break
     }
 
-    /// The `Binder` counterpart of `expr_would_break` - used by
-    /// `print_spine_args` over a name/lambda's binders so a binder that's
-    /// itself going to print multi-line (e.g. a record pattern with many
-    /// fields) forces itself and every later binder onto its own line,
-    /// instead of leaving a later binder glued after its closing bracket.
+    /// `expr_would_break` for `Binder`s - used by `print_spine_args` so a
+    /// binder that would print multi-line forces itself and later binders
+    /// onto their own lines.
     fn binder_would_break(&mut self, b: &Binder) -> bool {
         let comment_idx_before = self.comment_idx;
         let would_break = self.render_indented(0, |p| p.print_binder(b)).contains('\n');
@@ -345,11 +263,7 @@ impl<'s> Printer<'s> {
         would_break
     }
 
-    /// The `Typ` counterpart of `paren_would_break`, for the same reason: a
-    /// type glued directly after `::`/`->`/`=>` needs to know whether it's
-    /// going to print in the block style before deciding whether to break
-    /// onto a fresh line first, so its closing `)` doesn't end up looking
-    /// like it moved back past whatever precedes it.
+    /// `paren_would_break` for `Typ::Paren`.
     fn typ_paren_would_break(&mut self, t: &Typ) -> bool {
         matches!(t, Typ::Paren(..)) && self.typ_would_break(t)
     }
@@ -363,72 +277,34 @@ impl<'s> Printer<'s> {
     }
 
     /// Prints `(` `print_inner` `)`, using the `( ` ... `)`-on-its-own-line
-    /// block style when `inner` would print across multiple lines, or when
-    /// `force_block` says the source itself had a break right after `(` or
-    /// right before `)` - shared by `Expr::Paren` and `Typ::Paren` so a
-    /// parenthesized type wraps exactly the same way a parenthesized value
-    /// does.
+    /// block style when `inner` would print multi-line, or `force_block`
+    /// says the source had a break right after `(`/before `)`. Shared by
+    /// `Expr::Paren` and `Typ::Paren`.
     ///
-    /// The *content*-driven half of this can't be replaced by a span-based
-    /// check: `inner` might contain a `case`/`do`/`let`, which always prints
-    /// across multiple lines regardless of its own source layout, so
-    /// deciding block-style from "did `inner`'s own span move" would flip
-    /// between formatting passes (flat on pass one, block-style on pass two
-    /// once the close paren visibly lands on a later line than the open
-    /// one). Render `inner` into a scratch buffer and check whether the
-    /// result actually contains a line break instead - a pure function of
-    /// the AST, stable across repeated formatting.
-    ///
-    /// `force_block` (`Expr::Paren` only - `Typ::Paren` always passes
-    /// `false`, keeping types' own "never relocate" convention untouched)
-    /// additionally preserves a source break the content alone wouldn't have
-    /// asked for (`( \n 1)` - trivial content, but the source still chose to
-    /// spread it across lines). Computed once, from the *original* source
-    /// span gap around `(`/`)`, by the caller - safe to OR in here without
-    /// reintroducing the pass-to-pass instability above, because once block
-    /// style is chosen for any reason, the closing paren always lands on its
-    /// own fresh line, which keeps the same gap (and the same `force_block`
-    /// value) true again on every subsequent pass.
-    ///
-    /// `(` is always glued in place here, never relocated onto its own fresh
-    /// line even when that would leave `)` looking like it moved back past
-    /// whatever precedes `(` - relocating based on "am I at a fresh line"
-    /// can't distinguish "glued after `=`/`->`" from "one flat `Expr::App`
-    /// argument", and relocating the latter would change this paren's own
-    /// source position, flipping `Expr::App`'s own (span-based) multiline
-    /// decision on the next pass. The "break the glued token instead"
-    /// handling belongs at the call site that knows it's printing an arrow's
-    /// RHS - see `print_arrow_rhs`.
-    ///
-    /// `is_typ` picks between two deliberately different hang strategies once
-    /// `inner` is going to print as a block (see "Types are a floor" in
-    /// FORMATTER.md):
-    /// - `Typ::Paren` (`is_typ = true`): `inner` hangs under the *exact
-    ///   column* right after `( `, however much text that's glued in front of
-    ///   it (`:: `, `-> `, a class name, ...) - a type-level `::`/`=>`/`->`/`.`
-    ///   never moves, so `inner`'s hang has to account for that prefix's real
-    ///   width itself rather than approximating with a level bump.
-    /// - `Expr::Paren` (`is_typ = false`): `inner` hangs one level below
-    ///   wherever we already were, the same as always - a value's own glued
-    ///   constructs already have an established "break the glued token
-    ///   first instead" strategy (`paren_would_break` + `print_arrow_rhs`),
-    ///   so by the time this runs, whatever `(` is glued after either isn't
-    ///   going to move, or already broke onto its own fresh line.
+    /// - Block-style is decided by rendering `inner` into a scratch buffer
+    ///   and checking for a line break, not by comparing spans - `inner`
+    ///   can contain a `case`/`do`/`let` that always breaks regardless of
+    ///   source layout, which would make a span check flip between passes.
+    /// - `force_block` (`Expr::Paren` only; `Typ::Paren` always passes
+    ///   `false`) preserves a source break the content alone wouldn't ask
+    ///   for. Safe to OR in without reintroducing pass-to-pass
+    ///   instability: once block style is chosen, `)` always lands on its
+    ///   own line, so the same source gap stays true on later passes.
+    /// - `(` is always glued in place, never relocated - that would change
+    ///   its own source position and flip `Expr::App`'s span-based
+    ///   multiline decision on the next pass. Breaking the glued token
+    ///   instead is the caller's job (see `print_arrow_rhs`).
+    /// - `is_typ` picks the hang once `inner` prints as a block: a type
+    ///   hangs under the exact column after `( ` (a type-level arrow/`::`
+    ///   never relocates, so this must account for the glued prefix's real
+    ///   width); an expr just hangs one level deeper as usual.
     fn print_paren_block(&mut self, force_block: bool, print_inner: impl FnOnce(&mut Self)) {
-        // A paren is its own bracketed context, unrelated to whatever signature
-        // it happens to be nested inside - a chain inside it that was written
-        // flat shouldn't inherit an enclosing broken-signature's forced
-        // expansion (see the same reset in `print_row`). Irrelevant to `Expr`,
-        // which doesn't use `in_broken_sig`, so this is a no-op there.
+        // A paren is its own bracketed context - reset so it doesn't inherit
+        // an enclosing broken-signature's forced expansion (see `print_row`).
         let outer_in_broken_sig = self.in_broken_sig;
         self.in_broken_sig = false;
-        // Same "floor" model as `print_row`: hang the body, and the closing
-        // paren, under this paren's own real column, not an `indent_in`-level
-        // approximation of it - when `(` is glued mid-line after something of
-        // its own width (an operator, a class name), the ambient indent
-        // baseline has no memory of that width. Applies to `Expr::Paren` too,
-        // not just `Typ::Paren`: an `Op` operand glued after `<#> ` with no
-        // relocation decision of its own needs this the same way.
+        // Same "floor" model as `print_row`: hang the body/closing paren
+        // under this paren's own real column, not an indent-level approximation.
         let open_col = self.current_column();
         let inner_text = self.render_at_column(open_col + 2, print_inner);
         self.in_broken_sig = outer_in_broken_sig;
@@ -447,25 +323,19 @@ impl<'s> Printer<'s> {
         source_text_with_starts(self.source, &self.line_starts, &span).unwrap_or("")
     }
 
-    /// Print a leaf AST node (identifier, literal, ...) by slicing its span out
-    /// of the original source - this is always faithful since these nodes never
-    /// carry sub-structure a formatter would want to reflow.
+    /// Print a leaf AST node by slicing its span out of the source verbatim.
     fn lit<T: Ast>(&mut self, x: &T) {
         let t = self.text(x.span());
         self.raw(t);
     }
 
-    /// Last-resort fallback for AST shapes not yet handled: print the original
-    /// source text for this node verbatim.
+    /// Last-resort fallback: print the original source text verbatim.
     fn raw_fallback<T: Ast>(&mut self, x: &T) {
         self.lit(x);
     }
 
-    /// A qualifier used on its own (not immediately followed by the name it
-    /// qualifies, e.g. `A.` before `do`/`ado`). The parser's `Qual` span
-    /// deliberately excludes the trailing `.` (so that merging it with a
-    /// following name's span still yields the right text), so a bare `Qual`
-    /// needs the dot added back explicitly.
+    /// A qualifier used standalone (e.g. `A.` before `do`/`ado`). `Qual`'s
+    /// span excludes the trailing `.`, so it's added back explicitly.
     fn print_qual(&mut self, q: &Qual) {
         self.lit(q);
         self.raw(".");
@@ -488,12 +358,7 @@ impl<'s> Printer<'s> {
             // (only if it's actually still before `line`; otherwise it
             // belongs to some unrelated, much later comment group and its
             // position says nothing about a gap right here), or `line`
-            // itself otherwise. Same "0 or 1, never more" leading-blank-line
-            // preservation `print_module`'s decl loop and
-            // `print_indented_siblings` already apply *before* a comment
-            // group, just applied here *inside* one too (a standalone
-            // section comment like `-- MODEL` followed by a deliberate blank
-            // line before the declaration it precedes).
+            // itself otherwise.
             let next_line = match self.comments.get(self.comment_idx) {
                 Some((_, s)) if s.lo().0 < line => s.lo().0,
                 _ => line,
@@ -504,12 +369,8 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// The line whatever prints next for `before_line` will actually start on:
-    /// the first pending comment's line if one is attached ahead of it, else
-    /// `before_line` itself. Used to measure "was there a source blank line
-    /// here" against what visually comes first, since a comment block leading
-    /// a decl/binding is what the blank line (if any) actually precedes, not
-    /// the decl/binding's own span.
+    /// The line whatever prints next for `before_line` actually starts on:
+    /// a leading pending comment's line if any, else `before_line` itself.
     fn next_visible_line(&self, before_line: usize) -> usize {
         match self.comments.get(self.comment_idx) {
             Some((_, span)) if span.lo().0 < before_line => span.lo().0,
@@ -517,17 +378,13 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// If the very next pending comment starts on `hi_line` (the source line
-    /// whatever was just printed ended on), it was written trailing that
-    /// content on the same line (`foo = 1 -- like this`) rather than leading
-    /// whatever comes next - glue it onto the current line instead of
-    /// `flush_comments_before`'s always-its-own-leading-line treatment.
-    /// A no-op, leaving the comment for the next `flush_comments_before` to
-    /// pick up as a leading comment, if it starts on any other line. Returns
-    /// whether a comment was actually flushed - callers that decide their own
-    /// break state per-item (`Expr::Op`'s operand loop) need to know a
-    /// trailing comment just ended the current line even when no source span
-    /// gap says so, so the next item can't stay glued after it.
+    /// If the next pending comment starts on `hi_line` (where whatever was
+    /// just printed ended), it's trailing (`foo = 1 -- like this`) - glue it
+    /// onto the current line instead of leaving it for
+    /// `flush_comments_before`. No-op otherwise. Returns whether a comment
+    /// was flushed, since that ends the current line even with no source
+    /// span gap - callers like `Expr::Op`'s operand loop need to know their
+    /// next item can't stay glued after it.
     fn flush_trailing_comment(&mut self, hi_line: usize) -> bool {
         let Some((Ok(Token::LineComment(s) | Token::BlockComment(s)), span)) =
             self.comments.get(self.comment_idx)
@@ -540,11 +397,8 @@ impl<'s> Printer<'s> {
         self.raw(" ");
         self.raw(s);
         self.comment_idx += 1;
-        // A `--` line comment swallows everything after it up to the next
-        // real line break - whatever the caller goes on to print right after
-        // this call (a closing `}`/`)`, the next sibling, ...) would silently
-        // become part of the comment, corrupting the output, without this.
-        // Safe/harmless for a block comment too, just not strictly required.
+        // A `--` comment swallows everything up to the next line break;
+        // without this, whatever prints next would silently join it.
         self.newline();
         true
     }
@@ -569,36 +423,24 @@ impl<'s> Printer<'s> {
     // -- lists ---------------------------------------------------------
 
     /// True if there's a source line break between the end of `a` and the
-    /// start of `b`.
-    ///
-    /// Deliberately a local, adjacent-boundary check rather than comparing an
-    /// overall first-to-last span: an item that's internally forced to print
-    /// across multiple lines regardless of source layout (e.g. a nested case/do
-    /// block) would otherwise "infect" its neighbors into looking multiline on a
-    /// later formatting pass even though nothing about *their* source layout
-    /// changed - which breaks idempotence.
+    /// start of `b`. Deliberately a local adjacent-boundary check, not an
+    /// overall first-to-last span comparison - a neighbor forced multiline
+    /// by its own content (e.g. a nested `case`/`do`) would otherwise
+    /// "infect" this pair on a later pass, breaking idempotence.
     fn breaks_before(a: Span, b: Span) -> bool {
         a.hi().0 != b.lo().0
     }
 
-    /// True if any adjacent pair in `spans` has a line break between them (see
-    /// `breaks_before`) - used to decide whether a whole chain/list should print
-    /// expanded.
+    /// True if any adjacent pair in `spans` has a line break between them
+    /// (see `breaks_before`) - decides whether a chain/list prints expanded.
     fn any_breaks(spans: &[Span]) -> bool {
         spans.windows(2).any(|w| Self::breaks_before(w[0], w[1]))
     }
 
     /// Flattens a curried `App(App(App(f, a1), a2), a3)` chain into
-    /// `(f, [a1, a2, a3])` - lets `Expr::App` decide multiline-ness (and print
-    /// one-arg-per-line) for the whole call at once, the same way `list()` does
-    /// for bracketed items, instead of each binary `App` node deciding on its
-    /// own in isolation. Without this, a block (`case`/`do`/...) buried inside
-    /// one argument of a call whose *other* arguments span multiple lines in the
-    /// source has no way to inherit the extra indent that implies - it prints at
-    /// whatever indent level was already active before the call, which can land
-    /// shallower than sibling lines the call goes on to print, i.e. its own
-    /// contents appear to print "before" (at a shallower indent than) the block
-    /// itself.
+    /// `(f, [a1, a2, a3])` so `Expr::App` decides multiline-ness for the
+    /// whole call at once (like `list()` does for bracketed items) instead
+    /// of each binary `App` node deciding in isolation.
     fn app_spine(e: &Expr) -> (&Expr, Vec<&Expr>) {
         let mut args = Vec::new();
         let mut cur = e;
@@ -617,29 +459,15 @@ impl<'s> Printer<'s> {
         crate::parser::op_fixity((op.1).0 .0).prec()
     }
 
-    /// Flattens a *same-precedence* run of an `Op` tree - `Op(a, op1, Op(b,
-    /// op2, c))`, `Op(Op(a, op1, b), op2, c)`, or any other nesting shape
-    /// precedence climbing produces, provided `op1`/`op2`/... all share one
-    /// precedence number - into the flat in-order sequence of operands and
-    /// operators the source actually wrote: `(a, [(op1, b), (op2, c)])`. A
-    /// child `Op` node whose operator binds at a *different* precedence than
-    /// `e`'s own (a tighter or looser sub-chain, e.g. the `&&`s inside `a ||
-    /// b && c || d && e`) is left un-flattened - it stays a single atomic
-    /// operand here, printed later by recursing back into `Expr::Op`'s own
-    /// printing, so it makes its own independent flat/multiline decision
-    /// instead of being dragged into the outer chain's.
-    ///
-    /// Flattening a same-precedence run is needed for the same reason
-    /// `app_spine` flattens `App`: printing each binary `Op` node's
-    /// multiline decision independently nests one `indent_in` inside another
-    /// whenever the tree leans the "wrong" way for its operator's
-    /// associativity (e.g. right-associative `<>`, which nests on the right,
-    /// puts each subsequent `Op` inside the previous one's own `indent_in`/
-    /// `newline` block) - so a chain of N same-precedence operators drifts
-    /// one indent level deeper per operator instead of lining up flush.
-    /// Flattening first lets the whole run make one multiline decision and
-    /// print every continuation at the same indent, regardless of how
-    /// precedence happened to shape the tree.
+    /// Flattens a same-precedence run of an `Op` tree (whatever nesting
+    /// shape precedence climbing produced) into the flat in-order sequence
+    /// `(a, [(op1, b), (op2, c)])`. A child `Op` at a *different* precedence
+    /// is left as a single atomic operand, printed later via its own
+    /// recursive `Expr::Op` call so it makes its own multiline decision.
+    /// Needed like `app_spine`: printing each binary node independently
+    /// would nest one `indent_in` per operator whenever the tree leans the
+    /// "wrong" way for its associativity (e.g. right-associative `<>`),
+    /// drifting one level deeper per operator instead of lining up flush.
     fn op_spine(e: &Expr) -> (&Expr, Vec<(&QOp, &Expr)>) {
         fn go<'e>(e: &'e Expr, target: usize, operands: &mut Vec<&'e Expr>, ops: &mut Vec<&'e QOp>) {
             match e {
@@ -674,13 +502,10 @@ impl<'s> Printer<'s> {
         (cur, args)
     }
 
-    /// The `Typ` counterpart of `op_spine`. Unlike `Expr` operators, every
-    /// type-level operator parses left-associative (see `typ_fop`), so a
-    /// chain never nests the "wrong" way and never needs the stacked-indent
-    /// fix `op_spine` exists for - but flattening it here still buys one
-    /// multiline decision for the whole chain instead of one independent
-    /// decision per adjacent pair, matching `print_typ_arrow_chain` and
-    /// `print_typ_constrained_chain`.
+    /// The `Typ` counterpart of `op_spine`. Type operators always parse
+    /// left-associative, so this doesn't need the stacked-indent fix
+    /// `op_spine` exists for, but still flattens for one shared multiline
+    /// decision across the chain.
     fn typ_op_spine(t: &Typ) -> (&Typ, Vec<(&QOp, &Typ)>) {
         fn go<'e>(t: &'e Typ, operands: &mut Vec<&'e Typ>, ops: &mut Vec<&'e QOp>) {
             match t {
@@ -699,13 +524,10 @@ impl<'s> Printer<'s> {
         (first, ops.into_iter().zip(operands).collect())
     }
 
-    /// Prints `args` (already glued to some preceding `first_span`, e.g. a
-    /// spine's head or a constraint's class name) one at a time: glue each
-    /// with a leading space until one either has a real source break before
-    /// it or would itself print multiline (`would_break`), then that
-    /// argument and every one after it print one-per-line at a single shared
-    /// indent level. Args before the first break stay glued, since nothing
-    /// forces them apart.
+    /// Prints `args` glued after `first_span` with a leading space each,
+    /// until one has a real source break before it or would itself print
+    /// multiline (`would_break`) - that argument and every later one then
+    /// print one-per-line at a shared indent level.
     fn print_spine_args<T>(
         &mut self,
         first_span: Span,
@@ -735,13 +557,10 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// `print_spine_args`'s counterpart for a data constructor's own
-    /// argument types: same "glue until a break forces them apart, then one
-    /// per line" policy, but *two* indent levels deep instead of one. `= `/
-    /// `| ` are exactly `INDENT` wide, so one level alone would make the
-    /// first argument look like it merely continues `cname`'s own column
-    /// rather than nesting under it (same reasoning as
-    /// `print_record_field_rhs`'s two-levels branch).
+    /// `print_spine_args` for a data constructor's argument types, but two
+    /// indent levels deep - `= `/`| ` are exactly `INDENT` wide, so one
+    /// level alone would look like a continuation of `cname`'s own column
+    /// rather than nesting under it.
     fn print_ctor_args(&mut self, cname_span: Span, cargs: &[Typ]) {
         let mut prev_span = cname_span;
         let mut broke = false;
@@ -766,19 +585,12 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// `Expr::App`'s own version of `print_spine_args`: glues each argument
-    /// with a leading space until the first one that either has a real
-    /// source break before it or doesn't fit flat, then moves that argument
-    /// (and every one after it) onto its own line at one shared indent
-    /// level. Whether an argument "doesn't fit flat" is decided by *trying*
-    /// it directly in the real output (mark the position, print it, check
-    /// afterward for a `'\n'`) and rolling back only that one attempt if it
-    /// fails - not by rendering every argument into a scratch buffer up
-    /// front the way `print_spine_args`'s `would_break` callback does
-    /// elsewhere, which is `O(2^depth)` in AST nesting depth once an
-    /// argument can itself be a call whose own arguments need the same
-    /// decision (a real, deeply-nested file used to hang on this instead of
-    /// finishing in a couple of seconds).
+    /// `print_spine_args` for `Expr::App`, but decides "doesn't fit flat" by
+    /// trying each argument directly in the real output and rolling back if
+    /// it breaks, instead of pre-rendering into a scratch buffer - the
+    /// scratch-buffer approach is O(2^depth) once an argument can itself be
+    /// a call needing the same decision (a real deeply-nested file used to
+    /// hang on this).
     fn print_app_args(&mut self, first_span: Span, args: &[&Expr]) {
         let mut prev_span = first_span;
         let mut broke = false;
@@ -823,26 +635,17 @@ impl<'s> Printer<'s> {
     /// (forall/constraints/arrow chain sprawling across lines) doesn't collapse
     /// into one long line.
     fn print_sig_typ(&mut self, before: Span, typ: &Typ) {
-        // Both conditions must produce the *same* shape (`::` moves onto its
-        // own line, glued to `typ`) - a `typ_paren_would_break`-only case
-        // that printed a different shape would make `breaks_before` true on
-        // the next parse, so it would never be a stable fixed point.
+        // Both branches must produce the same shape (`::` glued to `typ` on
+        // its own line) or this wouldn't be a stable fixed point on reformat.
         if Self::breaks_before(before, typ.span()) || self.typ_paren_would_break(typ) {
             self.indent_in();
             self.newline();
             self.raw(":: ");
             let outer = self.in_broken_sig;
             self.in_broken_sig = true;
-            // `typ` is glued directly after `:: ` here, a fixed-width raw
-            // token the indent baseline has no memory of - so if `typ` is
-            // itself a nesting shape (`App`/`Record`/`Row`) that breaks, it
-            // needs to hang under `typ`'s own real column (`hang_glued`),
-            // the same reasoning as `print_constraint`'s own hang. Not
-            // applied to an operator-chain shape (`Arr`/`Op`/`Constrained`/
-            // `Forall`): those must stay at the ambient level for their own
-            // continuations (see `print_typ_arrow_chain`'s doc comment) -
-            // hanging here would incorrectly push every `->`/`=>`
-            // continuation deeper.
+            // Hang App/Record/Row under `typ`'s own column after the glued
+            // `:: ` (see print_constraint); an operator-chain shape must
+            // stay at the ambient level instead (print_typ_arrow_chain).
             let needs_hang = matches!(typ, Typ::App(..) | Typ::Record(..) | Typ::Row(..));
             if needs_hang {
                 self.hang_glued(|p| p.print_typ(typ));
@@ -857,15 +660,9 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// The `type X = Typ` counterpart of `print_sig_typ` - a type alias's `=`
-    /// gets the same treatment a signature's `::` does (see `print_sig_typ`)
-    /// so the two break consistently, and so a value's `=` (`print_arrow_rhs`)
-    /// and a type alias's `=` behave the same way.
+    /// The `type X = Typ` counterpart of `print_sig_typ` - a type alias's
+    /// `=` breaks the same way a signature's `::` does.
     fn print_typ_alias_rhs(&mut self, before: Span, typ: &Typ) {
-        // Both conditions produce the same shape here already (`=` stays
-        // glued to `before`, `typ` moves to a fresh indented line) - unlike
-        // `print_sig_typ`, there's no second shape to collapse into on a
-        // later pass, so this stays a stable fixed point either way.
         if Self::breaks_before(before, typ.span()) || self.typ_paren_would_break(typ) {
             self.raw(" =");
             self.indent_in();
@@ -881,24 +678,14 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// A record/row field's own `label :: Typ` - like `print_typ_alias_rhs`,
-    /// not `print_sig_typ`: a field's `::` stays glued to its label (unlike a
-    /// top-level signature's `::`, which relocates to its own line), only
-    /// `typ` itself moves to a fresh indented line when it would break. Real
-    /// report: a field whose type was a multi-line application (`action ::
-    /// VariantStorable (...)`) printed with `VariantStorable` glued right
-    /// after `:: `, so its own parenthesized row just extended rightward
-    /// from wherever that landed instead of relocating - `print_row`
-    /// previously had no relocation logic here at all, unlike every other
-    /// `name :: Typ`/`name = Typ` site in this printer.
+    /// A record/row field's `label :: Typ` - unlike `print_sig_typ`, the
+    /// `::` stays glued to the label; only `typ` relocates when it would
+    /// break.
     fn print_field_typ(&mut self, before: Span, typ: &Typ) {
         if Self::breaks_before(before, typ.span()) || self.typ_would_break(typ) {
             self.raw(" ::");
-            // Two levels, not one - same reasoning as
-            // `print_record_field_rhs`'s own two-levels branch: `label ::`/
-            // `, ` is exactly `INDENT` wide, so a single `indent_in()` would
-            // land the relocated type flush with the field's own label
-            // column instead of visibly past it.
+            // Two levels, not one: `label ::`/`, ` is exactly `INDENT` wide,
+            // so one level would land flush with the label instead of past it.
             self.indent_in();
             self.indent_in();
             self.newline();
@@ -919,30 +706,23 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// Print `items` as `open item, item, item close` or, if the source had
-    /// them expanded, one per line with leading commas:
+    /// Print `items` as `open item, item, item close`, or one per line with
+    /// leading commas if the source had them expanded:
     /// ```text
     /// open item
     /// , item
     /// close
     /// ```
-    /// `pad` adds a space just inside the brackets on the flat (single-line) path,
-    /// e.g. `{ a: 1, b: 2 }` vs `[1, 2, 3]`. The expanded path is always padded,
-    /// since the leading-comma layout needs the space regardless.
-    /// `open_span`/`close_span` are the brackets' own spans when the caller
-    /// has them (pass `Span::zero()` otherwise, e.g. export/import lists,
-    /// which never matches). `close_span` flushes a comment sitting after
-    /// the last item but before the close - otherwise unreachable, since
-    /// there's no next item to flush before and `flush_trailing_comment`
-    /// only fires for a comment sharing the last item's own line. `open_span`
-    /// detects a source break between the brackets when there are no items
-    /// to otherwise carry one.
-    /// `item_hang` gives each item, in the expanded path, one extra indent
-    /// level while it's printed - needed when the item is itself a nesting
-    /// shape (most commonly an operator chain glued right after `open `/`, `)
-    /// that would otherwise look flush with its own head instead of nested
-    /// under it. Pass `false` when the item printer already manages this
-    /// itself (a record's fields do, via `print_record_field_rhs`).
+    /// `pad` adds a space inside the brackets on the flat path (`{ a: 1 }`
+    /// vs `[1, 2]`); the expanded path is always padded. `open_span`/
+    /// `close_span` are the brackets' spans, or `Span::zero()` if the
+    /// caller has none (e.g. export/import lists) - used to catch a source
+    /// break with zero/one items, and to flush a trailing comment before
+    /// `close`. `item_hang` adds one indent level per item in the expanded
+    /// path, for an item that's itself a nesting shape (e.g. an operator
+    /// chain glued after `open `/`, `) that would otherwise look flush
+    /// instead of nested; pass `false` when the item printer already
+    /// handles this itself.
     #[allow(clippy::too_many_arguments)]
     fn list<T>(
         &mut self,
@@ -956,13 +736,9 @@ impl<'s> Printer<'s> {
         span_of: impl Fn(&T) -> Span,
         mut print_item: impl FnMut(&mut Self, &T),
     ) {
-        // A source break can sit between `open` and the first item, or
-        // between the last item and `close`, not just between two adjacent
-        // items - the only way it can show up at all when there's one item
-        // or none, since a plain `any_breaks` over item spans has no
-        // adjacent pair to see it with then. Folding `open_span`/`close_span`
-        // into the same boundary chain `any_breaks` walks handles all of
-        // these uniformly, including the zero-item case.
+        // A source break can also sit between `open`/first item or last
+        // item/`close`, the only way to see one at all with 0-1 items -
+        // fold open_span/close_span into the same boundary chain.
         let mut boundary_spans: Vec<Span> = Vec::with_capacity(items.len() + 2);
         if open_span != Span::zero() {
             boundary_spans.push(open_span);
@@ -980,38 +756,19 @@ impl<'s> Printer<'s> {
                 self.raw(close);
                 return;
             }
-            // An item with no source break around it can still be going to
-            // print across multiple lines on its own (an `App` whose own
-            // spine breaks, an operator chain) - that should switch the
-            // whole list to the expanded style too, not just leave the item
-            // glued flat with its own internal break looking like a stray
-            // mid-line indent.
-            //
-            // Decided by trying the flat style directly (write `open`/items/
-            // `close` into the real output) and checking *after the fact*
-            // for a `'\n'`, rather than probing every item into a scratch
-            // buffer first: probing recurses into this same "render to
-            // check" pattern for a nested `Array`/`Record`'s own items,
-            // doubling work at every nesting level - `O(2^depth)` instead of
-            // `O(depth)`, and a real pathological case (a deeply-nested but
-            // entirely flat literal) never finished printing under it. If
-            // nothing printed contains a break, this was the right call at
-            // the cost of one traversal. If something did, roll back to
-            // `mark` (rewinding `comment_idx` too, so the expanded path
-            // below re-flushes what this attempt already flushed) and fall
-            // through to the expanded style - a real but non-recursive 2x,
-            // paid only by the ancestors of whatever forced the break.
+            // An item with no source break can still print multiline on its
+            // own (a breaking App/operator chain), which should expand the
+            // whole list too. Decided by writing the flat attempt directly
+            // into the real output and checking after the fact for a '\n',
+            // then rolling back to `mark` on failure - pre-rendering every
+            // item into a scratch buffer instead would recurse into nested
+            // Array/Record items and go O(2^depth) (a real deeply-nested
+            // flat literal used to hang on that).
             let mark = self.out.len();
             let comment_idx_before = self.comment_idx;
-            // Deliberately no `flush_trailing_comment` call in this branch,
-            // unlike the multiline one below: with several items sharing one
-            // physical line, "a pending comment starts on this item's own hi()
-            // line" doesn't mean *this* item is the last thing on that line -
-            // any earlier item on the same flat line would wrongly claim a
-            // comment that actually trails a *later* item, the closing
-            // bracket, or (as found against real-world input) something
-            // outside this list entirely. Safe in the multiline branch only
-            // because each item there is genuinely alone on its own line.
+            // No `flush_trailing_comment` here (unlike the multiline branch):
+            // with several items sharing a line, an earlier item could
+            // wrongly claim a comment trailing a later item or the bracket.
             self.raw(open);
             if pad {
                 self.raw(" ");
@@ -1035,34 +792,18 @@ impl<'s> Printer<'s> {
             self.comment_idx = comment_idx_before;
         }
 
-        // Reached either because the source already forced this (checked
-        // above), or because the flat attempt just rolled back.
+        // Reached either because the source already forced this, or because
+        // the flat attempt just rolled back.
         {
-            // If some outer construct already broke to a fresh line right before
-            // this call (e.g. a `=`/`->` that decided to break because *this*
-            // list starts on its own source line), don't also bump our own
-            // indent level - `newline()` below would be a no-op for the opening
-            // bracket (we're already at the start of a line) but the level bump
-            // would still stick around for every item after it, indenting them
-            // one level deeper than the bracket itself. Only take our own level
-            // when we're the one initiating the break.
-            //
-            // Unlike `print_row` (see its own version of this), a *value*-level
-            // list glued after something (an outer `=`, a lambda's `->`, ...)
-            // does relocate its opening bracket down a level here rather than
-            // hanging in place - values and types are deliberately different
-            // (see the "floor" model in FORMATTER.md): a value's own glued
-            // constructs already have their own established "break the glued
-            // token first instead" strategy (`paren_would_break` +
-            // `print_arrow_rhs`), so by the time `list()` runs, whatever it's
-            // glued after either isn't going to move, or already broke.
-            //
-            // Exception: if this whole list is itself sitting at exactly the
-            // position an *outer* list() just glued it to (`glued_floor`) -
-            // i.e. this list is a sole/first item like `[ { c: 1\n, d: 2\n} ]`
-            // - the outer list already committed to gluing here. Relocating
-            // anyway would double up on the outer list's own already-settled
-            // layout.
+            // If an outer construct already broke to a fresh line before this
+            // call, don't also bump our own indent level - only take a level
+            // when we're the one initiating the break, else items end up one
+            // level too deep. Unlike print_row, a glued value-level list does
+            // relocate its opening bracket down a level (see FORMATTER.md's
+            // "floor" model) - except when this list sits exactly at a floor
+            // an outer list() already committed to (`glued_floor`), e.g. a
+            // sole/first item like `[ { c: 1\n, d: 2\n} ]`, where relocating
+            // would double up on the outer list's own settled layout.
             let own_indent =
                 !self.at_fresh_line() && self.glued_floor != Some(self.out.len());
             if own_indent {
@@ -1085,25 +826,16 @@ impl<'s> Printer<'s> {
                     self.newline();
                 }
                 // Flush before the leading comma, not after - a comment
-                // belongs above the `, item` pair it precedes, not stranding
-                // the comma alone on its own line ahead of it.
+                // belongs above the `, item` pair, not stranding the comma
+                // alone ahead of it.
                 self.flush_comments_before(span_of(item).lo().0);
                 if i > 0 {
                     self.raw(", ");
                 }
-                // An item is glued directly after `open `/`, ` here, a
-                // fixed-width raw token the indent baseline has no memory
-                // of - so if the item is itself a nesting shape that breaks
-                // further (most commonly an operator chain), that break
-                // needs one more level than the item's own line, or it looks
-                // flush with the item's own head instead of visibly nested
-                // under it (easy to mistake for another sibling item at the
-                // list's own comma column). Invisible when the item prints
-                // flat. Same reasoning as `print_record_field_rhs`'s hang.
-                // Only for callers whose items don't already manage their
-                // own hang (`item_hang`) - a record's fields already get
-                // this from `print_record_field_rhs`, and adding another
-                // level here would double up on it.
+                // An item glued after `open `/`, ` needs one extra indent
+                // level if it breaks further (e.g. an operator chain), or it
+                // looks flush with its own head instead of nested under it.
+                // Skipped when the item printer already manages this itself.
                 if item_hang {
                     self.indent_in();
                 }
@@ -1114,21 +846,15 @@ impl<'s> Printer<'s> {
                 if item_hang {
                     self.indent_out();
                 }
-                // Each item is always the last thing on its own line here (the
-                // next one, or the closing bracket, starts its own fresh
-                // `newline()`) - safe to check for a trailing comment. Without
-                // this, a comment trailing the *last* item specifically had
-                // nowhere to be flushed before the closing bracket, so it rode
-                // straight past it to wherever the next flush point happened to
-                // be - possibly relocating into unrelated code entirely, and
-                // (since that also changes what row the bracket's own
-                // surroundings appear to end on) risking a multiline decision
-                // elsewhere flipping between formatting passes.
+                // Each item is always the last thing on its own line here, so
+                // it's safe to check for a trailing comment - without this, a
+                // comment trailing the last item had nowhere to flush before
+                // the closing bracket and could relocate into unrelated code.
                 self.flush_trailing_comment(span_of(item).hi().0);
             }
-            // Catches a comment that's on its own separate line, still before
-            // the close - `flush_trailing_comment` above only catches one
-            // sharing the last item's own line.
+            // Catches a comment on its own line before the close, which
+            // flush_trailing_comment above doesn't (it only catches one
+            // sharing the last item's line).
             self.flush_comments_before(close_span.lo().0);
             self.newline();
             self.raw(close);
@@ -1145,10 +871,8 @@ impl<'s> Printer<'s> {
         let mut prev_hi_line: Option<usize> = None;
         if let Some(h) = &m.0 {
             self.print_header(h);
-            // `print_header` already forced a blank line right after the export
-            // list when there were no imports to absorb it instead - don't also
-            // let the gap check below add a second one for the first decl based
-            // on the (now-irrelevant) source line count.
+            // print_header already forced a blank line after the export list
+            // when there were no imports to absorb it - don't add a second one.
             if !(h.1.is_some() && h.2.is_empty()) {
                 prev_hi_line = Some(h.span().hi().0);
             }
@@ -1163,15 +887,9 @@ impl<'s> Printer<'s> {
             }
             self.flush_comments_before(decl.span().lo().0);
             self.print_decl(decl);
-            // Redundant (a no-op) for a `Decl::Def`/`Decl::Instance`/etc. whose
-            // own printing already checked this via `print_guarded_expr` or
-            // `print_indented_siblings` - needed for the decl kinds that
-            // don't route through either of those.
+            // No-op for decl kinds already covered via print_guarded_expr/
+            // print_indented_siblings; needed for the rest.
             self.flush_trailing_comment(decl.span().hi().0);
-            // Not `raw("\n")` - a consumed trailing comment already ended
-            // this line itself (`flush_trailing_comment` always calls
-            // `newline()`), and unconditionally adding another would leave a
-            // spurious blank line after every decl that has one.
             self.ensure_fresh_line();
             prev = Some(decl);
             prev_hi_line = Some(decl.span().hi().0);
@@ -1209,18 +927,13 @@ impl<'s> Printer<'s> {
         self.print_imports(imports);
     }
 
-    /// Groups and sorts imports the way purs-tidy does: unqualified "open" imports
-    /// (`import Foo`, or `import Foo hiding (...)` - anything with no explicit name
-    /// list and no alias) form their own group first, separated by a blank line
-    /// from the rest; everything else is sorted alphabetically by module name,
-    /// with an unaliased import of a module sorting before its `as`-aliased form.
-    /// Imports that only differ in their name list (same module, same alias, same
-    /// hiding-ness) are merged into one, matching purs-tidy's import-merging.
+    /// Groups and sorts imports like purs-tidy: unqualified "open" imports
+    /// form their own group first; everything else sorts alphabetically by
+    /// module name (unaliased before `as`-aliased). Imports differing only
+    /// in name list (same module/alias/hiding-ness) get merged.
     ///
-    /// Comments inside the import block aren't reattached per-import after this
-    /// reordering (that mapping stops being meaningful once imports move around) -
-    /// they're flushed as one batch right before the block instead, so nothing is
-    /// lost even though placement within the block may not be preserved exactly.
+    /// Comments inside the import block aren't reattached per-import after
+    /// reordering - flushed as one batch before the block instead.
     fn print_imports(&mut self, imports: &[ImportDecl]) {
         if let Some(last_line) = imports.iter().map(|i| i.span().hi().0).max() {
             self.flush_comments_before(last_line + 1);
@@ -1281,16 +994,10 @@ impl<'s> Printer<'s> {
         items.dedup_by(|a, b| self.import_display_text(a) == self.import_display_text(b));
     }
 
-    /// Sorting key for an import item - a (tier, bare name) pair, not just
-    /// rendered text. purs-tidy's real sort ranks by *kind* first - class
-    /// imports, then type-operator imports (`type (~>)`), then plain type
-    /// imports, then plain value imports, then value-operator imports last -
-    /// and only alphabetically by name *within* each tier. That's why e.g.
-    /// `type (..)` sorts before a plain type name even when its symbol text
-    /// wouldn't win a flat compare, and why a value operator like `(>>=)`
-    /// sorts after `bind`/`discard`/`join` (`(` is low ASCII, which a flat
-    /// sort would put first). A flat sort on rendered or bare text can't
-    /// reproduce this; the tier has to be its own key column.
+    /// Sort key: (kind tier, bare name), not just rendered text. purs-tidy
+    /// ranks class < type-operator < type < value < value-operator, then
+    /// alphabetically within a tier - a flat text sort can't reproduce this
+    /// (e.g. `(>>=)` would sort before `bind` on raw ASCII).
     fn import_sort_key(&self, i: &Import) -> (u8, &str) {
         match i {
             Import::Class(_, n) => (0, self.text(n.span())),
@@ -1472,15 +1179,9 @@ impl<'s> Printer<'s> {
                     return;
                 }
                 let ctor_spans: Vec<Span> = ctors.iter().map(|c| c.span()).collect();
-                // `any_breaks` alone only catches breaking *between* two or
-                // more constructors - a lone constructor has no adjacent pair
-                // to compare, so it never fired even when that constructor's
-                // own args would break (e.g. a record with enough fields),
-                // leaving `= Ctor` glued flat while its args relocated out
-                // from under it. Checking the sole constructor's own args
-                // here closes that gap, matching the "= Ctor" line always
-                // moving down together with its args, the same one true
-                // shape the multi-constructor case already uses.
+                // `any_breaks` alone misses a lone constructor (no adjacent
+                // pair to compare), so also check its own args directly -
+                // otherwise `= Ctor` stays flat while its args relocate away.
                 let multiline = Self::any_breaks(&ctor_spans)
                     || (ctors.len() == 1 && ctors[0].1.iter().any(|a| self.typ_would_break(a)));
                 self.indent_in();
@@ -1526,16 +1227,9 @@ impl<'s> Printer<'s> {
                     self.raw(" ");
                     self.print_typ_var_binding(v);
                 }
-                // Unlike `Decl::Data`, a newtype constructor always wraps
-                // exactly one `Typ` - never a space-separated arg list - so
-                // this is its own direct relocation, not a borrowed call into
-                // `print_ctor_args` (built for that plural case). The two
-                // constructs are genuinely different (a newtype constructor
-                // isn't a data constructor with one field), but land on the
-                // same visual shape when the wrapped type would break: the
-                // whole `= Ctor` line moves down together with it, rather
-                // than leaving `= Ctor` glued flat while only `typ` relocates
-                // out from under it.
+                // A newtype constructor wraps exactly one Typ (never a
+                // space-separated list), so this relocates directly rather
+                // than reusing print_ctor_args, but matches its visual shape.
                 let multiline = self.typ_would_break(typ);
                 self.indent_in();
                 if multiline {
@@ -1546,10 +1240,8 @@ impl<'s> Printer<'s> {
                 self.raw("= ");
                 self.lit(ctor);
                 if multiline {
-                    // Two levels past the `= Ctor` line, matching
-                    // `print_ctor_args`'s own double indent for a relocated
-                    // data-constructor argument - same visual depth for the
-                    // same kind of jump, even though this is separate code.
+                    // Two levels, matching print_ctor_args's own double
+                    // indent for a relocated data-constructor argument.
                     self.indent_in();
                     self.indent_in();
                     self.newline();
@@ -1606,20 +1298,10 @@ impl<'s> Printer<'s> {
                 let mark = self.out.len();
                 self.print_inst_head(head);
                 if !bindings.is_empty() {
-                    // `where` glues flat (` where`) unless the head - the
-                    // constraint context, the class/args spine, or both -
-                    // printed across more than one line, in which case it
-                    // relocates onto its own line at the same indent level
-                    // `=>` sits at (one `indent_in`, matching
-                    // `print_constraint_ctx`'s own), rather than staying
-                    // glued to whatever the head's last printed token
-                    // happens to be (e.g. a spine arg like `to`). Checked by
-                    // looking for a real `'\n'` in what was just printed
-                    // (the same rendered-output check `paren_would_break`/
-                    // `typ_would_break` use), not a span comparison - the
-                    // head's own multiline-ness already accounts for every
-                    // reason it could break, so this doesn't need its own
-                    // parallel decision.
+                    // `where` glues flat unless the head printed multi-line,
+                    // in which case it relocates to its own line at the same
+                    // indent `=>` sits at. Checked via a rendered-output '\n'
+                    // scan (like paren_would_break), not a span comparison.
                     if self.out[mark..].contains('\n') {
                         self.indent_in();
                         self.newline();
@@ -1698,22 +1380,13 @@ impl<'s> Printer<'s> {
     }
 
     /// Prints an `instance`/`class` head's optional constraint context -
-    /// `(A, B) => `/`A => ` for an instance head, `(A, B) <= `/`A <= ` for a
-    /// class - and decides, via `any_breaks` over the constraints' own spans
-    /// plus the bracket spans (when parenthesized) plus `after` (the span of
-    /// whatever comes right after the arrow, e.g. the instance/class name),
-    /// whether the source had this expanded across multiple lines. Mirrors
-    /// `print_typ_constrained_chain`'s decision, generalized from a single
-    /// chained constraint to a comma-separated list - unlike that chain,
-    /// there's no preceding name/`::` to check a "glued mid-line" boundary
-    /// against (`instance`/`class` are fixed keywords, not spans), so on the
-    /// multiline path everything - parens, arrow, and (per the caller, which
-    /// must close the same `indent_in` this opens) whatever follows - is
-    /// unconditionally relocated onto fresh indented lines: one canonical
-    /// shape, always a fixed point on the next parse, the same reasoning as
-    /// `print_sig_typ`'s "both branches produce the same shape" comment.
-    /// Returns whether it took the multiline path, so the caller knows
-    /// whether it must `indent_out` after printing what follows the arrow.
+    /// `(A, B) => `/`A => ` (or `<= ` for a class) - deciding via
+    /// `any_breaks` over the constraints/brackets/`after` (whatever follows
+    /// the arrow) whether to expand across multiple lines. On the multiline
+    /// path everything relocates onto fresh indented lines unconditionally,
+    /// for one canonical shape that's a fixed point on reformat. Returns
+    /// whether it took the multiline path, so the caller knows to
+    /// `indent_out` after printing what follows the arrow.
     fn print_constraint_ctx(
         &mut self,
         constraints: &Option<Constraints>,
@@ -1738,21 +1411,15 @@ impl<'s> Printer<'s> {
             self.indent_in();
             self.newline();
         }
-        // Parens around a lone constraint are syntactically optional, but
-        // whether the source actually wrote them is real information -
-        // `constraints()` (parser.rs) only leaves `open`/`close` as
-        // `Span::zero()` for the genuinely parenless form, never for an
-        // explicit `(A) => `. Printing exactly what's there, rather than
-        // unilaterally normalizing it away, matches how `Expr::Paren`/
-        // `Typ::Paren` are handled everywhere else in this printer -
-        // removing a truly redundant paren is a `style.rs` rule's job
-        // (opt-in), not something the raw printer decides on its own.
+        // Parens around a lone constraint are optional but real source
+        // information (`open`/`close` are Span::zero() only for the
+        // genuinely parenless form) - print exactly what's there; removing
+        // a redundant paren is style.rs's job, not the raw printer's.
         let has_parens = cs.len() > 1 || *open != Span::zero();
         if !has_parens {
             self.print_constraint(&cs[0]);
         } else if multiline {
-            // Leading-comma style, matching `list()`'s convention for every
-            // other bracketed multi-item construct.
+            // Leading-comma style, matching list()'s convention.
             self.raw("( ");
             for (i, c) in cs.iter().enumerate() {
                 if i > 0 {
@@ -1809,17 +1476,11 @@ impl<'s> Printer<'s> {
     fn print_inst_head(&mut self, h: &InstHead) {
         let InstHead(constraints, name, args) = h;
         let multiline = self.print_constraint_ctx(constraints, name.span(), "=>");
-        // Same unconditional hang reasoning as `print_constraint`'s own args:
-        // `name` is glued directly after `=> ` (or nothing at all), a
-        // fixed-width raw token/absent-token the indent baseline has no
-        // memory of - so a multiline arg needs to hang under `name`'s own
-        // real column, not the ambient baseline.
+        // `name` is glued after `=> `, so a multiline arg hangs under its
+        // real column, not the ambient baseline (see print_constraint).
         let name_col = self.current_column();
         self.lit(name);
         self.with_indent_at(name_col, |p| {
-            // See `print_constraint`/`Typ::App` - a `Typ::Paren` arg that
-            // would itself break relocates it and every arg after it, same
-            // as `Expr::App`; `Record`/`Row` args keep hanging in place.
             p.print_spine_args(
                 name.span(),
                 args,
@@ -1856,19 +1517,12 @@ impl<'s> Printer<'s> {
 
     // -- guards --------------------------------------------------------
 
-    /// `before` is the span of whatever immediately precedes `arrow` (the last
-    /// binder, or the name/binder itself if there are none) - used to decide,
-    /// via `breaks_before`, whether the RHS/guards should break onto their own
-    /// indented line(s) or stay glued to `arrow` on the same line, the same
-    /// source-fidelity pattern used throughout the printer (see `Expr::App`,
-    /// `Expr::Lambda`, `Expr::Let`).
-    /// `e`'s value is always the tail of a decl, guarded clause, let-binding,
-    /// or case-branch - never a subexpression with more of the same source
-    /// line still to come after it (contrast a bare `print_arrow_rhs` call,
-    /// which is also how `Expr::Lambda`/`Guard::Binder` print, and can be
-    /// nested arbitrarily deep - see the comment there) - so this is a safe,
-    /// and the appropriate, place to check for a trailing comment after each
-    /// clause's own RHS (or the one RHS, for `Unconditional`).
+    /// `before` is whatever immediately precedes `arrow`, used via
+    /// `breaks_before` to decide if the RHS/guards break onto their own
+    /// line. `e` is always a decl/clause/let-binding/case-branch tail
+    /// (never a nested subexpression with more of the line to come, unlike
+    /// a bare `print_arrow_rhs` call), so checking for a trailing comment
+    /// here is safe.
     fn print_guarded_expr(&mut self, before: Span, ge: &GuardedExpr, arrow: &str) {
         match ge {
             GuardedExpr::Unconditional(e) => {
@@ -1898,11 +1552,9 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// Prints one guarded clause's `guard, guard ... arrow e` - `before` is the
-    /// fallback anchor (see `print_guarded_expr`) used only when the clause has
-    /// no guards; normally the clause's own last guard is what `e` is checked
-    /// against for whether it should break onto its own indented line, the same
-    /// way `Unconditional`'s RHS is.
+    /// Prints one guarded clause's `guard, guard ... arrow e`. `before` is
+    /// only the fallback anchor for a clause with no guards; normally the
+    /// last guard is checked instead (see `print_guarded_expr`).
     fn print_guard_clause(&mut self, before: Span, guards: &[Guard], e: &Expr, arrow: &str) {
         for (i, g) in guards.iter().enumerate() {
             if i > 0 {
@@ -1914,21 +1566,12 @@ impl<'s> Printer<'s> {
         self.print_arrow_rhs(before, arrow, e);
     }
 
-    /// The record-field counterpart of `print_arrow_rhs`: unlike a decl's
-    /// `=` or a lambda's `->`, a record field's value always sits one level
-    /// deeper than the field itself, whether or not it visibly moves onto
-    /// its own line - so a nested multi-branch `case`/`do` value stays
-    /// visually inside the field even when glued right after `label:`.
-    ///
-    /// The two branches need a *different* number of levels. When the value
-    /// stays glued (`b: case x of`), its own head is still visually attached
-    /// to the label, so one level is enough - it only has to keep the
-    /// value's own further breaking from looking like a sibling field, and
-    /// the value's own hang supplies the rest. When the value moves onto its
-    /// own line entirely, that attachment is gone: `label:` and `{`/`, ` are
-    /// exactly `INDENT` wide, so one level alone would place the value flush
-    /// with `label`'s own column instead of visibly past it. Two levels are
-    /// needed there.
+    /// The record-field counterpart of `print_arrow_rhs`: a field's value
+    /// always sits at least one level deeper than the field, even when glued
+    /// right after `label:`, so a nested multi-branch value stays visually
+    /// inside the field. When the value relocates onto its own line, it
+    /// needs two levels instead of one - `label:`/`{`/`, ` are exactly
+    /// `INDENT` wide, so one level alone would land it flush with `label`.
     fn print_record_field_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
         if self.paren_would_break(e)
             || self.keyword_block_would_break(e)
@@ -1951,47 +1594,27 @@ impl<'s> Printer<'s> {
     }
 
     /// Prints `arrow e`, breaking `e` onto its own indented line when the
-    /// source had it starting after a line break from `before` (the last
-    /// token immediately preceding `arrow`) - the shared source-fidelity
-    /// pattern behind a declaration's `=`, a lambda's `->`, a guarded
-    /// clause's `->`/`=`, a do-statement's `<-`, and a let-pattern's `=`.
-    /// Without this, a multiline construct (most commonly `let ... in`) that
-    /// glues flat to `arrow` can end up printed at the same column as the
-    /// statement it's embedded in, which is invalid PureScript layout - the
-    /// parser reads it as that enclosing block ending early.
+    /// source had a break before it - the shared pattern behind a decl's
+    /// `=`, a lambda's `->`, a guarded clause's `->`/`=`, a do-statement's
+    /// `<-`, and a let-pattern's `=`. Without this a multiline construct
+    /// (e.g. `let ... in`) glued flat to `arrow` can land at the same
+    /// column as its enclosing statement, which is invalid layout.
     ///
-    /// Three extra cases force a break even when the source didn't have one -
-    /// `e` is going to print across multiple lines, and gluing `arrow`
-    /// straight onto it would look wrong for one of three different reasons:
-    /// - `e` is a parenthesized expression printing in the `( ` ...
-    ///   `)`-on-its-own-line block style (see `Expr::Paren`, `paren_would_break`).
-    ///   Gluing `arrow` straight to `(` there would put the closing `)` back
-    ///   at `arrow`'s own (or an even shallower) column once printed -
-    ///   visually "moving back" past where this subexpression started, which
-    ///   a reader reasonably reads as the expression having ended early.
-    /// - `e` is a `case`/`do`/`ado`/`let` block that's going to print
-    ///   multi-line (`keyword_block_would_break`). These have no closing
-    ///   delimiter to regress like a paren does, but leaving their keyword
-    ///   glued to `arrow` while their own content (and, for an empty `ado`,
-    ///   nothing at all) hangs underneath reads just as oddly.
-    /// - `e` is an `Expr::Op` chain that would print multi-line
-    ///   (`op_chain_would_break`) - relocates even if only one break is
-    ///   needed (`foo = a\n  >>> b` becomes `foo =\n  a\n    >>> b`).
+    /// Three cases also force a break even without a source one, when
+    /// gluing `arrow` to a multi-line `e` would look wrong:
+    /// - `e` is a `Paren` printing in block style (`paren_would_break`) -
+    ///   gluing would put `)` back at/above `arrow`'s column, reading as
+    ///   the expression having ended early.
+    /// - `e` is a `case`/`do`/`ado`/`let` block that prints multi-line
+    ///   (`keyword_block_would_break`) - no closing delimiter to regress,
+    ///   but a glued keyword with content hanging underneath reads just as odd.
+    /// - `e` is an `Op` chain that would print multi-line
+    ///   (`op_chain_would_break`) - relocates even for a single break.
     ///
-    /// All three are decided by actually rendering `e` at the current indent
-    /// and checking for a line break, the same "don't trust a span here,
-    /// trust what got printed" approach `Expr::Paren` itself uses and for the
-    /// same reason (`e` can be, or contain, a `case`/`do` that always breaks
-    /// regardless of source layout, which would make a source-span check for
-    /// this unstable across formatting passes). This lives here rather than
-    /// as a general "am I at a fresh line" check inside `Expr::Paren`/
-    /// `Expr::Case`/etc. themselves - `Expr::Paren` in particular is also
-    /// reached as one space-separated argument of a flat `Expr::App`, where
-    /// relocating would rewrite that paren's own source position and flip
-    /// `Expr::App`'s own (span-based) multiline decision on the very next
-    /// formatting pass. `Expr::App` and `Array`/`Record` (`list()`) are left
-    /// out of all three checks - they already relocate internally
-    /// (`own_indent`).
+    /// All three render `e` and check for an actual line break rather than
+    /// comparing spans, since `e` can contain a `case`/`do` that always
+    /// breaks regardless of source layout. `Expr::App` and `Array`/`Record`
+    /// are excluded - they already relocate internally.
     fn print_arrow_rhs(&mut self, before: Span, arrow: &str, e: &Expr) {
         if self.paren_would_break(e)
             || self.keyword_block_would_break(e)
@@ -2007,17 +1630,9 @@ impl<'s> Printer<'s> {
             self.raw(arrow);
             self.print_expr(e);
         }
-        // Deliberately no trailing-comment check here (contrast
-        // `print_guarded_expr`, which does one): unlike a decl's `=` or a
-        // guarded clause's `=`/`->`, this function is also how `Expr::Lambda`
-        // prints its `->` and `Guard::Binder` prints its `<-` - and a lambda
-        // can be nested anywhere inside a larger expression (with plenty
-        // more of that same source line still to print after it returns),
-        // and a guard can have more guards after it before the clause's own
-        // arrow. Checking here would be exactly the "grabbed a comment
-        // meant for something printed later on the same line" bug
-        // `flush_trailing_comment` itself warns about - only call it from a
-        // site that actually knows it's printing the last thing on a line.
+        // No trailing-comment check here (contrast print_guarded_expr):
+        // this also prints Expr::Lambda's `->` and Guard::Binder's `<-`,
+        // which can have more of the same line still to print afterward.
     }
 
     fn print_guard(&mut self, g: &Guard) {
@@ -2061,11 +1676,8 @@ impl<'s> Printer<'s> {
         self.print_indented_siblings(bindings, |b| b.span(), |p, b| p.print_let_binding(b));
     }
 
-    /// True if printing `b` at the current indent produces any line break at
-    /// all - the `LetBinding` counterpart of `expr_would_break`, used by
-    /// `print_let_kw_bindings` to decide whether a single binding can stay
-    /// glued to `let` (its RHS might still be a `case`/`do`/`let` that always
-    /// prints multiline regardless of source layout, which rules that out).
+    /// `expr_would_break` for `LetBinding` - used by `print_let_kw_bindings`
+    /// to decide if a single binding can stay glued to `let`.
     fn let_binding_would_break(&mut self, b: &LetBinding) -> bool {
         let comment_idx_before = self.comment_idx;
         let would_break = self.render_indented(0, |p| p.print_let_binding(b)).contains('\n');
@@ -2073,8 +1685,7 @@ impl<'s> Printer<'s> {
         would_break
     }
 
-    /// The `DoStmt` counterpart of `let_binding_would_break`, used the same
-    /// way by `Expr::Ado`'s own single-statement glue check.
+    /// `let_binding_would_break` for `DoStmt`, used by `Expr::Ado`.
     fn do_stmt_would_break(&mut self, s: &DoStmt) -> bool {
         let comment_idx_before = self.comment_idx;
         let would_break = self.render_indented(0, |p| p.print_do_stmt(s)).contains('\n');
@@ -2082,18 +1693,11 @@ impl<'s> Printer<'s> {
         would_break
     }
 
-    /// Prints a `let`-block's bindings right after the `let` keyword itself -
-    /// used by `Expr::Let` and `DoStmt::Let`, where (unlike `where`, which
-    /// always uses `print_let_bindings`' one-per-line indented block) the
-    /// source commonly writes a single simple binding glued flat on the same
-    /// line (`let a = 1`). Stays glued when there's exactly one binding, the
-    /// source had it starting on `let`'s own line, and printing it doesn't
-    /// itself force a line break (e.g. a nested `case`/`do`/`let` RHS always
-    /// does, regardless of source layout); otherwise falls back to
-    /// `print_let_bindings`'s indented block, same as `where`. Returns
-    /// whether it glued - `Expr::Let` needs that to decide whether `in`
-    /// itself can stay glued to the same line too (`let x = 1 in x`) or
-    /// needs its own fresh line below the bindings block.
+    /// Prints a `let`-block's bindings right after `let` - unlike `where`
+    /// (always an indented block), a single simple binding can stay glued
+    /// flat (`let a = 1`) when the source had it on `let`'s line and it
+    /// wouldn't itself force a break. Returns whether it glued, so
+    /// `Expr::Let` knows whether `in` can share that line too.
     fn print_let_kw_bindings(&mut self, let_span: Span, bindings: &[LetBinding]) -> bool {
         if let [only] = bindings
             && !Self::breaks_before(let_span, only.span())
@@ -2107,10 +1711,9 @@ impl<'s> Printer<'s> {
         false
     }
 
-    /// The body of `print_indented_siblings`, without the indent_in()/
-    /// indent_out() pair around it - for a caller (`Expr::Ado`) that needs to
-    /// keep the same indent level active across the sibling list *and*
-    /// something printed immediately after it.
+    /// `print_indented_siblings`'s body without the indent_in/indent_out
+    /// pair, for a caller (`Expr::Ado`) that keeps the same indent level
+    /// active across the list and something printed right after it.
     fn print_siblings_body<T>(
         &mut self,
         items: &[T],
@@ -2127,21 +1730,14 @@ impl<'s> Printer<'s> {
             }
             self.flush_comments_before(span_of(item).lo().0);
             print_item(self, item);
-            // Each item here is always the last thing on its own line (the
-            // next one starts its own fresh `newline()`), so it's safe to
-            // check for a trailing comment right after it.
             self.flush_trailing_comment(span_of(item).hi().0);
             prev_hi_line = Some(span_of(item).hi().0);
         }
     }
 
-    /// Prints `items` one per line, one indent level deeper than the current
-    /// one, preserving each item's own leading blank line from the source (0
-    /// or 1, never more - the same idea as `print_module`'s decl loop, just
-    /// at an indented sibling-list site instead of the top level) and
-    /// flushing any comment attached before it. Shared by `let`-bindings,
-    /// `do`-statements, and `case` branches - anywhere a block prints a
-    /// vertical list of sibling items at one indent level.
+    /// Prints `items` one per line, one indent level deeper, preserving each
+    /// item's own leading blank line (0 or 1) and flushing comments before
+    /// it. Shared by `let`-bindings, `do`-statements, and `case` branches.
     fn print_indented_siblings<T>(
         &mut self,
         items: &[T],
@@ -2246,9 +1842,8 @@ impl<'s> Printer<'s> {
             Typ::Symbol(s) => self.lit(s),
             Typ::Str(s) => self.lit(s),
             Typ::Int(neg, i) => {
-                // Typ::Int stores a parsed i64 rather than interned source text (unlike most
-                // literals), and the parser's span for the negative case covers only the `-`
-                // token, not the digits - so print the value directly instead of slicing source.
+                // Stores a parsed i64, not source text, and the negative
+                // case's span covers only `-`, not the digits.
                 if *neg {
                     self.raw("-");
                 }
@@ -2262,16 +1857,10 @@ impl<'s> Printer<'s> {
             Typ::App(..) => {
                 let (head, args) = Self::typ_app_spine(t);
                 self.print_typ(head);
-                // `Typ::Record`/`Typ::Row` arguments still use the "floor"
-                // model unconditionally - they hang glued in place under
-                // their own bracket rather than relocating. A `Typ::Paren`
-                // arg is different: with no real source break before it but
-                // internal breaks of its own, hanging it in place left every
-                // sibling argument after it glued onto its closing line
-                // instead of moving down with it. So a `Typ::Paren` arg gets
-                // the same `would_break` treatment as `Expr::App`'s own
-                // spine; `Record`/`Row` don't need it since they already
-                // hang correctly on their own.
+                // Record/Row args hang glued under their own bracket (the
+                // "floor" model); a Paren arg with internal breaks but no
+                // source break before it needs the would_break treatment
+                // instead, or later siblings stay glued to its closing line.
                 self.print_spine_args(
                     head.span(),
                     &args,
@@ -2288,18 +1877,10 @@ impl<'s> Printer<'s> {
                     || Self::any_breaks(&spans)
                     || rest.iter().any(|(_, r)| self.typ_paren_would_break(r));
                 self.print_typ(first);
-                // `in_broken_sig` means this chain is itself the flattened
-                // continuation of a signature/alias's own `::`/`=` break (see
-                // `print_typ_arrow_chain`/`print_typ_constrained_chain`), which
-                // already established the right column - adding a level here
-                // would push every operator deeper than the sibling `->`/`=>`
-                // lines it lines up with. Anywhere else (e.g. glued right after
-                // a `Typ::Paren`'s `( `, which resets `in_broken_sig` - see
-                // `print_paren_block`), there's no such column already
-                // accounted for, so the chain needs its own hang, the same way
-                // a value's operator chain (`Expr::Op`) always does - otherwise
-                // its continuation lands flush with the first operand instead
-                // of one level past the bracket it's glued to.
+                // `in_broken_sig` means the enclosing signature/alias already
+                // established the right column, so no extra hang is needed;
+                // elsewhere (e.g. glued after a Typ::Paren's `( `) it does,
+                // like Expr::Op's chain, or the continuation lands flush.
                 let own_hang = multiline && !self.in_broken_sig;
                 if own_hang {
                     self.indent_in();
@@ -2364,9 +1945,8 @@ impl<'s> Printer<'s> {
     }
 
     fn print_typ_var_binding(&mut self, v: &TypVarBinding) {
-        // The third field is the `@` visible-type-application marker, not "wrap in
-        // parens" - parens are only syntactically required when there's a kind
-        // annotation (`forall (a :: Type).`), so that's what drives them here.
+        // The `@` marks visible-type-application; parens are driven by the
+        // kind annotation instead, only syntactically required there.
         let TypVarBinding(name, kind, is_at) = v;
         let needs_parens = kind.is_some();
         if needs_parens {
@@ -2387,21 +1967,12 @@ impl<'s> Printer<'s> {
 
     fn print_constraint(&mut self, c: &Constraint) {
         let Constraint(name, args) = c;
-        // Unconditional hang, same reasoning as `print_record_field_rhs`: a
-        // constraint's args are glued directly after its name, which is in
-        // turn glued after a fixed-width raw token (`. `, `=> `) whose own
-        // width the indent baseline has no memory of - so if the args
-        // break, they need to hang under `name`'s own real column (captured
-        // here, before printing it, then handed to `print_spine_args` via
-        // `with_indent_at` so *its* own break-handling adds one level on top
-        // of that, not of the stale ambient), or the resulting block looks
-        // shallower than the constraint's own name, not just less indented.
+        // Args are glued after `name`, itself glued after a fixed-width
+        // token (`. `, `=> `) - hang under name's own column so a breaking
+        // arg doesn't land shallower than the constraint name itself.
         let name_col = self.current_column();
         self.lit(name);
         self.with_indent_at(name_col, |p| {
-            // See the matching note on `Typ::App` - a `Typ::Paren` arg that
-            // would itself break relocates it and every arg after it, same
-            // as `Expr::App`; `Record`/`Row` args keep hanging in place.
             p.print_spine_args(
                 name.span(),
                 args,
@@ -2412,16 +1983,10 @@ impl<'s> Printer<'s> {
         });
     }
 
-    /// Prints `t`, hung under its own real column first when `t` is a
-    /// nesting shape (`App`/`Record`/`Row`) - mirrors `print_sig_typ`'s own
-    /// `needs_hang` check, for the same reason: whatever glues directly in
-    /// front of `t` here (an arrow chain's `-> `, a constrained chain's
-    /// closing `=> `) is a fixed-width raw token the indent baseline has no
-    /// memory of, so if `t` itself breaks, it needs to hang under `t`'s own
-    /// column (`hang_glued`) or it lands shallower than that very token.
-    /// Never applied to `Arr`/`Op`/`Constrained`/`Forall` - those decide
-    /// their own indent independently, and hanging here would wrongly push
-    /// every nested `->`/`=>`/operator continuation a level deeper.
+    /// Prints `t`, hung under its own real column when `t` is a nesting
+    /// shape (`App`/`Record`/`Row`) glued after a fixed-width token (`-> `,
+    /// `=> `) - mirrors `print_sig_typ`'s `needs_hang` check. Not applied to
+    /// `Arr`/`Op`/`Constrained`/`Forall`, which decide their own indent.
     fn print_typ_glued(&mut self, t: &Typ) {
         let needs_hang = matches!(t, Typ::App(..) | Typ::Record(..) | Typ::Row(..));
         if needs_hang {
@@ -2431,15 +1996,11 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// `a -> b -> c -> ...` is parsed as a right-nested chain of `Typ::Arr`. Flatten
-    /// it so the whole chain makes one multiline decision instead of one independent
-    /// decision per `Arr` node. Unlike a value's operator chains (see `op_spine`), a
-    /// broken type-operator chain never gets its own extra indent level - each `->`
-    /// prints at whatever indent was already active (a bare `newline()`, no
-    /// `indent_in`), the same way `Typ::Op` does; only a non-operator break (a
-    /// `Typ::App` argument moving to its own line, a `Typ::Paren` block) increases
-    /// indent - via `print_typ_glued`, since each segment is glued directly after
-    /// `-> ` (or, for the first segment, `:: `/`= `).
+    /// `a -> b -> c -> ...` parses as a right-nested `Typ::Arr` chain -
+    /// flattened for one shared multiline decision. Unlike a value's
+    /// operator chains, a broken type chain never gets its own indent level
+    /// per `->`; only a non-operator break (an App arg, a Paren block)
+    /// increases indent, via `print_typ_glued`.
     fn print_typ_arrow_chain(&mut self, a: &Typ, b: &Typ) {
         let mut segments = vec![a];
         let mut rest = b;
@@ -2465,10 +2026,8 @@ impl<'s> Printer<'s> {
         }
     }
 
-    /// `C1 => C2 => ... => Body` (including the desugared form of a parenthesized,
-    /// comma-separated constraint list) is a right-nested chain of `Typ::Constrained`.
-    /// Flattened the same way as `print_typ_arrow_chain`, for the same reason - no
-    /// extra indent for the `=>` breaks either.
+    /// `C1 => C2 => ... => Body` is a right-nested `Typ::Constrained` chain,
+    /// flattened like `print_typ_arrow_chain` - no extra indent per `=>`.
     fn print_typ_constrained_chain(&mut self, c0: &Constraint, body0: &Typ) {
         let mut constraints = vec![c0];
         let mut rest = body0;
@@ -2503,15 +2062,10 @@ impl<'s> Printer<'s> {
     }
 
     /// Prints a record/row type's `open field, field | tail close` (or the
-    /// leading-comma multiline block style, when the source had one), mirroring
-    /// `list()`'s architecture - a real multiline decision via `any_breaks`, own
-    /// bracket placement (so it can relocate to a fresh line the same way
-    /// `list()` does), and per-field `flush_comments_before`/
-    /// `flush_trailing_comment` - rather than `list()` itself, since a row's
-    /// optional `| tail` doesn't fit `list()`'s "comma-separated items only"
-    /// shape. `close_line` is the closing bracket's own line (from the row's
-    /// overall `S<Row>` span's `hi()` - reliable now that the `Typ::Row` parser
-    /// arm captures it *before* consuming `)`, not after).
+    /// leading-comma multiline block style), mirroring `list()`'s
+    /// architecture but not reusing it - a row's optional `| tail` doesn't
+    /// fit `list()`'s comma-only shape. `close_line` is the closing
+    /// bracket's own line.
     fn print_row(&mut self, open: &str, close: &str, close_line: usize, pad: bool, row: &Row) {
         let Row(fields, tail) = row;
         if fields.is_empty() && tail.is_none() {
@@ -2520,9 +2074,8 @@ impl<'s> Printer<'s> {
             self.raw(close);
             return;
         }
-        // A record's braces are their own bracketed context, unrelated to whatever
-        // signature this row happens to be nested inside - a field's own type (e.g.
-        // a forall) shouldn't inherit an enclosing broken-signature's flattening.
+        // A record's braces are their own bracketed context - a field's type
+        // shouldn't inherit an enclosing broken-signature's flattening.
         let outer_in_broken_sig = self.in_broken_sig;
         self.in_broken_sig = false;
 
@@ -2530,14 +2083,11 @@ impl<'s> Printer<'s> {
         if let Some(t) = tail {
             spans.push(t.span());
         }
-        // `any_breaks` can't see a break right before `close` when there's
-        // only one field (no adjacent pair to compare) - that still has to
-        // force block style, same reasoning as `Expr::Paren`'s `force_block`.
-        // (Not checked symmetrically on the `open` side: a leading comment
-        // between `open` and the first field isn't flushed until the loop
-        // below, which shifts the first field's *printed* line across
-        // passes without any real source-layout change - comparing against
-        // `open`'s line would flip this decision and break idempotence.)
+        // `any_breaks` can't see a break before `close` with only one field
+        // (no adjacent pair to compare) - force block style same as
+        // `Expr::Paren`'s `force_block`. Not checked on the `open` side: that
+        // would flip across passes as the first field's printed line shifts,
+        // breaking idempotence.
         let force_block = spans.last().is_some_and(|l| l.hi().0 != close_line);
         let multiline = force_block || Self::any_breaks(&spans);
 
@@ -2568,11 +2118,7 @@ impl<'s> Printer<'s> {
             }
             self.raw(close);
         } else {
-            // See `list()`'s own version of this for why: hang every line
-            // after `open` from the column it's about to print at, rather
-            // than relocating `open` itself to a deeper line when something
-            // (an arrow's `-> `, a class name, ...) is already glued onto
-            // this line ahead of it.
+            // Hang every line from the column `open` prints at, like `list()`.
             let saved_indent = self.indent;
             self.indent = self.current_column();
             self.raw(open);
@@ -2611,19 +2157,10 @@ impl<'s> Printer<'s> {
     // -- expressions -------------------------------------------------------
 
     fn print_expr(&mut self, e: &Expr) {
-        // Every other place a comment can precede something in the source
-        // flushes it explicitly before printing that thing (list items, case
-        // branches, do-statements, let bindings, ...) - but there's no single
-        // sibling-loop for "the expression that follows some keyword"
-        // (`in` before a `let`'s body, `=`/`->` before a guarded clause's
-        // RHS, ...), so each of those call sites would need its own flush
-        // call, and it's easy to miss one (a `let`'s body was missing exactly
-        // this - a comment right before it silently rode along to whatever
-        // flush point came next, appearing somewhere unrelated). Flushing
-        // here instead, unconditionally, covers every call site at once:
-        // redundant (a no-op) wherever a comment before `e` was already
-        // flushed by an outer loop, and otherwise catches what those loops
-        // don't cover.
+        // Unconditional flush here covers call sites with no sibling-loop of
+        // their own (a let's body, a guarded clause's RHS, ...) - redundant
+        // where an outer loop already flushed, but a `let` body once missed
+        // its comment entirely without this.
         self.flush_comments_before(e.span().lo().0);
         match e {
             Expr::Ident(n) => self.lit(n),
@@ -2646,34 +2183,23 @@ impl<'s> Printer<'s> {
                 self.print_expr(inner);
             }
             Expr::Typed(inner, t) => {
-                // Same `name :: Typ` convention as every other signature site
-                // (`print_sig_typ`'s 9 other call sites) - `::` relocates
-                // onto its own line when there's a source break or `t` would
-                // break, instead of always gluing `t` flat after `inner`.
+                // Same `name :: Typ` convention as every other signature site.
                 self.print_expr(inner);
                 self.print_sig_typ(inner.span(), t);
             }
             Expr::App(..) => {
                 let (head, args) = Self::app_spine(e);
-                // Relocate the whole call - head included - onto its own
-                // indented line whenever it's glued right after something
-                // and is itself going to print across multiple lines, the
-                // same concern `list()`'s own `own_indent` decides for a
-                // glued `Array`/`Record`. Without this, only the argument
-                // that actually breaks moves (via `print_app_args` below) -
-                // the head, and any args before it, stay flush on the call's
-                // original line.
+                // Relocate the whole call onto its own indented line when
+                // glued after something and going to break multiline - same
+                // concern as `list()`'s `own_indent` for a glued
+                // `Array`/`Record`. Otherwise only the breaking argument
+                // moves, via `print_app_args`.
                 //
-                // Decided by trying to print flat directly in the real
-                // output first (head glued, `own_indent` never applied), and
-                // rolling the whole attempt back to redo with the head
-                // relocated only if it doesn't fit - same "try first, only
-                // roll back on failure" trick as `list()`, and for the same
-                // reason: probing every argument into a scratch buffer up
-                // front is `O(2^depth)` once an argument can itself be a
-                // call needing the same decision. Whether an individual
-                // argument itself needs to break is decided the same way,
-                // one level down, inside `print_app_args`.
+                // Decided by trying flat directly in the real output first,
+                // rolling back to relocate the head only if it doesn't fit -
+                // same "try first, roll back on failure" trick as `list()`,
+                // for the same reason (scratch-buffer probing is
+                // `O(2^depth)`).
                 let could_relocate =
                     !self.at_fresh_line() && self.glued_floor != Some(self.out.len());
                 let mut boundary_spans = vec![head.span()];
@@ -2701,14 +2227,9 @@ impl<'s> Printer<'s> {
             }
             Expr::Vta(f, t) => {
                 self.print_expr(f);
-                // Same shape as `print_sig_typ`/`print_typ_alias_rhs`: `@` is a
-                // fixed-width raw token glued directly onto `f`'s own line, so if
-                // `t` is going to break (a `Row`/`Record` visible type application
-                // is the common case), hanging it under `@`'s own column instead
-                // of relocating to a fresh indented line would inherit however
-                // deep `f` already sits - e.g. as an `App` argument several
-                // levels in - and blow the whole type out to the right instead of
-                // a stable, shallow indent.
+                // Relocate `t` to a fresh indented line rather than hanging
+                // under `@`'s column - `f` may sit deep (e.g. as an App
+                // argument), and hanging would inherit that depth.
                 if Self::breaks_before(f.span(), t.span()) || self.typ_would_break(t) {
                     self.indent_in();
                     self.newline();
@@ -2723,51 +2244,20 @@ impl<'s> Printer<'s> {
             Expr::Op(..) => {
                 let (first, rest) = Self::op_spine(e);
                 self.print_expr(first);
-                // Same "glue until the first operand that actually needs to
-                // break, then break from there onward" rule
-                // `print_spine_args` already applies to `Expr::App`'s own
-                // arguments - operators before the first forced break stay
-                // glued flat on `first`'s own line; once one operand either
-                // has a real source break before it or would print across
-                // multiple lines on its own, that operand's operator (and
-                // every operator after it) moves onto its own line at one
-                // shared indent level, entered once on the first break, not
-                // per operator - so a same-precedence run of operators lines
-                // up flush instead of staircasing.
-                //
-                // "Would print across multiple lines on its own" is decided
-                // by *trying* each operand glued flat directly in the real
-                // output (mark the position, print it, check afterward for a
-                // `'\n'`), not by rendering every operand into a throwaway
-                // scratch buffer up front - the same "try first, roll back
-                // only on failure" trick `list()` uses, for the same reason:
-                // probing every operand separately and then re-printing all
-                // of them for real the moment even one doesn't fit is
-                // `O(2^depth)` in AST nesting depth instead of `O(depth)`.
-                // Rolling back only the one operand whose attempt failed
-                // means an operand that already committed flat is never
-                // re-rendered.
+                // Same "glue until the first forced break, then break from
+                // there on at one shared indent" rule as `print_spine_args`.
+                // Whether an operand would break on its own is decided by
+                // trying it glued flat in the real output and rolling back on
+                // failure (same reason as `list()`: a scratch-buffer probe is
+                // `O(2^depth)`).
                 let mut prev_span = first.span();
                 let mut broke = false;
                 for (op, r) in &rest {
                     let cur_span = r.span();
-                    // A comment can trail `prev_span`'s own line (`x # f --
-                    // like this\n  <#> g`) - previously left pending for
-                    // whatever printed next to pick up, and the next thing is
-                    // always `print_expr(r)`, whose own unconditional
-                    // `flush_comments_before` at entry has no way to tell
-                    // "this comment trails the *previous* operand" from
-                    // "this comment leads *this* operand", so it silently
-                    // misattached as a leading comment on `r` instead,
-                    // prying it away from the operator it trails. Only safe
-                    // to claim it here, once `breaks_before` has confirmed
-                    // `prev_span` really is the last thing on its own source
-                    // line - checking any earlier (e.g. right after `first`,
-                    // before even trying to glue `op r` after it) can't tell
-                    // "trails `prev_span`" apart from "trails whatever *else*
-                    // still shares this same physical line", the same
-                    // ambiguity `trailing_comment_does_not_attach_to_an_earlier_token_on_the_same_line`
-                    // already covers for a flat multi-token expression.
+                    // A comment trailing `prev_span`'s line must be claimed
+                    // here, once `breaks_before` confirms `prev_span` really
+                    // is last on its line - otherwise `print_expr(r)`'s own
+                    // unconditional flush misattaches it as leading `r`.
                     let mut just_flushed_comment = false;
                     if !broke && Self::breaks_before(prev_span, cur_span) {
                         self.indent_in();
@@ -2780,27 +2270,13 @@ impl<'s> Printer<'s> {
                         self.raw(" ");
                         self.lit(*op);
                         self.raw(" ");
-                        // Glued directly after `op ` - suppress a nested
-                        // `own_indent`-style relocation (most commonly
-                        // `Expr::App`'s, when the operand is a call whose
-                        // own argument breaks) the same way the broken path
-                        // below does, so a self-relocating operand doesn't
-                        // spuriously fail this flat attempt.
+                        // Suppress a nested `own_indent`-style relocation so a
+                        // self-relocating operand doesn't spuriously fail
+                        // this flat attempt.
                         let prev_glued_floor = self.glued_floor;
                         self.glued_floor = Some(self.out.len());
-                        // Hung under the operand's own real column (`op `'s
-                        // width included), not a plain `indent_in()` off the
-                        // chain's stale ambient level - `op ` is a
-                        // fixed-width glued prefix the ambient baseline has
-                        // no memory of, the same reasoning as
-                        // `print_sig_typ`/`print_constraint`'s own
-                        // `hang_glued` calls (see its doc comment). A plain
-                        // ambient bump can land short of the operator's own
-                        // column whenever `op `'s width isn't an exact
-                        // multiple of `INDENT`, letting the operand's own
-                        // break (an `App` call, a `case`) print "behind" the
-                        // operator instead of past it - invisible when the
-                        // operand prints flat.
+                        // Hang under the operand's own column, not the
+                        // chain's stale ambient indent (see `hang_glued`).
                         self.hang_glued(|p| p.print_expr(r));
                         self.glued_floor = prev_glued_floor;
                         if !self.out[mark..].contains('\n') {
@@ -2813,21 +2289,12 @@ impl<'s> Printer<'s> {
                         broke = true;
                         just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
                     }
-                    // A comment on its own line right before the operator
-                    // (`x\n  -- comment\n  <#> y`) is a leading comment for
-                    // this `op r` unit, not for `r` alone - claim it here,
-                    // before `op` prints, so it lands above the operator
-                    // instead of `print_expr(r)`'s own unconditional
-                    // `flush_comments_before` claiming it as a leading
-                    // comment on `r`, which would force `r` onto its own
-                    // line under the comment even though nothing about `r`
-                    // itself needed to break. A no-op when the comment was
-                    // already claimed above as trailing `prev_span`'s line.
+                    // A comment on its own line before the operator belongs
+                    // to `op r`, not `r` alone - claim it here so it lands
+                    // above the operator. No-op if already claimed above.
                     self.flush_comments_before(cur_span.lo().0);
-                    // `flush_trailing_comment`/`flush_comments_before` above
-                    // already ended the line itself (and, since `indent_in()`
-                    // ran above, at the new broken indent) - an explicit
-                    // `newline()` here too would leave a blank line behind it.
+                    // The flushes above already ended the line at the new
+                    // broken indent; an extra newline() would leave a gap.
                     if !just_flushed_comment {
                         self.newline();
                     }
@@ -2838,13 +2305,9 @@ impl<'s> Printer<'s> {
                     self.hang_glued(|p| p.print_expr(r));
                     self.glued_floor = prev_glued_floor;
                     prev_span = cur_span;
-                    // Only reachable once `prev_span` (now `r`) is confirmed
-                    // the last thing on its own line - either the chain just
-                    // broke onto its own line above, or it was already
-                    // broken from an earlier iteration - so a comment
-                    // pending on `cur_span`'s own line unambiguously trails
-                    // it, not some later operand still to come on the same
-                    // physical line the way `first`/a still-flat `r` could.
+                    // `r` is confirmed last on its own line here (chain
+                    // already broke), so a pending comment unambiguously
+                    // trails it.
                     self.flush_trailing_comment(cur_span.hi().0);
                 }
                 if broke {
@@ -2933,15 +2396,9 @@ impl<'s> Printer<'s> {
             }
             Expr::Update(target, open, updates, close) => {
                 self.print_expr(target);
-                // Record update binds tighter than application - `target {
-                // ... }` is one atom, so `App`'s own spine-arg breaking
-                // (`print_app_args`) only ever sees this whole node's span,
-                // never the gap between `target` and `{` inside it. A
-                // source break there (`f x\n  { y = z }`) was silently
-                // dropped, re-gluing onto `f x { y = z }` on every reformat
-                // - this is the one place that gap can be represented at
-                // all, so it has to be checked here, not left to the
-                // caller.
+                // `target { ... }` is one atom to `App`'s spine-arg breaking,
+                // which never sees the gap between `target` and `{` - so a
+                // source break there has to be checked here, not the caller.
                 let broke = Self::breaks_before(target.span(), *open);
                 if broke {
                     self.indent_in();
@@ -2976,18 +2433,10 @@ impl<'s> Printer<'s> {
                     self.print_qual(q);
                 }
                 self.raw("ado");
-                // A 0-or-1-statement `ado` glued flat on one source line in
-                // the original (`ado in x`, `ado x <- pure 1 in x`) stays
-                // flat here too, the same "single simple binding stays glued"
-                // convention `print_let_kw_bindings` applies to `let`.
-                // Stricter than that convention though (no tolerance for a
-                // one-line gap): unlike `let ... in`, an `ado` with no
-                // statements has nothing else to visually anchor `in` to, so
-                // any real source break here instead falls through to the
-                // block form below, which `keyword_block_would_break` (see
-                // its own doc comment) then relocates as a whole via
-                // `print_arrow_rhs`/`print_record_field_rhs` - same as it
-                // does for any non-flat `case`/`do`/`let`.
+                // A 0-or-1-statement `ado` glued flat in the source stays
+                // flat here too, like `print_let_kw_bindings` does for
+                // `let` - but stricter, with no tolerance for any gap, since
+                // an empty `ado` has nothing else to anchor `in` to.
                 let flat = match stmts.as_slice() {
                     [] => !Self::breaks_before(*kw, result.span()),
                     [only] => {
@@ -3017,26 +2466,17 @@ impl<'s> Printer<'s> {
             Expr::Let(kw, bindings, body) => {
                 self.raw("let");
                 let glued = self.print_let_kw_bindings(*kw, bindings);
-                // A glued single binding (`let x = 1`) stays on one line
-                // with `in` too - only a bindings block that actually broke
-                // onto its own indented lines needs `in` pushed onto a fresh
-                // line below it.
+                // Only a bindings block that broke onto its own lines needs
+                // `in` pushed onto a fresh line below it.
                 if glued {
                     self.raw(" ");
                 } else {
                     self.newline();
                 }
                 self.raw("in");
-                // A bindings block that broke onto its own indented lines
-                // always puts the body on its own fresh line below `in` too
-                // (at `in`'s own level, not indented further under it) - only
-                // a glued single binding can still share `in`'s line. There's
-                // no separate span for the `in` keyword itself (the parser
-                // doesn't capture one), but when bindings did glue, it always
-                // sits on the line right after the single binding's own last
-                // line - so a gap of exactly one line means body shares
-                // `in`'s line (`in x`); a gap of two or more means `in` had a
-                // line of its own and body breaks onto another.
+                // The parser captures no span for `in` itself: a gap of
+                // exactly one line after a glued binding means body shares
+                // `in`'s line; two or more means it breaks onto another.
                 let multiline = !glued
                     || self.paren_would_break(body)
                     || self.keyword_block_would_break(body)
@@ -3058,15 +2498,10 @@ impl<'s> Printer<'s> {
             }
             Expr::Case(kw, scrutinees, branches) => {
                 self.raw("case");
-                // Same "glued prefix in front of something that would break"
-                // relocation every other fixed-width keyword/operator prefix
-                // in this printer gets (see `print_arrow_rhs`, `print_sig_typ`) -
-                // a source break before the first scrutinee, between two
-                // scrutinees, or a scrutinee that's itself going to print
-                // multi-line (an `Op` chain, say) all move the *whole*
-                // scrutinee list onto its own indented line rather than
-                // leaving `of` looking glued to wherever the last scrutinee's
-                // own printing happened to end up.
+                // Same glued-prefix relocation as `print_arrow_rhs`/
+                // `print_sig_typ`: any break among the scrutinees moves the
+                // whole list onto its own indented line rather than leaving
+                // `of` glued wherever the last one ends up.
                 let mut spans = vec![*kw];
                 spans.extend(scrutinees.iter().map(|s| s.span()));
                 let multiline =
@@ -3102,9 +2537,8 @@ impl<'s> Printer<'s> {
 
     fn print_do_stmt(&mut self, s: &DoStmt) {
         match s {
-            // No explicit trailing-comment check needed on either arm here -
-            // `print_siblings_body` (the only caller, for both `do` and
-            // `ado`) already checks after each statement using its own span.
+            // No trailing-comment check needed here - `print_siblings_body`
+            // (the only caller) already does it per statement.
             DoStmt::Stmt(None, e) => self.print_expr(e),
             DoStmt::Stmt(Some(b), e) => {
                 self.print_binder(b);
@@ -3189,45 +2623,81 @@ mod tests {
 
     #[test]
     fn paren_operand_of_an_op_chain_closes_under_its_own_open_paren() {
-        // A `Paren` operand glued directly after an operator (`<#> ( ... )`)
-        // that itself prints multi-line must close under its own `(`, not
-        // one level short of it - `(` sits past the operator's own width,
-        // which the ambient indent baseline has no memory of. See
-        // `print_paren_block`.
-        let src = "module M where\n\nx =\n  y\n    <#> ( \\cred ->\n            [ Foo.Bar cur cred ]\n        )\n";
+        // Regression: a Paren operand glued after an operator must close
+        // under its own `(`, not the chain's ambient indent.
+        let src = indoc! {"
+            module M where
+
+            x =
+              y
+                <#> ( \\cred ->
+                        [ Foo.Bar cur cred ]
+                    )
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module M where\n\nx =\n  y\n    <#> ( \\cred ->\n            [ Foo.Bar cur cred ]\n        )\n"
+            indoc! {"
+                module M where
+
+                x =
+                  y
+                    <#> ( \\cred ->
+                            [ Foo.Bar cur cred ]
+                        )
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn array_operand_of_an_op_chain_closes_under_its_own_open_bracket() {
-        // Same bug as the `Paren` case above, in `list()`'s glued (not
-        // `own_indent`) branch: a bracketed operand glued after an operator
-        // had its continuation `,`/closing `]` hang off the ambient indent
-        // instead of `[`'s own real column.
-        let src = "module M where\n\nx =\n  y\n    <#> [ credA\n        , credB\n        , credC\n        ]\n";
+        // Same bug as the Paren case above, for list()'s glued branch.
+        let src = indoc! {"
+            module M where
+
+            x =
+              y
+                <#> [ credA
+                    , credB
+                    , credC
+                    ]
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module M where\n\nx =\n  y\n    <#> [ credA\n        , credB\n        , credC\n        ]\n"
+            indoc! {"
+                module M where
+
+                x =
+                  y
+                    <#> [ credA
+                        , credB
+                        , credC
+                        ]
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn nested_paren_inside_a_glued_paren_anchors_to_the_right_column() {
-        // Root cause behind the two tests above: `current_column()` read a
-        // freshly swapped-in scratch buffer (used to decide a `Paren`'s own
-        // flat-vs-block layout) as column 0 regardless of `self.indent`,
-        // since nothing had been physically written into it yet. A `Paren`
-        // immediately inside another glued `Paren` then anchored its own
-        // `open_col` at 0 instead of its real column, corrupting every line
-        // under it into invalid layout.
-        let src = "module M where\n\nx =\n  y\n    # f\n        ( ( case _ of\n              A -> 1\n              B -> 2\n          )\n            >>> g\n        )\n";
+        // Regression: `current_column()` read a freshly swapped-in scratch
+        // buffer as column 0 regardless of `self.indent`, so a nested glued
+        // `Paren` anchored its `open_col` at 0 instead of its real column.
+        let src = indoc! {"
+            module M where
+
+            x =
+              y
+                # f
+                    ( ( case _ of
+                          A -> 1
+                          B -> 2
+                      )
+                        >>> g
+                    )
+        "};
         let out = fmt(src);
         assert_idempotent(&out);
         let (toks, comments) = lexer::lex(&out, Fi(0));
@@ -3240,238 +2710,499 @@ mod tests {
 
     #[test]
     fn vta_row_type_breaks_to_a_fresh_line_instead_of_hanging_off_a_deep_column() {
-        let src = "module M where\n\nx =\n    ( foo\n        @( aaa :: _\n        , bbb :: _\n        , ccc :: _\n        )\n    )\n";
+        let src = indoc! {"
+            module M where
+
+            x =
+                ( foo
+                    @( aaa :: _
+                    , bbb :: _
+                    , ccc :: _
+                    )
+                )
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module M where\n\nx =\n  ( foo\n      @( aaa :: _\n       , bbb :: _\n       , ccc :: _\n       )\n  )\n"
+            indoc! {"
+                module M where
+
+                x =
+                  ( foo
+                      @( aaa :: _
+                       , bbb :: _
+                       , ccc :: _
+                       )
+                  )
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn simple_module() {
-        let src = "module Foo (foo) where\n\nfoo = 1\n";
+        let src = indoc! {"
+            module Foo (foo) where
+
+            foo = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo (foo) where\n\nfoo = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo (foo) where
+
+                foo = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn export_list_always_gets_a_blank_line_before_what_follows() {
-        // No blank in the source at all before the import - one is still forced
-        // in. The import-to-decl boundary is untouched by this fix and keeps
-        // preserving 0-or-1 from the source (see `imports_and_multiple_decls`) -
-        // no blank here since the source didn't have one.
-        let src = "module Foo (foo) where\nimport Prelude\nfoo = 1\n";
+        // Forced even with no blank in the source; the import-to-decl
+        // boundary below is untouched and keeps preserving 0-or-1.
+        let src = indoc! {"
+            module Foo (foo) where
+            import Prelude
+            foo = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo (foo) where\n\nimport Prelude\nfoo = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo (foo) where
+
+                import Prelude
+                foo = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn export_list_forces_a_blank_line_before_a_decl_when_there_are_no_imports() {
-        let src = "module Foo (foo) where\nfoo = 1\n";
+        let src = indoc! {"
+            module Foo (foo) where
+            foo = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo (foo) where\n\nfoo = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo (foo) where
+
+                foo = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn no_export_list_does_not_force_a_blank_line() {
-        // Unchanged behavior when there's no export list to begin with - this
-        // boundary just preserves whatever the source had (see `next_visible_line`
-        // based decl/let-binding blank-line preservation elsewhere).
-        let src = "module Foo where\nfoo = 1\n";
+        let src = indoc! {"
+            module Foo where
+            foo = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\nfoo = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+                foo = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn paren_expands_when_source_has_a_newline_inside() {
-        // `=` breaks too, even though the source had it glued - otherwise the
-        // closing `)` would visually "move back" to `foo`'s own column, past
-        // where `(` started (see `paren_would_break`/`print_arrow_rhs`).
-        let src = "module Foo where\n\nfoo = (1 +\n  2)\n";
+        // `=` breaks too, else the closing `)` would move back past `(`.
+        let src = indoc! {"
+            module Foo where
+
+            foo = (1 +
+              2)
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  ( 1\n      + 2\n  )\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  ( 1
+                      + 2
+                  )
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn paren_after_arrow_breaks_the_arrow_first_instead_of_moving_back() {
-        // The same fix, but for `->` (a lambda body) instead of `=`.
-        let src = "module Foo where\n\nfoo = map (\\x -> (x +\n  1)) xs\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = map (\\x -> (x +
+              1)) xs
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  map\n    ( \\x ->\n        ( x\n            + 1\n        )\n    )\n    xs\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  map
+                    ( \\x ->
+                        ( x
+                            + 1
+                        )
+                    )
+                    xs
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn paren_stays_flat_when_source_is_flat() {
-        let src = "module Foo where\n\nfoo = (1 + 2)\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = (1 + 2)
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = (1 + 2)\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo = (1 + 2)
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn imports_and_multiple_decls() {
-        let src = "module Foo where\n\nimport Prelude\nimport Data.Array (head, tail)\n\nfoo = 1\nbar = 2\n";
+        let src = indoc! {"
+            module Foo where
+
+            import Prelude
+            import Data.Array (head, tail)
+
+            foo = 1
+            bar = 2
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\nimport Prelude\n\nimport Data.Array (head, tail)\n\nfoo = 1\nbar = 2\n"
+            indoc! {"
+                module Foo where
+                import Prelude
+
+                import Data.Array (head, tail)
+
+                foo = 1
+                bar = 2
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn array_stays_flat_when_source_is_flat() {
-        let src = "module Foo where\n\nfoo = [1, 2, 3]\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = [1, 2, 3]
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = [ 1, 2, 3 ]\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo = [ 1, 2, 3 ]
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn array_expands_when_source_has_a_newline_inside() {
-        let src = "module Foo where\n\nfoo = [1,\n  2, 3]\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = [1,
+              2, 3]
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  [ 1\n  , 2\n  , 3\n  ]\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  [ 1
+                  , 2
+                  , 3
+                  ]
+            "}
+        );
         assert_idempotent(src);
     }
 
-    /// Regression test: an empty array with a source newline between its
-    /// brackets is a multiline array too, even with no items to carry the
-    /// break - `list()`'s empty-items fast path used to ignore this
-    /// entirely and always collapse to `[]`.
     #[test]
     fn empty_array_with_a_newline_between_the_brackets_stays_expanded() {
-        let src = "module Foo where\n\nfoo = [\n]\n";
+        // Regression: `list()`'s empty-items fast path used to always
+        // collapse to `[]`, ignoring a source break between the brackets.
+        let src = indoc! {"
+            module Foo where
+
+            foo = [
+            ]
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  [\n  ]\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  [
+                  ]
+            "}
+        );
         assert_idempotent(src);
     }
 
-    /// Regression test: an item with no source break around it can still be
-    /// going to print across multiple lines all on its own (here, `c d`'s
-    /// own `App` spine breaks) - that alone should switch the whole array to
-    /// the expanded style, the same as a source break between items would,
-    /// instead of leaving the array looking flat with an item randomly
-    /// breaking mid-line.
     #[test]
     fn array_item_that_would_break_on_its_own_expands_the_whole_array() {
-        // `c` stays glued to the list's own leading comma (it's already
-        // glued right after `, `, so `Expr::App`'s `own_indent` must not
-        // double-relocate on top of that); only `d`, which genuinely breaks
-        // from `c` in the source, drops to its own line.
-        let src = "module Foo where\n\nfoo = [a b, c\n d]\n";
+        // `c` stays glued to its leading comma; `App`'s own_indent must not
+        // double-relocate on top of that.
+        let src = indoc! {"
+            module Foo where
+
+            foo = [a b, c
+             d]
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  [ a b\n  , c\n      d\n  ]\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  [ a b
+                  , c
+                      d
+                  ]
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn app_stays_flat_when_source_is_flat() {
-        let src = "module Foo where\n\nfoo = bar baz qux\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = bar baz qux
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo = bar baz qux\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo = bar baz qux
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn app_expands_one_arg_per_line_when_source_has_a_newline_between_args() {
-        let src = "module Foo where\n\nfoo = bar\n  baz\n  qux\n";
-        let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  bar\n    baz\n    qux\n");
-        assert_idempotent(src);
-    }
+        let src = indoc! {"
+            module Foo where
 
-    /// Regression test: a call glued right after `=` that ends up printing
-    /// across multiple lines relocates entirely - head included - onto its
-    /// own indented line, the same way `list()`'s `own_indent` already does
-    /// for a glued `Array`/`Record` (`Expr::App` previously left its head
-    /// flush glued to `=`/whatever precedes it, only pushing the arguments
-    /// after the break onto their own line via `print_spine_args`'s
-    /// existing "once broken, stay broken" rule).
-    #[test]
-    fn app_only_pushes_args_after_the_first_break_onto_their_own_line() {
-        let src = "module Foo where\n\nfoo = a b\n  c d\n";
-        let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  a b\n    c\n    d\n");
-        assert_idempotent(src);
-    }
-
-    /// Regression test: an argument that's itself going to print across
-    /// multiple lines (here, a `Paren` wrapping a call that breaks) forces
-    /// the same relocation as a real source break would, even with no
-    /// source break of its own before it - `foo`'s own head/call was
-    /// previously left glued flat in this case, only breaking *inside* the
-    /// paren, which made the paren's closing `)` and the following argument
-    /// look like they never left the call's own line.
-    #[test]
-    fn app_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
-        let src = "module Foo where\n\nfoo = a (b\nc) d\n";
-        let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  a\n    ( b\n        c\n    )\n    d\n");
-        assert_idempotent(src);
-    }
-
-    /// Same fix as the previous test, but for a `Record` argument rather
-    /// than a `Paren` one - `expr_would_break` (unlike `paren_would_break`)
-    /// is deliberately not restricted to any one node shape, since any kind
-    /// of glued argument can print across multiple lines on its own.
-    #[test]
-    fn app_record_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
-        let src = "module Foo where\n\nfoo = a { x: 1\n, y: 2 } d\n";
+            foo = bar
+              baz
+              qux
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  a\n    { x: 1\n    , y: 2\n    }\n    d\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  bar
+                    baz
+                    qux
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// A call whose first argument stays glued (`x {}` - a single
-    /// `Expr::Update` node with zero updates, not a separate `App` argument)
-    /// followed by one that breaks (`[\na\n]`) needs the *whole* call to
-    /// relocate, not just the argument that broke.
     #[test]
-    fn app_relocates_when_a_later_glued_argument_would_break() {
-        let src = "module Foo where\n\na = x {} [\na\n]\n";
+    fn app_only_pushes_args_after_the_first_break_onto_their_own_line() {
+        let src = indoc! {"
+            module Foo where
+
+            foo = a b
+              c d
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\na =\n  x {}\n    [ a\n    ]\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  a b
+                    c
+                    d
+            "}
+        );
         assert_idempotent(src);
     }
 
-    /// A function definition's binders use `print_spine_args` too, so a
-    /// binder that would itself break (a record pattern with several fields)
-    /// pushes later binders onto their own line rather than leaving them
-    /// glued onto the record's own closing `}` line. Same fix applies to
-    /// `Decl::Def`, `InstBinding::Def`, `LetBinding::Name`, and
-    /// `Expr::Lambda`.
+    #[test]
+    fn app_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
+        let src = indoc! {"
+            module Foo where
+
+            foo = a (b
+            c) d
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  a
+                    ( b
+                        c
+                    )
+                    d
+            "}
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn app_record_arg_that_would_break_pushes_itself_and_later_args_onto_their_own_line() {
+        let src = indoc! {"
+            module Foo where
+
+            foo = a { x: 1
+            , y: 2 } d
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  a
+                    { x: 1
+                    , y: 2
+                    }
+                    d
+            "}
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn app_relocates_when_a_later_glued_argument_would_break() {
+        // `x {}` is one `Expr::Update` node with zero updates, not a
+        // separate `App` argument.
+        let src = indoc! {"
+            module Foo where
+
+            a = x {} [
+            a
+            ]
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                a =
+                  x {}
+                    [ a
+                    ]
+            "}
+        );
+        assert_idempotent(src);
+    }
+
     #[test]
     fn decl_def_binder_that_would_break_pushes_itself_and_later_binders_onto_their_own_line() {
-        let src = "module M where\n\nf x@\n  { a\n  , b\n  }\n  y = 1\n";
+        // Same fix applies to InstBinding::Def, LetBinding::Name, and Lambda.
+        let src = indoc! {"
+            module M where
+
+            f x@
+              { a
+              , b
+              }
+              y = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module M where\n\nf\n  x@\n    { a\n    , b\n    }\n  y = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module M where
+
+                f
+                  x@
+                    { a
+                    , b
+                    }
+                  y = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn inst_binding_def_binder_that_would_break_pushes_itself_and_later_binders_onto_their_own_line()
      {
-        let src =
-            "module M where\n\ninstance showFoo :: Show Foo where\n  f x@\n    { a\n    , b\n    }\n    y = 1\n";
+        let src = indoc! {"
+            module M where
+
+            instance showFoo :: Show Foo where
+              f x@
+                { a
+                , b
+                }
+                y = 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module M where\n\ninstance Show Foo where\n  f\n    x@\n      { a\n      , b\n      }\n    y = 1\n"
+            indoc! {"
+                module M where
+
+                instance Show Foo where
+                  f
+                    x@
+                      { a
+                      , b
+                      }
+                    y = 1
+            "}
         );
         assert_idempotent(src);
     }
@@ -3479,74 +3210,139 @@ mod tests {
     #[test]
     fn let_binding_name_binder_that_would_break_pushes_itself_and_later_binders_onto_their_own_line()
      {
-        let src =
-            "module M where\n\nfoo =\n  let\n    f x@\n      { a\n      , b\n      }\n      y = 1\n  in\n    f\n";
+        let src = indoc! {"
+            module M where
+
+            foo =
+              let
+                f x@
+                  { a
+                  , b
+                  }
+                  y = 1
+              in
+                f
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module M where\n\nfoo =\n  let\n    f\n      x@\n        { a\n        , b\n        }\n      y = 1\n  in\n  f\n"
+            indoc! {"
+                module M where
+
+                foo =
+                  let
+                    f
+                      x@
+                        { a
+                        , b
+                        }
+                      y = 1
+                  in
+                  f
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// Same bug and fix as the tests above, but for `Expr::Lambda` - with one
-    /// deliberate asymmetry: the *first* binder stays glued directly after
-    /// `\` (no space, never relocating) both before and after the fix, since
-    /// only binders after the first go through `print_spine_args` (see
-    /// `Expr::Lambda`'s own doc comment).
     #[test]
     fn lambda_binder_that_would_break_pushes_later_binders_onto_their_own_line() {
-        let src = "module M where\n\nfoo =\n  \\x@\n     { a\n     , b\n     }\n   y -> 1\n";
+        // Deliberate asymmetry: the first binder always stays glued after
+        // `\`; only binders after it go through print_spine_args.
+        let src = indoc! {"
+            module M where
+
+            foo =
+              \\x@
+                 { a
+                 , b
+                 }
+               y -> 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module M where\n\nfoo =\n  \\x@\n    { a\n    , b\n    }\n    y -> 1\n"
+            indoc! {"
+                module M where
+
+                foo =
+                  \\x@
+                    { a
+                    , b
+                    }
+                    y -> 1
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// Regression test for a bug where `case`/`do` nested inside one argument
-    /// of a multiline call printed at whatever indent was active before the
-    /// call, instead of inheriting the call's own extra indent - so its
-    /// branches ended up no deeper than (or shallower than) sibling call
-    /// arguments, looking like they printed "before" the block itself.
     #[test]
     fn case_nested_in_a_multiline_app_arg_indents_past_the_call() {
-        let src =
-            "module Foo where\n\nfoo = bar\n  (case x of\n    A -> 1\n    B -> 2)\n  qux\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = bar
+              (case x of
+                A -> 1
+                B -> 2)
+              qux
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  bar\n    ( case x of\n        A -> 1\n        B -> 2\n    )\n    qux\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  bar
+                    ( case x of
+                        A -> 1
+                        B -> 2
+                    )
+                    qux
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn case_branches_preserve_a_blank_line_between_groups() {
-        let src = "module Foo where\n\nfoo x = case x of\n  A -> 1\n\n  B -> 2\n  C -> 3\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo x = case x of
+              A -> 1
+
+              B -> 2
+              C -> 3
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo x =\n  case x of\n    A -> 1\n\n    B -> 2\n    C -> 3\n"
+            indoc! {"
+                module Foo where
+
+                foo x =
+                  case x of
+                    A -> 1
+
+                    B -> 2
+                    C -> 3
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn guarded_clause_comments_stay_attached_to_their_own_clause() {
-        // Regression test: `GuardedExpr::Guarded`'s multiline branch used to
-        // never flush comments per clause, so every leading comment on every
-        // clause silently rode along to whatever flush point came next -
-        // dumping them all at the very end of the function instead.
-        let src = concat!(
-            "module Foo where\n\n",
-            "f x\n",
-            "  -- first\n",
-            "  | a x = 1\n",
-            "  -- second\n",
-            "  | b x = 2\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            f x
+              -- first
+              | a x = 1
+              -- second
+              | b x = 2
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3554,17 +3350,17 @@ mod tests {
 
     #[test]
     fn comment_before_a_field_does_not_strand_its_leading_comma() {
-        // Regression test: `list()`'s multiline branch used to flush a
-        // comment *after* writing the leading `, `, stranding the comma
-        // alone on its own line ahead of the comment instead of above it.
-        let src = concat!(
-            "module Foo where\n\n",
-            "foo =\n",
-            "  { a: 1\n",
-            "  -- comment\n",
-            "  , b: 2\n",
-            "  }\n",
-        );
+        // Regression: `list()` used to write the leading `, ` before
+        // flushing the comment, stranding the comma on its own line.
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              { a: 1
+              -- comment
+              , b: 2
+              }
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3572,40 +3368,46 @@ mod tests {
 
     #[test]
     fn comment_before_a_lets_body_is_not_relocated_past_it() {
-        // Regression test: `Expr::Let`'s body was printed via a plain
-        // `print_expr` call with no `flush_comments_before` of its own, so a
-        // comment right before the body rode along to whatever the body's
-        // own printing flushed next - e.g. landing after a `case`'s own
-        // first branch's own leading comment instead of before the `case`.
-        let src = concat!(
-            "module Foo where\n\n",
-            "foo = do\n",
-            "  let\n",
-            "    y = 1\n",
-            "  -- comment\n",
-            "  case y of\n",
-            "    _ -> pure y\n",
-        );
+        // Regression: `Expr::Let`'s body printed via plain `print_expr` with
+        // no `flush_comments_before`, so the comment rode along to whatever
+        // the body flushed next (e.g. past a case branch's own comment).
+        let src = indoc! {"
+            module Foo where
+
+            foo = do
+              let
+                y = 1
+              -- comment
+              case y of
+                _ -> pure y
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "foo =\n",
-                "  do\n",
-                "    let\n",
-                "      y = 1\n",
-                "    -- comment\n",
-                "    case y of\n",
-                "      _ -> pure y\n",
-            )
+            indoc! {"
+                module Foo where
+
+                foo =
+                  do
+                    let
+                      y = 1
+                    -- comment
+                    case y of
+                      _ -> pure y
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn trailing_comment_stays_on_its_own_line_glued_to_what_it_trails() {
-        let src = "module Foo where\n\nfoo = 1 -- trailing\n\nbar = 2\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = 1 -- trailing
+
+            bar = 2
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3613,12 +3415,13 @@ mod tests {
 
     #[test]
     fn trailing_comment_does_not_attach_to_an_earlier_token_on_the_same_line() {
-        // Regression test: an earlier version checked "does a pending comment
-        // start on this token's own line" for *every* subexpression, which a
-        // multi-token flat expression can't distinguish from "trails
-        // something later on the same line" - `Tuple a b -- c` would end up
-        // as `Tuple -- c a b`, injecting the comment mid-expression.
-        let src = "module Foo where\n\nfoo = Tuple a b -- trailing\n";
+        // Regression: checking "does a comment start on this token's line"
+        // per-subexpression made `Tuple a b -- c` print as `Tuple -- c a b`.
+        let src = indoc! {"
+            module Foo where
+
+            foo = Tuple a b -- trailing
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3626,18 +3429,16 @@ mod tests {
 
     #[test]
     fn op_chain_trailing_comment_stays_on_the_operand_it_trails() {
-        // An `Op` chain must call `flush_trailing_comment` for its own
-        // operands too, or a comment trailing one operand's line (`# f arg
-        // -- comment`) falls through to the next operand's unconditional
-        // `flush_comments_before` and misattaches as a *leading* comment on
-        // that next operand, pushing it down onto its own separate line.
-        let src = concat!(
-            "module Foo where\n\n",
-            "foo x =\n",
-            "  x\n",
-            "    # f arg -- comment\n",
-            "    <#> (\\y -> y)\n",
-        );
+        // Without flush_trailing_comment per operand, the comment falls
+        // through and misattaches as a leading comment on the next operand.
+        let src = indoc! {"
+            module Foo where
+
+            foo x =
+              x
+                # f arg -- comment
+                <#> (\\y -> y)
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3645,8 +3446,6 @@ mod tests {
 
     #[test]
     fn op_chain_trailing_comment_on_a_still_flat_operand_does_not_misattach_earlier() {
-        // A trailing comment must not misattach until a real break confirms
-        // the operand before it truly ends its own line.
         let src = indoc! {"
             module Foo where
 
@@ -3669,20 +3468,17 @@ mod tests {
 
     #[test]
     fn op_chain_leading_comment_before_an_operator_stays_above_it_instead_of_forcing_the_operand_down() {
-        // A comment on its own line right before an operator (`x\n  --
-        // comment\n  <#> y`) belongs to the `op y` unit as a whole, not to
-        // `y` alone. `print_expr(y)`'s own unconditional
-        // `flush_comments_before` would otherwise claim it as a leading
-        // comment on `y`, forcing `y` onto its own line under the comment
-        // even though `y` itself never needed to break.
-        let src = concat!(
-            "module Foo where\n\n",
-            "foo =\n",
-            "  a b c\n",
-            "    -- comment\n",
-            "    <#> List.map d\n",
-            "    # e f\n",
-        );
+        // The comment belongs to the `op y` unit, not to `y` alone -
+        // print_expr(y)'s own flush_comments_before would otherwise claim it.
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              a b c
+                -- comment
+                <#> List.map d
+                # e f
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3690,57 +3486,116 @@ mod tests {
 
     #[test]
     fn record_expands_when_source_has_a_newline_inside() {
-        let src = "module Foo where\n\nfoo = { a: 1,\n  b: 2 }\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = { a: 1,
+              b: 2 }
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  { a: 1\n  , b: 2\n  }\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  { a: 1
+                  , b: 2
+                  }
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn sig_and_binders() {
-        let src = "module Foo where\n\nfoo :: Int -> Int\nfoo x = x\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo :: Int -> Int
+            foo x = x
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo :: Int -> Int\nfoo x = x\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo :: Int -> Int
+                foo x = x
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_and_array_flat_are_both_padded() {
-        let src = "module Foo where\n\nfoo = { a: 1, b: 2 }\nbar = [1, 2]\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = { a: 1, b: 2 }
+            bar = [1, 2]
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = { a: 1, b: 2 }\nbar = [ 1, 2 ]\n"
+            indoc! {"
+                module Foo where
+
+                foo = { a: 1, b: 2 }
+                bar = [ 1, 2 ]
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn if_then_else_multiline_is_indented() {
-        let src = "module Foo where\n\nfoo = if x\n  then 1\n  else 2\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = if x
+              then 1
+              else 2
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = if x\n  then 1\n  else 2\n"
+            indoc! {"
+                module Foo where
+
+                foo = if x
+                  then 1
+                  else 2
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn leading_comment_before_decl_is_kept() {
-        let src = "module Foo where\n\n-- a comment\nfoo = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            -- a comment
+            foo = 1
+        "};
         let out = fmt(src);
         assert!(out.contains("-- a comment"), "comment lost: {:?}", out);
         assert_idempotent(src);
     }
 
-    /// `flush_comments_before` must also check for a source blank line
-    /// *between* a leading comment and whatever it precedes (not just
-    /// *before* the comment group itself) - otherwise a standalone section
-    /// comment followed by a deliberate blank line collapses onto one line.
     #[test]
     fn blank_line_between_a_leading_comment_and_its_decl_is_kept() {
-        let src = "module Foo where\n\n-- section\n\nfoo = 1\n";
+        // flush_comments_before must check for a blank line between the
+        // comment and what follows, not just before the comment group.
+        let src = indoc! {"
+            module Foo where
+
+            -- section
+
+            foo = 1
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3748,105 +3603,194 @@ mod tests {
 
     #[test]
     fn case_of_with_multiple_branches() {
-        // `case` always breaks (it needs at least one branch), so it always
-        // relocates off of a glued `=` - see `keyword_block_would_break`.
-        let src = "module Foo where\n\nfoo = case 1 of\n  0 -> \"zero\"\n  x -> \"other\"\n";
+        // `case` always relocates off a glued `=` (see `keyword_block_would_break`).
+        let src = indoc! {"
+            module Foo where
+
+            foo = case 1 of
+              0 -> \"zero\"
+              x -> \"other\"
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  case 1 of\n    0 -> \"zero\"\n    x -> \"other\"\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  case 1 of
+                    0 -> \"zero\"
+                    x -> \"other\"
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// An empty-record binder `{}` had no `.span()` at all (the `Ast` derive
-    /// merges only over its empty field list), reducing to `Span::Zero` -
-    /// the same class of bug fixed for `Binder::Array`'s `[]`, just never
-    /// applied to `Binder::Record`. `breaks_before` then compared the
-    /// branch's real line against `Span::Zero`'s `(0, 0)`, always reading as
-    /// a break, so `{} -> 0` relocated even when glued flat in the source -
-    /// and since that shifted the branch's own end line, a second pass then
-    /// saw a spurious gap before the next branch too. Fixed by giving
-    /// `Binder::Record` real `{`/`}` brace spans, same as `Array`.
+    /// `{}` binder had no span, reading as `Span::Zero` - a false "break" that
+    /// relocated the branch and shifted later branches too.
     #[test]
     fn empty_record_binder_case_branch_does_not_relocate_or_flip() {
-        let src = "module Foo where\n\nfoo x = case x of\n  y | y > 0 -> y\n  {} -> 0\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo x = case x of
+              y | y > 0 -> y
+              {} -> 0
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo x =\n  case x of\n    y | y > 0 -> y\n    {} -> 0\n"
+            indoc! {"
+                module Foo where
+
+                foo x =
+                  case x of
+                    y | y > 0 -> y
+                    {} -> 0
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// A `case` scrutinee that's itself going to print multi-line (an `Op`
-    /// chain here) must push `case ... of` apart onto its own indented
-    /// block, or `of` ends up glued right after wherever the scrutinee's
-    /// last line happened to land.
     #[test]
     fn case_scrutinee_that_would_break_relocates_case_and_of_onto_their_own_lines() {
-        let src = "module Foo where\n\nfoo = case\n  a\n    && b\n  of\n  true -> 1\n  false -> 2\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = case
+              a
+                && b
+              of
+              true -> 1
+              false -> 2
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  case\n    a\n      && b\n    of\n    true -> 1\n    false -> 2\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  case
+                    a
+                      && b
+                    of
+                    true -> 1
+                    false -> 2
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// Same fix, for multiple comma-separated scrutinees - each one lands on
-    /// its own line, subsequent ones leading with `, ` (this printer's usual
-    /// leading-comma list style), with `of` and the branches unaffected.
     #[test]
     fn case_multiple_scrutinees_that_would_break_print_one_per_line() {
-        let src =
-            "module Foo where\n\nfoo = case\n  a\n  , b\n  of\n  true, e -> 1\n  _, _ -> 2\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = case
+              a
+              , b
+              of
+              true, e -> 1
+              _, _ -> 2
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  case\n    a\n    , b\n    of\n    true, e -> 1\n    _, _ -> 2\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  case
+                    a
+                    , b
+                    of
+                    true, e -> 1
+                    _, _ -> 2
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_field_with_case_value_hangs_one_level_deeper() {
-        // A record field's value always relocates a `case` (or `do`/`ado`/
-        // `let`) off the field's own `:`, the same as a top-level `=` does
-        // (`case_of_with_multiple_branches`) - `print_record_field_rhs` uses
-        // two `indent_in`s for that relocated position instead of one, so
-        // the value still sits one full level past the field itself, not
-        // flush with it.
-        let src =
-            "module Foo where\n\nfoo =\n  { a: 1\n  , b: case x of\n      0 -> 1\n      _ -> 2\n  }\n";
+        // `print_record_field_rhs` uses two `indent_in`s here, not one.
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              { a: 1
+              , b: case x of
+                  0 -> 1
+                  _ -> 2
+              }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  { a: 1\n  , b:\n      case x of\n        0 -> 1\n        _ -> 2\n  }\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  { a: 1
+                  , b:
+                      case x of
+                        0 -> 1
+                        _ -> 2
+                  }
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_update_field_with_case_value_hangs_one_level_deeper() {
-        let src = "module Foo where\n\nfoo =\n  r\n    { a = 1\n    , b = case x of\n        0 -> 1\n        _ -> 2\n    }\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              r
+                { a = 1
+                , b = case x of
+                    0 -> 1
+                    _ -> 2
+                }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo =\n  r\n    { a = 1\n    , b =\n        case x of\n          0 -> 1\n          _ -> 2\n    }\n"
+            indoc! {"
+                module Foo where
+
+                foo =
+                  r
+                    { a = 1
+                    , b =
+                        case x of
+                          0 -> 1
+                          _ -> 2
+                    }
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_field_moves_to_its_own_line_when_its_value_already_broke_in_source() {
-        // Unlike `case` (see `record_field_with_case_value_hangs_one_level_deeper`,
-        // which stays glued to `:`), an `App` chain whose argument already
-        // broke onto its own line in the source moves the whole value down
-        // instead of gluing its head right after `label:`, two levels past
-        // the field's own row rather than one (see
-        // `print_record_field_rhs`'s doc comment).
-        let src = "module Foo where\n\nf x =\n  update\n    { payload:\n        List.singleton\n          (Db.payload @\"type\" (selectedTypes # NonEmptyArray.map RowType.toStorageString))\n    , updatedColumns: List.singleton (Db.updatedColumn @\"status\")\n    }\n    tableRow\n";
+        // Unlike a `case` value (stays glued to `:`), an already-broken value
+        // moves down whole, two levels past the field's own row.
+        let src = indoc! {"
+            module Foo where
+
+            f x =
+              update
+                { payload:
+                    List.singleton
+                      (Db.payload @\"type\" (selectedTypes # NonEmptyArray.map RowType.toStorageString))
+                , updatedColumns: List.singleton (Db.updatedColumn @\"status\")
+                }
+                tableRow
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3854,16 +3798,22 @@ mod tests {
 
     #[test]
     fn constraint_arg_moves_to_its_own_line_after_a_multiline_row_argument() {
-        // `Union a (row) b`: `a` stays glued to `Union` (no source break),
-        // but once `row` prints as its own multiline block, `b` - which sits
-        // on the very next source line after the row's closing paren - must
-        // not glue back onto that closing line; it needs its own line at the
-        // same indent as the row block. The block hangs under `Union`'s own
-        // real column (`print_constraint`'s hang, via `hang_glued`) - not an
-        // approximate level bump - or it looks shallower than the very name
-        // it's an argument of, since the ambient indent baseline has no
-        // memory of `. `'s width.
-        let src = "module Foo where\n\nempty\n  :: forall a b\n   . Union a\n       ( balance :: Maybe Money.Money\n       , currency :: Currency\n       )\n       b\n  => Record b\nempty = x\n";
+        // The row block hangs under `Union`'s real column (`hang_glued`), not
+        // an approximate level bump, since the ambient indent has no memory
+        // of `. `'s width.
+        let src = indoc! {"
+            module Foo where
+
+            empty
+              :: forall a b
+               . Union a
+                   ( balance :: Maybe Money.Money
+                   , currency :: Currency
+                   )
+                   b
+              => Record b
+            empty = x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3871,28 +3821,59 @@ mod tests {
 
     #[test]
     fn guarded_def() {
-        let src = "module Foo where\n\nfoo x\n  | x > 0 = 1\n  | otherwise = 0\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo x
+              | x > 0 = 1
+              | otherwise = 0
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo x\n  | x > 0 = 1\n  | otherwise = 0\n"
+            indoc! {"
+                module Foo where
+
+                foo x
+                  | x > 0 = 1
+                  | otherwise = 0
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn do_notation() {
-        // A `do` block always breaks (it needs at least one statement), so
-        // it always relocates off of a glued `=` - see `keyword_block_would_break`.
-        let src = "module Foo where\n\nfoo = do\n  x <- bar\n  pure x\n";
+        // `do` always relocates off a glued `=` (see `keyword_block_would_break`).
+        let src = indoc! {"
+            module Foo where
+
+            foo = do
+              x <- bar
+              pure x
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  do\n    x <- bar\n    pure x\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  do
+                    x <- bar
+                    pure x
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn let_in() {
-        let src = "module Foo where\n\nfoo = let x = 1 in x\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = let x = 1 in x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3900,62 +3881,132 @@ mod tests {
 
     #[test]
     fn let_in_relocates_and_separates_in_from_body_when_bindings_block() {
-        // A `let`'s bindings that don't collapse flat (see `let_in`) force
-        // the whole `let ... in ...` off of a glued `=` (`keyword_block_would_break`),
-        // the same as `case`/`do`/`ado` - and once the bindings printed as a
-        // block, `in` and the body split onto their own lines too (both at
-        // `in`'s own level), rather than leaving `in <body>` glued as if the
-        // bindings had stayed flat.
-        let src = "module A where\n\na = let\n  b = 2\n  in b\n";
+        let src = indoc! {"
+            module A where
+
+            a = let
+              b = 2
+              in b
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module A where\n\na =\n  let\n    b = 2\n  in\n  b\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module A where
+
+                a =
+                  let
+                    b = 2
+                  in
+                  b
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn case_relocates_off_a_glued_arrow_even_for_a_single_trivial_branch() {
-        let src = "module A where\n\na = case 1 of\n  _ -> 1\n";
+        let src = indoc! {"
+            module A where
+
+            a = case 1 of
+              _ -> 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module A where\n\na =\n  case 1 of\n    _ -> 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module A where
+
+                a =
+                  case 1 of
+                    _ -> 1
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn nested_case_branch_body_also_relocates_off_its_glued_arrow() {
-        let src = "module A where\n\na =\n  case 1 of\n    _ -> case 1 of\n      _ -> 1\n";
+        let src = indoc! {"
+            module A where
+
+            a =
+              case 1 of
+                _ -> case 1 of
+                  _ -> 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module A where\n\na =\n  case 1 of\n    _ ->\n      case 1 of\n        _ -> 1\n"
+            indoc! {"
+                module A where
+
+                a =
+                  case 1 of
+                    _ ->
+                      case 1 of
+                        _ -> 1
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn paren_preserves_a_source_break_around_trivial_content() {
-        // Unlike `case`/`do`/`let`/`ado`, `Expr::Paren`'s own block-vs-flat
-        // choice stays content-driven first (a nested always-multiline
-        // construct must still force block style) but now also treats a
-        // source break right after `(` or right before `)` as forcing it
-        // too, even for content that would otherwise happily print flat -
-        // see `print_paren_block`'s `force_block` parameter.
-        let src = "module A where\n\na = (\n 1)\n";
+        // A source break right after `(` or before `)` forces block style
+        // even when the content would otherwise print flat.
+        let src = indoc! {"
+            module A where
+
+            a = (
+             1)
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module A where\n\na =\n  ( 1\n  )\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module A where
+
+                a =
+                  ( 1
+                  )
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn ado_notation_with_statements_relocates_off_a_glued_arrow_like_do_does() {
-        let src = "module Foo where\n\nfoo = ado\n  x <- bar\n  in x\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = ado
+              x <- bar
+              in x
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  ado\n    x <- bar\n    in x\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  ado
+                    x <- bar
+                    in x
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn ado_with_no_statements_stays_flat_when_the_source_had_it_on_one_line() {
-        let src = "module Foo where\n\nfoo = ado in 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = ado in 1
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3963,7 +4014,11 @@ mod tests {
 
     #[test]
     fn ado_with_one_statement_stays_flat_when_the_source_had_it_on_one_line() {
-        let src = "module Foo where\n\nfoo = ado x <- pure 1 in x\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = ado x <- pure 1 in x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3971,25 +4026,39 @@ mod tests {
 
     #[test]
     fn ado_with_no_statements_and_a_source_break_relocates_the_whole_block() {
-        // Unlike a populated `ado`/`do` block (which always stays glued to
-        // `=`, real statements or not), an empty `ado` has nothing but `in`
-        // to show under it - so once it can't stay flat on one line, the
-        // whole `ado ... in ...` unit moves onto its own indented line
-        // instead of leaving `ado` glued with just `in` dangling under it.
-        let src = "module Foo where\n\nfoo = ado\n  in 1\n";
+        // Unlike a populated `ado`/`do` (always glued to `=`), an empty `ado`
+        // relocates the whole `ado ... in ...` unit instead of leaving `ado`
+        // glued with just `in` dangling under it.
+        let src = indoc! {"
+            module Foo where
+
+            foo = ado
+              in 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo =\n  ado\n    in 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  ado
+                    in 1
+            "}
+        );
         assert_idempotent(&out);
     }
 
     #[test]
     fn let_single_binding_stays_glued_in_do_block() {
-        // Regression test: a single simple `let` binding that sat glued flat
-        // on `let`'s own source line used to always break onto its own
-        // indented line (`let\n  a = 1`) even though nothing about it needed
-        // to - now it only breaks when the source did, or the binding's own
-        // RHS forces a break (e.g. a nested `case`/`do`).
-        let src = "module A where\n\na =\n  do\n    let a = 1\n    pure a\n";
+        let src = indoc! {"
+            module A where
+
+            a =
+              do
+                let a = 1
+                pure a
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -3997,327 +4066,397 @@ mod tests {
 
     #[test]
     fn let_multiple_bindings_still_break() {
-        // `do` (the decl's own RHS here) always relocates off a glued `=`
-        // now - see `keyword_block_would_break` - so everything inside it,
-        // including this `let`-statement, shifts down one level too.
-        let src = "module A where\n\na = do\n  let\n    x = 1\n    y = 2\n  pure (x + y)\n";
+        let src = indoc! {"
+            module A where
+
+            a = do
+              let
+                x = 1
+                y = 2
+              pure (x + y)
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module A where\n\na =\n  do\n    let\n      x = 1\n      y = 2\n    pure (x + y)\n"
+            indoc! {"
+                module A where
+
+                a =
+                  do
+                    let
+                      x = 1
+                      y = 2
+                    pure (x + y)
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn let_binding_on_its_own_source_line_still_breaks() {
-        let src = "module A where\n\na = do\n  let\n    x = 1\n  pure x\n";
+        let src = indoc! {"
+            module A where
+
+            a = do
+              let
+                x = 1
+              pure x
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module A where\n\na =\n  do\n    let\n      x = 1\n    pure x\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module A where
+
+                a =
+                  do
+                    let
+                      x = 1
+                    pure x
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn where_clause() {
-        let src = "module Foo where\n\nfoo = result where\n  result = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = result where
+              result = 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = result\n  where\n    result = 1\n"
+            indoc! {"
+                module Foo where
+
+                foo = result
+                  where
+                    result = 1
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_update_and_infix() {
-        let src = "module Foo where\n\nfoo = r { a = 1 }\nbar = 1 `add` 2\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo = r { a = 1 }
+            bar = 1 `add` 2
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nfoo = r { a = 1 }\nbar = 1 `add` 2\n"
+            indoc! {"
+                module Foo where
+
+                foo = r { a = 1 }
+                bar = 1 `add` 2
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn data_flat_and_multiline() {
-        let src = "module Foo where\n\ndata Flat = A | B Int\n\ndata Tall\n  = C\n  | D String\n";
+        let src = indoc! {"
+            module Foo where
+
+            data Flat = A | B Int
+
+            data Tall
+              = C
+              | D String
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\ndata Flat = A | B Int\n\ndata Tall\n  = C\n  | D String\n"
+            indoc! {"
+                module Foo where
+
+                data Flat = A | B Int
+
+                data Tall
+                  = C
+                  | D String
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// A single constructor's `any_breaks` check has no adjacent pair to
-    /// compare (there's only one constructor, no `|` alternative), so it
-    /// never caught a record-typed arg that would break on its own account
-    /// while still glued flat after the constructor name in source - the
-    /// constructor name stayed on the `=` line while only its args
-    /// relocated out from under it. Now the whole `= Ctor` line relocates
-    /// together with its args, matching the shape a multi-constructor
-    /// break already used.
+    /// A single constructor has no adjacent `|` alternative for `any_breaks`
+    /// to compare against, so a would-break arg alone must still relocate
+    /// the whole `= Ctor` line, not just the arg.
     #[test]
     fn data_single_ctor_arg_that_would_break_relocates_whole_line() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "data Store = Store { a :: Int\n",
-            "  , b :: Int\n",
-            "  }\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            data Store = Store { a :: Int
+              , b :: Int
+              }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "data Store\n",
-                "  = Store\n",
-                "      { a :: Int\n",
-                "      , b :: Int\n",
-                "      }\n",
-            )
+            indoc! {"
+                module Foo where
+
+                data Store
+                  = Store
+                      { a :: Int
+                      , b :: Int
+                      }
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// A data constructor's own fields relocate when they break, same as a
-    /// name's binders or a call's arguments. Also required a parser fix:
-    /// `data_cnstr` parsed each field with the full `typ` parser rather than
-    /// `typ_atom`, so two space-separated fields (`C A B`) mis-parsed as one
-    /// field being `A` applied to `B` instead of two sibling fields (needs
-    /// explicit parens for application, per PureScript's `atype*`
-    /// constructor-field grammar).
+    /// Also fixes `data_cnstr` parsing fields with `typ` instead of `typ_atom`
+    /// (which mis-parsed `C A B` as one field `A` applied to `B`).
     #[test]
     fn data_ctor_fields_that_would_break_relocate_two_levels_past_the_bullet() {
-        let src = "module Foo where\n\ndata D\n  = C\n      A\n      B\n  | E\n";
+        let src = indoc! {"
+            module Foo where
+
+            data D
+              = C
+                  A
+                  B
+              | E
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// `newtype`'s single constructor argument relocates when it would
-    /// break, even glued flat in the source - the common case for a record
-    /// type with enough fields. A newtype constructor always wraps exactly
-    /// one `Typ`, never a space-separated arg list like a data constructor
-    /// can, so this has its own direct relocation logic rather than a
-    /// borrowed call into `print_ctor_args` - but lands on the same visual
-    /// shape as `Decl::Data`'s single-constructor case: the whole `= Ctor`
-    /// line moves down together with the arg, two levels past the bullet.
+    /// `newtype` wraps exactly one `Typ` (no arg list like `data`), so this
+    /// has its own relocation logic, landing on the same shape as `Decl::Data`.
     #[test]
     fn newtype_ctor_arg_that_would_break_relocates_even_when_source_glued_it_flat() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "newtype Store = Store { a :: Int\n",
-            "  , b :: Int\n",
-            "  }\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            newtype Store = Store { a :: Int
+              , b :: Int
+              }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "newtype Store\n",
-                "  = Store\n",
-                "      { a :: Int\n",
-                "      , b :: Int\n",
-                "      }\n",
-            )
+            indoc! {"
+                module Foo where
+
+                newtype Store
+                  = Store
+                      { a :: Int
+                      , b :: Int
+                      }
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// A record/row field's own type relocates when it would break, the
-    /// same as every other `name :: Typ`/`name = Typ` site. Unlike a
-    /// top-level signature, a field's `::` stays glued to its label
-    /// (`print_field_typ` mirrors `print_typ_alias_rhs`'s shape, not
-    /// `print_sig_typ`'s) - only the type itself drops to a fresh line.
+    /// Unlike a top-level signature, a field's `::` stays glued to its label
+    /// (`print_field_typ` mirrors `print_typ_alias_rhs`, not `print_sig_typ`).
     #[test]
     fn record_field_typ_that_would_break_relocates_with_double_colon_staying_put() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "type T =\n",
-            "  { a :: Int\n",
-            "  , action :: Foo\n",
-            "      Bar\n",
-            "      Baz\n",
-            "  }\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            type T =
+              { a :: Int
+              , action :: Foo
+                  Bar
+                  Baz
+              }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "type T =\n",
-                "  { a :: Int\n",
-                "  , action ::\n",
-                "      Foo\n",
-                "        Bar\n",
-                "        Baz\n",
-                "  }\n",
-            )
+            indoc! {"
+                module Foo where
+
+                type T =
+                  { a :: Int
+                  , action ::
+                      Foo
+                        Bar
+                        Baz
+                  }
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// A comment between a ctor's name and its record-type argument isn't
-    /// flushed until `print_row`'s field loop reaches the first field -
-    /// which lands the field on a different *output* line than `{` even
-    /// though nothing in the *source* put a real break there. A single-field
-    /// record's block-style decision must not treat that shifted position as
-    /// a genuine source break on a later pass, or it flips to block style
-    /// and never stabilizes.
+    /// A leading comment shifts the field onto a different output line than
+    /// `{`; the block-style check must not mistake that for a real source
+    /// break on a later pass, or it never stabilizes.
     #[test]
     fn comment_before_ctor_record_arg_does_not_flip_flat_row_to_block_on_reformat() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "data D\n",
-            "  = C\n",
-            "      -- TODO comment\n",
-            "      { a :: Int, b :: Int }\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            data D
+              = C
+                  -- TODO comment
+                  { a :: Int, b :: Int }
+        "};
         assert_idempotent(src);
     }
 
-    /// A single-field record can't show a source break via `any_breaks`
-    /// (there's no adjacent field pair to compare) - the break right before
-    /// `}` still has to force block style, or it silently collapses to one
-    /// line and loses the source's intended shape.
+    /// A single-field record has no adjacent pair for `any_breaks` to
+    /// compare, so the break before `}` alone must force block style.
     #[test]
     fn single_field_record_with_a_break_before_close_brace_stays_block_style() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "type Model =\n",
-            "  { page :: PageModel\n",
-            "  }\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            type Model =
+              { page :: PageModel
+              }
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// A single-export list has the same "no adjacent pair to compare" gap as
-    /// a single-field record: `Header` didn't carry the export list's paren
-    /// spans at all, so a break right after `(` had no way to force block
-    /// style, and the list silently collapsed onto one line. Once the list
-    /// does break, the module head itself must relocate too (`module Name`
-    /// onto its own line, `where` trailing the closing paren) rather than
-    /// leaving `module Name (` glued while the export hangs underneath.
+    /// `Header` didn't carry the export list's paren spans, so a source break
+    /// there had no way to force block style; once it does, `module Name`
+    /// relocates too, not just the list.
     #[test]
     fn module_header_export_list_relocates_on_a_source_break_after_open_paren() {
-        let src = "module A (\na) where\n";
+        let src = indoc! {"
+            module A (
+            a) where
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module A\n  ( a\n  ) where\n\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module A
+                  ( a
+                  ) where
+
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_field_typ_app_with_paren_row_arg_indents_two_levels_past_label() {
-        // `label ::`/`, ` is exactly `INDENT` characters wide, so a single
-        // `indent_in()` for the relocated type would land it flush with the
-        // field's own label column - looking like it merely continued the
-        // label instead of nesting under it.
-        let src = concat!(
-            "module Foo where\n\n",
-            "type T =\n",
-            "  { other :: Int\n",
-            "  , action :: VariantStorable\n",
-            "      ( conversion :: ProxyStorable \"conversion\"\n",
-            "      , funding :: ProxyStorable \"funding\"\n",
-            "      )\n",
-            "  }\n",
-        );
+        // `label ::`/`, ` is exactly `INDENT` wide, so a single `indent_in()`
+        // would land the type flush with the label column, not nested under it.
+        let src = indoc! {"
+            module Foo where
+
+            type T =
+              { other :: Int
+              , action :: VariantStorable
+                  ( conversion :: ProxyStorable \"conversion\"
+                  , funding :: ProxyStorable \"funding\"
+                  )
+              }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "type T =\n",
-                "  { other :: Int\n",
-                "  , action ::\n",
-                "      VariantStorable\n",
-                "        ( conversion :: ProxyStorable \"conversion\"\n",
-                "        , funding :: ProxyStorable \"funding\"\n",
-                "        )\n",
-                "  }\n",
-            )
+            indoc! {"
+                module Foo where
+
+                type T =
+                  { other :: Int
+                  , action ::
+                      VariantStorable
+                        ( conversion :: ProxyStorable \"conversion\"
+                        , funding :: ProxyStorable \"funding\"
+                        )
+                  }
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn type_newtype_class_instance() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "type Id a = a\n\n",
-            "newtype Wrap = Wrap Int\n\n",
-            "class Show a where\n  show :: a -> String\n\n",
-            "instance Show Int where\n  show x = \"int\"\n\n",
-            "derive instance Eq Wrap\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            type Id a = a
+
+            newtype Wrap = Wrap Int
+
+            class Show a where
+              show :: a -> String
+
+            instance Show Int where
+              show x = \"int\"
+
+            derive instance Eq Wrap
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// `print_inst_head`/`Decl::Class`'s constraint-context printing tracks
-    /// multiline the same way `print_typ_constrained_chain` does for a
-    /// signature's `=>` chain, instead of always gluing
-    /// `(constraints) => head args... where` onto one line regardless of
-    /// source breaks. `where` also relocates onto its own line here (see
-    /// `Decl::Instance`) once anything between `instance` and `where` is
-    /// multiline, regardless of where the source itself put it.
+    /// `where` also relocates onto its own line once anything between
+    /// `instance` and `where` is multiline.
     #[test]
     fn instance_head_constraint_relocates_when_source_broke_it() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "instance\n",
-            "  IsSymbol l\n",
-            "  => Foldable.FoldWithIndex Foo (Proxy l) where\n",
-            "  foldingWithIndex _ _ acc value = acc\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            instance
+              IsSymbol l
+              => Foldable.FoldWithIndex Foo (Proxy l) where
+              foldingWithIndex _ _ acc value = acc
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "instance\n",
-                "  IsSymbol l\n",
-                "  => Foldable.FoldWithIndex Foo (Proxy l)\n",
-                "  where\n",
-                "  foldingWithIndex _ _ acc value = acc\n",
-            )
+            indoc! {"
+                module Foo where
+
+                instance
+                  IsSymbol l
+                  => Foldable.FoldWithIndex Foo (Proxy l)
+                  where
+                  foldingWithIndex _ _ acc value = acc
+            "}
         );
         assert_idempotent(out.as_str());
     }
 
-    /// Same bug, the parenthesized multi-constraint shape - expands with
-    /// leading commas, matching `list()`'s convention for every other
-    /// bracketed multi-item construct.
     #[test]
     fn instance_head_multi_constraint_relocates_leading_comma_style() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "instance\n",
-            "  ( IsSymbol l\n",
-            "  , Foo l\n",
-            "  )\n",
-            "  => Foldable.FoldWithIndex Foo (Proxy l) where\n",
-            "  foldingWithIndex _ _ acc value = acc\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            instance
+              ( IsSymbol l
+              , Foo l
+              )
+              => Foldable.FoldWithIndex Foo (Proxy l) where
+              foldingWithIndex _ _ acc value = acc
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "instance\n",
-                "  ( IsSymbol l\n",
-                "  , Foo l\n",
-                "  )\n",
-                "  => Foldable.FoldWithIndex Foo (Proxy l)\n",
-                "  where\n",
-                "  foldingWithIndex _ _ acc value = acc\n",
-            )
+            indoc! {"
+                module Foo where
+
+                instance
+                  ( IsSymbol l
+                  , Foo l
+                  )
+                  => Foldable.FoldWithIndex Foo (Proxy l)
+                  where
+                  foldingWithIndex _ _ acc value = acc
+            "}
         );
         assert_idempotent(out.as_str());
     }
@@ -4325,161 +4464,166 @@ mod tests {
     /// `Decl::Class`'s superclass context (`<=`) shares the same fix.
     #[test]
     fn class_superclass_constraint_relocates_when_source_broke_it() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "class\n",
-            "  Eq a\n",
-            "  <= MyClass a where\n",
-            "  bar :: a -> a\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            class
+              Eq a
+              <= MyClass a where
+              bar :: a -> a
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// A singleton constraint's parens are optional syntax, but whether the
-    /// source actually wrote them is real information the printer should
-    /// preserve - same treatment as `Expr::Paren`/`Typ::Paren` everywhere
-    /// else (removing a truly redundant paren is a `style.rs` rule's job,
-    /// not something the raw printer silently decides). An earlier version
-    /// of this fix unconditionally dropped these parens; that was wrong and
-    /// got corrected in the same session.
+    /// A singleton constraint's optional parens are preserved, not stripped -
+    /// removing a redundant paren is `style.rs`'s job, not the raw printer's.
     #[test]
     fn instance_head_single_constraint_paren_wrap_is_preserved_when_flat() {
-        let src = "module Foo where\n\ninstance (IsSymbol l) => Foo (Proxy l) where\n  foo = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            instance (IsSymbol l) => Foo (Proxy l) where
+              foo = 1
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// The parenless form stays parenless too - this isn't a "always add
-    /// parens" normalization, just "print exactly what's there."
     #[test]
     fn instance_head_single_constraint_without_parens_stays_bare() {
-        let src = "module Foo where\n\ninstance IsSymbol l => Foo (Proxy l) where\n  foo = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            instance IsSymbol l => Foo (Proxy l) where
+              foo = 1
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// `where` must relocate onto its own line whenever the head's own
-    /// class-args spine breaks onto several lines, not just when the
-    /// constraint context itself relocates.
+    /// `where` relocates when the head's class-args spine breaks, not just
+    /// when the constraint context does.
     #[test]
     fn instance_where_relocates_when_head_spine_args_break() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "instance\n",
-            "  ( IsSymbol name\n",
-            "  , WriteForeign ty\n",
-            "  )\n",
-            "  => WriteRowFields\n",
-            "       ( Cons namea\n",
-            "           (Maybe ty)\n",
-            "           tail\n",
-            "       )\n",
-            "       row\n",
-            "       from\n",
-            "       to\n",
-            "  where\n",
-            "  writeRowFields _ _ = 1\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            instance
+              ( IsSymbol name
+              , WriteForeign ty
+              )
+              => WriteRowFields
+                   ( Cons namea
+                       (Maybe ty)
+                       tail
+                   )
+                   row
+                   from
+                   to
+              where
+              writeRowFields _ _ = 1
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// `print_spine_args`'s `Typ` call sites (`Typ::App`, `print_constraint`,
-    /// `print_inst_head`) treat a `Typ::Paren` argument that would itself
-    /// break the same as `Expr::App`'s would-break args: it (and everything
-    /// after it) relocates onto its own line, even glued right after the
-    /// head with no source break before it.
+    /// `print_spine_args` treats a would-break `Typ::Paren` arg the same as
+    /// `Expr::App`'s would-break args, even glued with no source break before it.
     #[test]
     fn inst_head_paren_arg_with_no_source_break_before_it_still_relocates_when_it_would_break() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "instance\n",
-            "  ( IsSymbol name\n",
-            "  , ReadForeign ty\n",
-            "  )\n",
-            "  => ReadRowFields (Cons name\n",
-            "                          ty\n",
-            "                          tail\n",
-            "                       )\n",
-            "       from\n",
-            "       to\n",
-            "  where\n",
-            "  readRowFields _ _ = 1\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            instance
+              ( IsSymbol name
+              , ReadForeign ty
+              )
+              => ReadRowFields (Cons name
+                                      ty
+                                      tail
+                                   )
+                   from
+                   to
+              where
+              readRowFields _ _ = 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "instance\n",
-                "  ( IsSymbol name\n",
-                "  , ReadForeign ty\n",
-                "  )\n",
-                "  => ReadRowFields\n",
-                "       ( Cons name\n",
-                "           ty\n",
-                "           tail\n",
-                "       )\n",
-                "       from\n",
-                "       to\n",
-                "  where\n",
-                "  readRowFields _ _ = 1\n",
-            )
+            indoc! {"
+                module Foo where
+
+                instance
+                  ( IsSymbol name
+                  , ReadForeign ty
+                  )
+                  => ReadRowFields
+                       ( Cons name
+                           ty
+                           tail
+                       )
+                       from
+                       to
+                  where
+                  readRowFields _ _ = 1
+            "}
         );
         assert_idempotent(out.as_str());
     }
 
-    /// Same fix, `print_constraint`'s own spine - a constraint's `Typ::Paren`
-    /// argument (not `Typ::Row`/`Typ::Record`, which keep hanging in place,
-    /// see `row_type_expands_one_field_per_line_when_source_has_a_newline`)
-    /// relocates the same way when it would break, even glued with no
-    /// source break before it.
+    /// Same fix in `print_constraint`'s spine - unlike `Typ::Row`/`Typ::Record`,
+    /// which keep hanging in place, a `Typ::Paren` arg relocates.
     #[test]
     fn constraint_paren_arg_with_no_source_break_before_it_still_relocates_when_it_would_break() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "empty\n",
-            "  :: forall a b\n",
-            "   . Union (Cons name\n",
-            "              ty\n",
-            "              tail\n",
-            "           ) b\n",
-            "  => Record b\n",
-            "empty = x\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            empty
+              :: forall a b
+               . Union (Cons name
+                          ty
+                          tail
+                       ) b
+              => Record b
+            empty = x
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "empty\n",
-                "  :: forall a b\n",
-                "   . Union\n",
-                "       ( Cons name\n",
-                "           ty\n",
-                "           tail\n",
-                "       )\n",
-                "       b\n",
-                "  => Record b\n",
-                "empty = x\n",
-            )
+            indoc! {"
+                module Foo where
+
+                empty
+                  :: forall a b
+                   . Union
+                       ( Cons name
+                           ty
+                           tail
+                       )
+                       b
+                  => Record b
+                empty = x
+            "}
         );
         assert_idempotent(out.as_str());
     }
 
     #[test]
     fn foreign_and_fixity_and_role() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "foreign import unsafeCoerce :: forall a b. a -> b\n\n",
-            "infixl 5 add as +++\n\n",
-            "type role Foo nominal representational\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            foreign import unsafeCoerce :: forall a b. a -> b
+
+            infixl 5 add as +++
+
+            type role Foo nominal representational
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -4487,7 +4631,13 @@ mod tests {
 
     #[test]
     fn qualified_do_and_ado_keep_the_dot() {
-        let src = "module Foo where\n\na = A.do\n  x <- A.a\n  pure x\n";
+        let src = indoc! {"
+            module Foo where
+
+            a = A.do
+              x <- A.a
+              pure x
+        "};
         let out = fmt(src);
         assert!(out.contains("A.do"), "qualifier dot lost: {:?}", out);
         assert!(!out.contains("Ado") && !out.contains("Adodo"), "garbled qualifier: {:?}", out);
@@ -4496,25 +4646,60 @@ mod tests {
 
     #[test]
     fn negative_typ_int_keeps_the_digits() {
-        let src = "module Foo where\n\na :: -1\na = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            a :: -1
+            a = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\na :: -1\na = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                a :: -1
+                a = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn visible_forall_binder_without_kind_has_no_parens() {
-        let src = "module Foo where\n\nreadJSON :: forall @a. Array a\n";
+        let src = indoc! {"
+            module Foo where
+
+            readJSON :: forall @a. Array a
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nreadJSON :: forall @a. Array a\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                readJSON :: forall @a. Array a
+            "}
+        );
         assert_idempotent(src);
     }
 
     #[test]
     fn kinded_forall_binder_keeps_parens() {
-        let src = "module Foo where\n\nfoo :: forall (a :: Type). a\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo :: forall (a :: Type). a
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\nfoo :: forall (a :: Type). a\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo :: forall (a :: Type). a
+            "}
+        );
         assert_idempotent(src);
     }
 
@@ -4529,9 +4714,7 @@ mod tests {
         }
     }
 
-    /// Real-world-ish fixtures under tests/golden should format idempotently. Fixtures
-    /// whose source doesn't already parse cleanly are skipped - some deliberately
-    /// exercise parser error recovery rather than being formattable programs.
+    // Fixtures that fail to parse cleanly are skipped (parser-error-recovery fixtures).
     #[test]
     fn golden_fixtures_format_idempotently() {
         let mut files = Vec::new();
@@ -4564,22 +4747,36 @@ mod tests {
 
     #[test]
     fn symbol_export_import_are_not_double_parenthesized() {
-        let src = "module Foo ((<*>), type (~>)) where\n\nimport Data.Functor ((<$>))\n\nfoo = (<*>)\n";
+        let src = indoc! {"
+            module Foo ((<*>), type (~>)) where
+
+            import Data.Functor ((<$>))
+
+            foo = (<*>)
+        "};
         let out = fmt(src);
-        // An exact match is the real check here - `((<$>))` alone would look like a
-        // double-paren bug, but is actually correct: the outer pair is the (single-
-        // element) import list's own delimiters, the inner pair belongs to the
-        // Symbol's own span (which already covers its parens).
+        // `((<$>))` isn't doubled - outer paren is the import list's, inner is the Symbol's own.
         assert_eq!(
             out,
-            "module Foo ((<*>), type (~>)) where\n\nimport Data.Functor ((<$>))\n\nfoo = (<*>)\n"
+            indoc! {"
+                module Foo ((<*>), type (~>)) where
+
+                import Data.Functor ((<$>))
+
+                foo = (<*>)
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn comment_before_module_keyword_stays_before_it() {
-        let src = "-- top comment\nmodule Foo where\n\nfoo = 1\n";
+        let src = indoc! {"
+            -- top comment
+            module Foo where
+
+            foo = 1
+        "};
         let out = fmt(src);
         assert!(
             out.starts_with("-- top comment\nmodule Foo"),
@@ -4591,7 +4788,16 @@ mod tests {
 
     #[test]
     fn comment_inside_export_list_is_not_relocated_past_the_header() {
-        let src = "module Foo\n  ( a\n  -- mid comment\n  , b\n  ) where\n\na = 1\nb = 2\n";
+        let src = indoc! {"
+            module Foo
+              ( a
+              -- mid comment
+              , b
+              ) where
+
+            a = 1
+            b = 2
+        "};
         let out = fmt(src);
         let where_pos = out.find("where").unwrap();
         let comment_pos = out.find("-- mid comment").unwrap();
@@ -4605,90 +4811,115 @@ mod tests {
 
     #[test]
     fn bare_imports_are_grouped_first_and_separated() {
-        let src = "module Foo where\n\nimport Data.Array (head)\nimport Prelude\nimport Data.Maybe\n\nfoo = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            import Data.Array (head)
+            import Prelude
+            import Data.Maybe
+
+            foo = 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\nimport Data.Maybe\nimport Prelude\n\nimport Data.Array (head)\n\nfoo = 1\n"
+            indoc! {"
+                module Foo where
+                import Data.Maybe
+                import Prelude
+
+                import Data.Array (head)
+
+                foo = 1
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn imports_are_sorted_and_duplicates_merged() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "import Data.Array (tail)\n",
-            "import Control.Bind (class Bind)\n",
-            "import Data.Array (head)\n\n",
-            "foo = 1\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            import Data.Array (tail)
+            import Control.Bind (class Bind)
+            import Data.Array (head)
+
+            foo = 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n",
-                "import Control.Bind (class Bind)\n",
-                "import Data.Array (head, tail)\n\n",
-                "foo = 1\n",
-            )
+            indoc! {"
+                module Foo where
+                import Control.Bind (class Bind)
+                import Data.Array (head, tail)
+
+                foo = 1
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn import_class_sorts_before_types_as_its_own_tier() {
-        // Class imports are their own leading tier (purs-tidy's
-        // `ImportClassCmp`), always ahead of plain type/value names -
-        // not merely alphabetical among "class Eq"/"Foo"/"bar" as rendered
-        // or bare text (both would put `Foo` before `class Eq` here).
-        let src = "module Foo where\n\nimport Data.Foo (Foo, class Eq, bar)\n\nx = 1\n";
+        // Class imports are their own leading tier (purs-tidy's `ImportClassCmp`), not alphabetical.
+        let src = indoc! {"
+            module Foo where
+
+            import Data.Foo (Foo, class Eq, bar)
+
+            x = 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\nimport Data.Foo (class Eq, Foo, bar)\n\nx = 1\n"
+            indoc! {"
+                module Foo where
+                import Data.Foo (class Eq, Foo, bar)
+
+                x = 1
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn import_sort_follows_purs_tidys_five_tier_kind_order() {
-        // purs-tidy's `ordImportComparison` ranks import items by kind before
-        // name: class, then type-operator (`type (~>)`), then plain type,
-        // then plain value, then value-operator - each tier alphabetical
-        // within itself. A flat alphabetical sort (on either the rendered
-        // "class "/"type "-prefixed text or the bare name alone) would put
-        // `(>>=)` first (low-ASCII `(`) instead of last, and wouldn't place
-        // `type (..)` ahead of the plain type names.
-        let src = concat!(
-            "module Foo where\n\n",
-            "import Db.Type (Name, class GetPk, type (..), toSqlValue, (>>=), class GetIndex, fromSqlValue)\n\n",
-            "x = 1\n",
-        );
+        // Kind order is class, type-op, type, value, value-op (purs-tidy's `ordImportComparison`), not flat alphabetical.
+        let src = indoc! {"
+            module Foo where
+
+            import Db.Type (Name, class GetPk, type (..), toSqlValue, (>>=), class GetIndex, fromSqlValue)
+
+            x = 1
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n",
-                "import Db.Type (class GetIndex, class GetPk, type (..), Name, fromSqlValue, toSqlValue, (>>=))\n\n",
-                "x = 1\n",
-            )
+            indoc! {"
+                module Foo where
+                import Db.Type (class GetIndex, class GetPk, type (..), Name, fromSqlValue, toSqlValue, (>>=))
+
+                x = 1
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn multiline_type_signature_stays_expanded() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "f\n",
-            "  :: forall a\n",
-            "   . Show a\n",
-            "  => a\n",
-            "  -> a\n",
-            "  -> String\n",
-            "f a b = show a\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            f
+              :: forall a
+               . Show a
+              => a
+              -> a
+              -> String
+            f a b = show a
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -4696,36 +4927,53 @@ mod tests {
 
     #[test]
     fn flat_type_signature_stays_flat() {
-        let src = "module Foo where\n\nf :: forall a. Show a => a -> a -> String\nf a b = show a\n";
+        let src = indoc! {"
+            module Foo where
+
+            f :: forall a. Show a => a -> a -> String
+            f a b = show a
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// `Typ::Paren`'s counterpart of `paren_expands_when_source_has_a_newline_inside` -
-    /// a parenthesized type that breaks internally forces the same `( ` ... `)`
-    /// block style (and the same "break `::` first rather than move the `)`
-    /// back" fix) that a parenthesized value gets.
     #[test]
     fn typ_paren_expands_when_source_has_a_newline_inside() {
-        // The paren's own hang lines up under its real column - right after
-        // `( `, wherever that lands once glued after `:: ` - not an
-        // approximate level bump; see the "floor" model in FORMATTER.md.
-        let src = "module Foo where\n\nf :: (Int ->\n  String)\nf = undefined\n";
+        // Hangs under its own real column (after glued `( `), not an approximate level bump.
+        let src = indoc! {"
+            module Foo where
+
+            f :: (Int ->
+              String)
+            f = undefined
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nf\n  :: ( Int\n       -> String\n     )\nf = undefined\n"
+            indoc! {"
+                module Foo where
+
+                f
+                  :: ( Int
+                       -> String
+                     )
+                f = undefined
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// `Typ::App`'s counterpart of `app_expands_one_arg_per_line_when_source_has_a_newline_between_args` -
-    /// previously `Typ::App` had no multiline handling at all and always glued
-    /// every argument flat with a single space.
     #[test]
     fn typ_app_expands_one_arg_per_line_when_source_has_a_newline_between_args() {
-        let src = "module Foo where\n\nf :: Bar\n  Baz\n  Qux\nf = x\n";
+        let src = indoc! {"
+            module Foo where
+
+            f :: Bar
+              Baz
+              Qux
+            f = x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -4733,219 +4981,210 @@ mod tests {
 
     #[test]
     fn typ_app_directly_after_a_broken_sig_gets_an_extra_hang_level() {
-        // `typ` is glued directly after `:: ` here (a fixed-width raw token
-        // the ambient indent baseline has no memory of) - if `typ` is a
-        // nesting shape (`Array { ... }`) that itself breaks, it needs to
-        // hang under `Array`'s own real column (`hang_glued`), or the
-        // resulting block looks shallower than `Array` itself.
-        let src =
-            "module Foo where\n\nf\n  :: Array\n       { from :: RowId\n       , to :: RowId\n       }\nf = x\n";
+        // Glued after `:: ` (a fixed-width token), so it must hang_glued under its own real column.
+        let src = indoc! {"
+            module Foo where
+
+            f
+              :: Array
+                   { from :: RowId
+                   , to :: RowId
+                   }
+            f = x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Regression test: `print_typ_arrow_chain` printed every segment with a
-    /// bare `print_typ`, unlike `print_sig_typ`'s own `needs_hang` check for
-    /// a bare (non-arrow) signature type - so a nesting shape (`Array
-    /// {...}`) that's the *first* segment of an arrow chain (glued directly
-    /// after `:: `, same as `typ_app_directly_after_a_broken_sig_gets_an_extra_hang_level`
-    /// above, just with a `-> ...` tail after it) never got its extra hang
-    /// level, landing a whole level shallower than `Array` itself instead of
-    /// past it.
+    // An arrow chain's first segment needs the same needs_hang check as a bare signature type.
     #[test]
     fn typ_arrow_chain_segment_gets_the_same_extra_hang_as_a_bare_sig() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "linkRows\n",
-            "  :: Array\n",
-            "       { source :: RowId\n",
-            "       , target :: LinkId.LinkId\n",
-            "       }\n",
-            "  -> Ctx _ _ Unit\n",
-            "linkRows = linkRowsSql >>> DbCtx.runSql\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            linkRows
+              :: Array
+                   { source :: RowId
+                   , target :: LinkId.LinkId
+                   }
+              -> Ctx _ _ Unit
+            linkRows = linkRowsSql >>> DbCtx.runSql
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// The same missing hang, reached through `print_sig_typ`'s own
-    /// `needs_hang` branch directly (no arrow chain involved) rather than
-    /// through `print_typ_arrow_chain` - a `Typ::App` whose own argument is a
-    /// `Typ::Paren`-wrapped operator chain, glued after `:: `. `needs_hang`
-    /// hangs under `Db.Table`'s own real column (`hang_glued`), not an
-    /// approximate level bump off the ambient baseline.
+    // Same needs_hang gotcha, reached via print_sig_typ directly (no arrow chain involved).
     #[test]
     fn typ_app_paren_op_chain_directly_after_a_broken_sig_gets_an_extra_hang_level() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "tableLinkRow\n",
-            "  :: Db.Table\n",
-            "       ( Db.Pk (\"row_a\" .. \"row_b\")\n",
-            "           .. Db.Index \"row_b\"\n",
-            "           .. Db.Name \"row_link_v0\"\n",
-            "       )\n",
-            "       LinkRowR\n",
-            "tableLinkRow = Db.table @\"row_link_v0\"\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            tableLinkRow
+              :: Db.Table
+                   ( Db.Pk (\"row_a\" .. \"row_b\")
+                       .. Db.Index \"row_b\"
+                       .. Db.Name \"row_link_v0\"
+                   )
+                   LinkRowR
+            tableLinkRow = Db.table @\"row_link_v0\"
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// `print_typ_constrained_chain`'s counterpart of the same fix: the
-    /// `body` after the last `=> ` is glued the same way a bare `:: `'s type
-    /// or an arrow chain's segment is, so it needs the same `print_typ_glued`
-    /// treatment when it's a nesting shape.
+    // Same needs_hang gotcha, for the body after a constrained chain's last `=> `.
     #[test]
     fn typ_constrained_chain_body_gets_the_same_extra_hang_as_a_bare_sig() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "f\n",
-            "  :: Eq a\n",
-            "  => Array\n",
-            "       { x :: Int\n",
-            "       , y :: Int\n",
-            "       }\n",
-            "f = x\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            f
+              :: Eq a
+              => Array
+                   { x :: Int
+                   , y :: Int
+                   }
+            f = x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Regression test: a broken type-operator chain used to add its own
-    /// indent level for the operator (like a value's operator chain does),
-    /// drifting deeper than the non-operator break that introduced it. Type
-    /// operators get no extra indent - `.. B`/`.. C` line up with `A`, one
-    /// level in from `type T =`, not two.
+    // Unlike a value operator chain, type operators get no extra indent level.
     #[test]
     fn typ_operator_chain_does_not_add_its_own_indent() {
-        let src = "module Foo where\n\ntype T =\n  A\n    .. B\n    .. C\nf = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            type T =
+              A
+                .. B
+                .. C
+            f = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\ntype T =\n  A\n  .. B\n  .. C\nf = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                type T =
+                  A
+                  .. B
+                  .. C
+                f = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
-    /// `Decl::Type`'s counterpart of `paren_expands_when_source_has_a_newline_inside` -
-    /// previously a type alias's `=` had no "break me instead of letting the
-    /// closing `)` move back" handling at all (unlike a value's `=` or a
-    /// signature's `::`).
     #[test]
     fn type_alias_rhs_breaks_when_its_paren_would_break() {
-        let src = "module Foo where\n\ntype T = (A\n  -> B)\nf = 1\n";
+        let src = indoc! {"
+            module Foo where
+
+            type T = (A
+              -> B)
+            f = 1
+        "};
         let out = fmt(src);
-        assert_eq!(out, "module Foo where\n\ntype T =\n  ( A\n    -> B\n  )\nf = 1\n");
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                type T =
+                  ( A
+                    -> B
+                  )
+                f = 1
+            "}
+        );
         assert_idempotent(src);
     }
 
-    /// Regression test: `in_broken_sig` (which forces a signature's/alias's
-    /// chains to stay fully expanded once the source deliberately wrapped
-    /// them) used to leak into parenthesized sub-expressions, so a flat,
-    /// single-line operator chain nested inside a paren got force-broken
-    /// just because the *outer* declaration happened to be multiline. A
-    /// paren is its own bracketed scope (like a row's braces already are;
-    /// see `print_row`'s own reset) and must decide its own contents'
-    /// multiline-ness independently. The outer chain's own operator
-    /// continuation (`.. Db.Index`) gets its own hang level past the `( `
-    /// it's glued to - see `typ_op_chain_gets_its_own_hang_when_not_in_a_broken_sig`
-    /// - while the flat, nested `("region_id" .. "type")` stays untouched.
+    // A paren is its own scope for multiline-ness; in_broken_sig must not leak into it.
     #[test]
     fn broken_type_alias_does_not_force_a_flat_nested_paren_to_expand() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "type Table =\n",
-            "  Db.Table\n",
-            "    ( Db.Pk \"id\"\n",
-            "        .. Db.Index (\"region_id\" .. \"type\")\n",
-            "    )\n",
-            "    Row\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            type Table =
+              Db.Table
+                ( Db.Pk \"id\"
+                    .. Db.Index (\"region_id\" .. \"type\")
+                )
+                Row
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Regression test: a `Typ::Op` chain glued directly after a `Typ::Paren`'s
-    /// `( ` (which resets `in_broken_sig` - see `print_paren_block`) needs its
-    /// own hang level for its operator continuations, the same way `Expr::Op`
-    /// always does - without it, `.. Db.Index`/`.. Db.Name` land flush
-    /// with `Db.Pk`, one level shallower than they should (only as deep as
-    /// the paren's own content baseline, not past it). This is distinct from
-    /// `typ_operator_chain_does_not_add_its_own_indent`, where the chain *is*
-    /// the flattened continuation of a signature/alias's own break
-    /// (`in_broken_sig` true) and must stay flush with that break's column
-    /// instead.
+    // Glued after a paren's `( ` (in_broken_sig reset), the chain hangs like Expr::Op does.
     #[test]
     fn typ_op_chain_gets_its_own_hang_when_not_in_a_broken_sig() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "type Route =\n",
-            "  Schema\n",
-            "    ( Db.Pk \"key\"\n",
-            "        .. Db.Index \"row_b\"\n",
-            "        .. Db.Name \"row_idem_v0\"\n",
-            "    )\n",
-            "    IdemRowR\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            type Route =
+              Schema
+                ( Db.Pk \"key\"
+                    .. Db.Index \"row_b\"
+                    .. Db.Name \"row_idem_v0\"
+                )
+                IdemRowR
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Parser regression test: `Db.Pk ("key")` used to lose `"key"`
-    /// entirely, printing `Db.Pk ()`. Root cause was in `row_label`, not
-    /// the printer - `row`'s stop condition treats a `String`/`RawString` as
-    /// a possible row-label start (quoted labels like `("my-label" ::
-    /// Int)`), so parsing `("key")` first tried it as an empty row type: the
-    /// old `row_label` committed to consuming `"key"` as a label via
-    /// `label(p)?` *before* checking for the `::` that would confirm it
-    /// really was one, and that consumption didn't roll back when the `::`
-    /// check then failed. `sep_until` saw the (spuriously) failed field
-    /// attempt, stopped with zero fields, and by then `"key"` was already
-    /// gone - so the very next token looked like the closing `)` the
-    /// row-alternative wanted, and `typ_atom`'s `alt!` never got to try the
-    /// `Typ::Paren` alternative that should have parsed `"key"` as an
-    /// ordinary type. Fixed by checking for `::` with lookahead before
-    /// committing to a label at all (`row_label`, matching the existing
-    /// `record_label`/`record_binder` style) instead of consume-then-fail.
+    // Parser regression: row_label consumed a quoted label before checking for `::`, losing it when there wasn't one.
     #[test]
     fn paren_wrapped_string_typ_is_not_mistaken_for_an_empty_row() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "tableIdemRow\n",
-            "  :: Db.Table\n",
-            "       ( Db.Pk (\"key\")\n",
-            "           .. Db.Index \"row_b\"\n",
-            "           .. Db.Name \"row_idem_v0\"\n",
-            "       )\n",
-            "       IdemRowR\n",
-            "tableIdemRow = x\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            tableIdemRow
+              :: Db.Table
+                   ( Db.Pk (\"key\")
+                       .. Db.Index \"row_b\"
+                       .. Db.Name \"row_idem_v0\"
+                   )
+                   IdemRowR
+            tableIdemRow = x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// A quoted row label immediately followed by `::` must still parse as
-    /// a label, not get rejected by the same lookahead that now bails out on
-    /// a bare string used as an ordinary type (see the test above).
+    // Companion to the test above: a quoted label immediately followed by `::` must still parse.
     #[test]
     fn quoted_row_label_still_parses() {
-        let src = "module Foo where\n\ntype Foo = (\"my-label\" :: Int, normal :: String)\n";
+        let src = indoc! {"
+            module Foo where
+
+            type Foo = (\"my-label\" :: Int, normal :: String)
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// The formatter must never break a type that was written on a single
-    /// line into multiple lines, no matter how many nested parens/operators/
-    /// applications it contains - it only ever preserves breaks the source
-    /// already had.
     #[test]
     fn single_line_type_alias_with_nested_parens_and_operators_stays_flat() {
-        let src = "module Foo where\n\ntype Table = Db.Table (Db.Pk \"id\" .. Db.Index (\"region_id\" .. \"type\")) Row\n";
+        let src = indoc! {"
+            module Foo where
+
+            type Table = Db.Table (Db.Pk \"id\" .. Db.Index (\"region_id\" .. \"type\")) Row
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -4953,215 +5192,209 @@ mod tests {
 
     #[test]
     fn row_type_expands_one_field_per_line_when_source_has_a_newline() {
-        // The row's own `(` glues flat right after `Record ` (its argument
-        // never broke from the head in the source, so `print_spine_args`
-        // never moves it) - its own fields then hang under its real column,
-        // not a level bump. See the "floor" model in FORMATTER.md.
-        let src = "module Foo where\n\nf :: forall r. Record (a :: Int,\n  b :: String)\nf r = r\n";
+        // Fields hang under the row's own real column after glued `(`, not a level bump.
+        let src = indoc! {"
+            module Foo where
+
+            f :: forall r. Record (a :: Int,
+              b :: String)
+            f r = r
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nf :: forall r. Record ( a :: Int\n                      , b :: String\n                      )\nf r = r\n"
+            indoc! {"
+                module Foo where
+
+                f :: forall r. Record ( a :: Int
+                                      , b :: String
+                                      )
+                f r = r
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn comment_inside_a_multiline_row_stays_attached_to_its_own_field() {
-        // Regression test: `print_row` used to have no comment handling at
-        // all (always flat, no per-field flush) - a comment here would
-        // silently ride past the whole row to wherever the next flush point
-        // happened to be.
-        let src = concat!(
-            "module Foo where\n\n",
-            "f :: forall r. Record (a :: Int\n",
-            "  -- comment\n",
-            "  , b :: String)\n",
-            "f r = r\n",
-        );
+        // print_row previously had no per-field comment flush at all.
+        let src = indoc! {"
+            module Foo where
+
+            f :: forall r. Record (a :: Int
+              -- comment
+              , b :: String)
+            f r = r
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            "module Foo where\n\nf :: forall r. Record ( a :: Int\n                      -- comment\n                      , b :: String\n                      )\nf r = r\n"
+            indoc! {"
+                module Foo where
+
+                f :: forall r. Record ( a :: Int
+                                      -- comment
+                                      , b :: String
+                                      )
+                f r = r
+            "}
         );
         assert_idempotent(src);
     }
 
-    /// Regression test for the "floor" model (see FORMATTER.md): a type-level
-    /// `::`/`=>`/`->`/`.` is only ever a floor that whatever follows it glues
-    /// onto - it never moves, no matter how much the glued thing itself goes
-    /// on to break. A record glued right after `=> `/`-> ` must stay glued,
-    /// with its own fields hanging under its real column, rather than
-    /// relocating `{` onto a deeper line with `=>`/`->` left alone above it.
+    // A record glued after `=>`/`->` stays glued (the "floor" model); see FORMATTER.md.
     #[test]
     fn typ_record_glued_after_a_broken_sig_hangs_in_place_instead_of_moving_down() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "unpack\n",
-            "  :: forall unpacked packed\n",
-            "   . Lacks \"type_index\" packed\n",
-            "  => Db.Pack\n",
-            "       { balance :: Maybe Money.Money\n",
-            "       | unpacked\n",
-            "       }\n",
-            "       { date_created :: Maybe ExDate\n",
-            "       , type :: RowType\n",
-            "       | packed\n",
-            "       }\n",
-            "  => { date_created :: Maybe ExDate\n",
-            "     , type :: RowType\n",
-            "     , type_index :: Int\n",
-            "     | packed\n",
-            "     }\n",
-            "  -> { balance :: Maybe Money.Money\n",
-            "     | unpacked\n",
-            "     }\n",
-            "unpack = x\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            unpack
+              :: forall unpacked packed
+               . Lacks \"type_index\" packed
+              => Db.Pack
+                   { balance :: Maybe Money.Money
+                   | unpacked
+                   }
+                   { date_created :: Maybe ExDate
+                   , type :: RowType
+                   | packed
+                   }
+              => { date_created :: Maybe ExDate
+                 , type :: RowType
+                 , type_index :: Int
+                 | packed
+                 }
+              -> { balance :: Maybe Money.Money
+                 | unpacked
+                 }
+            unpack = x
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// `Typ::Paren`'s counterpart of the same fix, for `print_paren_block`:
-    /// `(` glued directly after an arrow's `-> ` hangs its own nested arrow
-    /// chain under its own first token (`c`, not an approximate level bump),
-    /// and its closing `)` lines up under its own `(` - not the outer `->`'s
-    /// floor, which can be a completely different column once `(` is glued
-    /// mid-line.
+    // The closing `)` lines up under its own `(`, not the outer `->`'s floor column.
     #[test]
     fn typ_paren_glued_after_arrow_hangs_under_its_own_first_token() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "a\n",
-            "  :: forall b c d\n",
-            "   . b\n",
-            "  -> (c\n",
-            "      -> Int\n",
-            "      -> String)\n",
-            "  -> d\n",
-            "a x y = z\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            a
+              :: forall b c d
+               . b
+              -> (c
+                  -> Int
+                  -> String)
+              -> d
+            a x y = z
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "a\n",
-                "  :: forall b c d\n",
-                "   . b\n",
-                "  -> ( c\n",
-                "       -> Int\n",
-                "       -> String\n",
-                "     )\n",
-                "  -> d\n",
-                "a x y = z\n",
-            )
+            indoc! {"
+                module Foo where
+
+                a
+                  :: forall b c d
+                   . b
+                  -> ( c
+                       -> Int
+                       -> String
+                     )
+                  -> d
+                a x y = z
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn multiline_operator_chain_stays_expanded() {
-        let src = "module Foo where\n\nfoo =\n  a\n    >>> b\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              a
+                >>> b
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Regression test: an array item glued directly after `[ `/`, ` (a
-    /// fixed-width raw token) that's itself an operator chain used to hang
-    /// its own continuation one level too shallow - the operator landed
-    /// flush with the item's own head column instead of visibly past it,
-    /// since `[ `/`, ` are exactly `INDENT` wide (see `list()`'s `item_hang`).
-    /// Unlike `multiline_operator_chain_stays_expanded` above (glued after a
-    /// declaration's own `=`, a genuine "floor"), a list item needs the extra
-    /// level so it isn't mistaken for a sibling item at the list's own comma
-    /// column.
+    // `[ `/`, ` are exactly INDENT wide, so a naive hang would land flush with a sibling item.
     #[test]
     fn array_item_operator_chain_hangs_past_its_own_head() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "buttons =\n",
-            "  [ Widget.create { onclick: ClickedClose false, children: [ Html.text \"Cancel\" ] }\n",
-            "      # Widget.isWide true\n",
-            "      # Widget.render\n",
-            "  , Widget.create { onclick: confirmMsg, children: [ Html.text \"Done\" ] }\n",
-            "      # Widget.isPrimary\n",
-            "      # Widget.isWide true\n",
-            "      # Widget.render\n",
-            "  ]\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            buttons =
+              [ Widget.create { onclick: ClickedClose false, children: [ Html.text \"Cancel\" ] }
+                  # Widget.isWide true
+                  # Widget.render
+              , Widget.create { onclick: confirmMsg, children: [ Html.text \"Done\" ] }
+                  # Widget.isPrimary
+                  # Widget.isWide true
+                  # Widget.render
+              ]
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Regression test: a `list()` item that's itself a *nested* `list()`-
-    /// based value (a record, here) glued directly after `[ ` used to
-    /// relocate its own opening brace onto a fresh, deeper line - doubling
-    /// up on `item_hang`'s own extra level instead of just hanging its
-    /// fields off the column it's already glued to (see `glued_floor`).
-    /// The record here has nothing forcing this array to be anything but a
-    /// single item, so the only thing making it expand at all is the
-    /// record's own internal break - exactly the shape that exposed the bug.
+    // Previously doubled up on item_hang's level instead of gluing to the `[` column (glued_floor).
     #[test]
     fn array_sole_item_record_stays_glued_after_open_bracket() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "a =\n",
-            "  [ { c: 1\n",
-            "    , d: 2\n",
-            "    }\n",
-            "  ]\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            a =
+              [ { c: 1
+                , d: 2
+                }
+              ]
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Regression test: the same `glued_floor` bug as
-    /// `array_sole_item_record_stays_glued_after_open_bracket`, but with the
-    /// record as the head of an operator chain (`{...} # f # g`) rather than
-    /// the whole item on its own - confirms the fix composes with
-    /// `item_hang`'s own extra level for the chain's continuations instead
-    /// of stacking a second, spurious level on top of the record's own
-    /// brace.
+    // Same glued_floor fix as the test above, composed with an operator chain head.
     #[test]
     fn array_sole_item_operator_chain_head_record_stays_glued() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "a =\n",
-            "  x y\n",
-            "    [ { c: 1\n",
-            "      , d: 2\n",
-            "      }\n",
-            "        # f\n",
-            "        # g\n",
-            "    ]\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            a =
+              x y
+                [ { c: 1
+                  , d: 2
+                  }
+                    # f
+                    # g
+                ]
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Same `glued_floor` bug as the two `array_sole_item_*` tests above,
-    /// but for `Expr::App`'s own `own_indent` instead of a nested `list()`
-    /// call: a single-item array whose item is a call with an argument that
-    /// itself breaks (a record) must not relocate the whole call onto its
-    /// own line below an empty `[`, doubling up on `item_hang`'s own level.
+    // Same glued_floor fix, for Expr::App's own_indent rather than a nested list().
     #[test]
     fn array_sole_item_call_head_stays_glued_after_open_bracket() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "a =\n",
-            "  [ g\n",
-            "      { b: 1\n",
-            "      , c: 2\n",
-            "      }\n",
-            "      h\n",
-            "  ]\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            a =
+              [ g
+                  { b: 1
+                  , c: 2
+                  }
+                  h
+              ]
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -5189,20 +5422,9 @@ mod tests {
         assert_idempotent(src);
     }
 
-    /// Regression test: an operand glued flat after an operator (no source
-    /// break before it) can still relocate itself onto its own line
-    /// (`Expr::App`'s own `own_indent`, when the operand is a call whose own
-    /// argument breaks) - which used to make the *first* formatting pass
-    /// stay flat (correctly, matching the source) while the *second* pass,
-    /// reparsing that output, saw a break between `first` and the operand
-    /// that wasn't really there in the original source and switched the
-    /// whole chain to the one-operator-per-line style: not idempotent. Now
-    /// decided by rendering (`expr_would_break`, like `list()`/`Expr::App`'s
-    /// own equivalent generalizations), so the *first* pass already produces
-    /// the stable, multiline-chain shape directly.
+    // Used to format flat on the first pass but reflow to one-per-line on the second (not idempotent).
     #[test]
     fn operator_chain_operand_that_would_break_on_its_own_expands_the_whole_chain() {
-        // `b` stays glued right after `$` - see `glued_floor`.
         let src = indoc! {"
             module Foo where
 
@@ -5228,14 +5450,18 @@ mod tests {
         assert_idempotent(src);
     }
 
-    /// Regression test: a right-associative operator (`<>` is `R(6)`, see
-    /// `op_fixity`) parses `a <> b <> c <> d` as a right-nested tree, so each
-    /// subsequent `Op` node used to print *inside* the previous one's own
-    /// `indent_in`/`newline` block - drifting one indent level deeper per
-    /// operator instead of lining up flush (see `op_spine`).
+    // Right-associative chains parse as a right-nested tree; op_spine keeps segments flush, not drifting deeper.
     #[test]
     fn multiline_operator_chain_of_three_or_more_stays_at_one_indent_level() {
-        let src = "module Foo where\n\nfoo =\n  a\n    <> b\n    <> c\n    <> d\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              a
+                <> b
+                <> c
+                <> d
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -5243,42 +5469,56 @@ mod tests {
 
     #[test]
     fn operator_chain_operand_that_is_itself_a_broken_call_hangs_one_level_deeper() {
-        // An operand is glued directly after its operator, so if the operand
-        // itself breaks (an `App` call whose argument is on its own line),
-        // that break needs to land one level deeper than the chain's own
-        // continuation - not at the same level, which would look like the
-        // call's argument is just another step of the chain. The call
-        // itself (`List.map (...)`) stays glued right after `#` - `op ` is
-        // its own floor (`glued_floor`), the same way `open `/`, ` already
-        // is for a `list()` item, so the call's own `own_indent` doesn't
-        // relocate it a second time on top of that.
-        let src = "module Foo where\n\nf rs =\n  rs\n    # List.map\n        ( \\r ->\n            r\n              # empty\n        )\n    # List.toArray\n";
+        // Must land one level deeper than the chain's continuation, else it reads as another chain step.
+        let src = indoc! {"
+            module Foo where
+
+            f rs =
+              rs
+                # List.map
+                    ( \\r ->
+                        r
+                          # empty
+                    )
+                # List.toArray
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// An operand must hang under its own real column (`op `'s width
-    /// included), not a plain `indent_in()` off the chain's ambient level -
-    /// invisible for a one-char operator like `#` (`"# "` happens to be
-    /// exactly one `INDENT` wide), but for a wider operator (`<#>`) the
-    /// operand's own further break would otherwise land level with the
-    /// operand itself instead of past it.
+    // A wide operator like `<#>` exposes a gap invisible with `#` (exactly INDENT wide).
     #[test]
     fn operator_chain_lambda_operand_case_body_hangs_under_the_lambda_not_the_chain() {
-        let src = "module Foo where\n\nfoo =\n  a\n    <#> \\x ->\n          case y of\n            true -> 1\n            false -> 2\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              a
+                <#> \\x ->
+                      case y of
+                        true -> 1
+                        false -> 2
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
     }
 
-    /// Same bug, for a call operand whose own argument relocates (see
-    /// `operator_chain_operand_that_is_itself_a_broken_call_hangs_one_level_deeper`
-    /// above) - `f`'s paren argument needs to hang under `f`'s own column,
-    /// not the chain's ambient level.
+    // Same gotcha as the test above, for a call operand's own relocating argument.
     #[test]
     fn operator_chain_call_operand_paren_arg_hangs_under_the_call_not_the_chain() {
-        let src = "module Foo where\n\nfoo =\n  a\n    <#> f\n          ( b\n              >>> c\n          )\n          d\n";
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              a
+                <#> f
+                      ( b
+                          >>> c
+                      )
+                      d
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -5286,14 +5526,15 @@ mod tests {
 
     #[test]
     fn comment_before_let_binding_is_not_relocated() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "foo = let\n",
-            "  a = 1\n",
-            "  -- a comment\n",
-            "  b = 2\n",
-            "in a { x: 1 }\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            foo = let
+              a = 1
+              -- a comment
+              b = 2
+            in a { x: 1 }
+        "};
         let out = fmt(src);
         let comment_pos = out.find("-- a comment").expect("comment lost");
         let record_pos = out.find("{ x: 1 }").expect("record missing");
@@ -5307,24 +5548,26 @@ mod tests {
 
     #[test]
     fn comment_before_do_stmt_and_case_branch_is_not_relocated() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "foo = do\n",
-            "  a\n",
-            "  -- a comment\n",
-            "  b\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            foo = do
+              a
+              -- a comment
+              b
+        "};
         let out = fmt(src);
         assert!(out.contains("-- a comment"), "comment lost: {:?}", out);
         assert_idempotent(src);
 
-        let src2 = concat!(
-            "module Foo where\n\n",
-            "foo = case x of\n",
-            "  A -> 1\n",
-            "  -- a comment\n",
-            "  B -> 2\n",
-        );
+        let src2 = indoc! {"
+            module Foo where
+
+            foo = case x of
+              A -> 1
+              -- a comment
+              B -> 2
+        "};
         let out2 = fmt(src2);
         assert!(out2.contains("-- a comment"), "comment lost: {:?}", out2);
         assert_idempotent(src2);
@@ -5332,17 +5575,7 @@ mod tests {
 
     #[test]
     fn deeply_nested_flat_literal_formats_without_exponential_blowup() {
-        // Regression test: `list()`'s multiline check used to render every
-        // item into a scratch buffer to check for a `'\n'`, then print it
-        // again for real - a call whose args (or an array's/record's items)
-        // never break still paid for two full renders of each, and since an
-        // item can itself be a nested `Array`/`Record`, that doubling
-        // recursed: `O(2^depth)` instead of `O(depth)`. A real
-        // deeply-nested-but-entirely-flat record literal (an XML-shaped
-        // test fixture on one line) hit this and never finished printing.
-        // This depth (30) would take unreasonably long (or overflow a
-        // `-release` binary's stack) if the exponential behavior ever comes
-        // back - the real value of this test is that it completes at all.
+        // Regression: double-rendering to check for multiline used to recurse O(2^depth).
         let depth = 30;
         let mut inner = "1".to_string();
         for _ in 0..depth {
@@ -5356,43 +5589,37 @@ mod tests {
 
     #[test]
     fn record_update_target_relocates_away_from_its_braces_on_a_source_break() {
-        // A record update (`RecordStore store { store = ... }`) whose source
-        // already broke between `store` and `{` must keep that break, not
-        // re-glue onto one line on reformat. Record update binds tighter
-        // than application (`store { ... }` is one `Expr::Update` atom,
-        // applied as `App`'s single argument), so `App`'s own spine-arg
-        // breaking only ever sees this whole node's span - the internal
-        // break between the target and its own `{` needed its own check.
-        // Once `Expr::Update` reports that internal break, the existing "an
-        // argument that would break relocates the whole call" rule takes
-        // over, same as it already does for a plain `Record` argument.
-        let src = concat!(
-            "module Foo where\n\n",
-            "reInsert event =\n",
-            "  RecordStore store\n",
-            "    { store = Map.insert (recordId event) (Pending event) store.store }\n",
-        );
+        // Expr::Update's internal target/`{` break needed its own check (App only sees the whole atom).
+        let src = indoc! {"
+            module Foo where
+
+            reInsert event =
+              RecordStore store
+                { store = Map.insert (recordId event) (Pending event) store.store }
+        "};
         let out = fmt(src);
         assert_eq!(
             out,
-            concat!(
-                "module Foo where\n\n",
-                "reInsert event =\n",
-                "  RecordStore\n",
-                "    store\n",
-                "      { store = Map.insert (recordId event) (Pending event) store.store }\n",
-            )
+            indoc! {"
+                module Foo where
+
+                reInsert event =
+                  RecordStore
+                    store
+                      { store = Map.insert (recordId event) (Pending event) store.store }
+            "}
         );
         assert_idempotent(src);
     }
 
     #[test]
     fn record_update_target_stays_glued_when_source_had_no_break() {
-        let src = concat!(
-            "module Foo where\n\n",
-            "reInsert event =\n",
-            "  RecordStore store { store = Map.insert (recordId event) (Pending event) store.store }\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            reInsert event =
+              RecordStore store { store = Map.insert (recordId event) (Pending event) store.store }
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);
@@ -5400,18 +5627,16 @@ mod tests {
 
     #[test]
     fn expr_typed_relocates_the_double_colon_like_a_signature_when_the_type_would_break() {
-        // `Expr::Typed`'s `:: Typ` relocates the same way every other
-        // `name :: Typ` site does (`print_sig_typ`), instead of always
-        // gluing flat and letting a multi-line arrow type extend rightward.
-        let src = concat!(
-            "module Foo where\n\n",
-            "foo =\n",
-            "  bar\n",
-            "    # ( fromSerializable\n",
-            "          :: VariantStorable (pending :: ProxyStorable \"pending\")\n",
-            "          -> Variant (pending :: Proxy \"pending\")\n",
-            "      )\n",
-        );
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              bar
+                # ( fromSerializable
+                      :: VariantStorable (pending :: ProxyStorable \"pending\")
+                      -> Variant (pending :: Proxy \"pending\")
+                  )
+        "};
         let out = fmt(src);
         assert_eq!(out, src);
         assert_idempotent(src);

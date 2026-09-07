@@ -319,9 +319,8 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
     }
 }
 
-/// Reads `arg` as a file path, except the literal `"-"`, which reads all of
-/// stdin instead - lets `-f`/`-c` take piped input the same way `purs-tidy`
-/// and most other CLI formatters treat a bare `-`.
+/// Reads `arg` as a file path, except `"-"`, which reads stdin instead
+/// (matches `purs-tidy` and most other CLI formatters).
 fn read_source(arg: &str) -> io::Result<String> {
     if arg == "-" {
         let mut buf = String::new();

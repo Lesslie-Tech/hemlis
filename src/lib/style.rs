@@ -1021,10 +1021,7 @@ fn rule_prefer_let(
 
 struct StyleChecker<'a> {
     source: &'a str,
-    /// Byte offset of the start of each source line, computed once up front -
-    /// every rule that slices source text out by span (called once per AST
-    /// node during the traversal) would otherwise re-scan the whole source
-    /// from scratch on each call.
+    /// Computed once so per-node span lookups don't rescan the source each time.
     line_starts: Vec<usize>,
     diagnostics: Vec<StyleDiagnostic>,
     /// The module defines its own top-level `pure`, so the unqualified-`pure`

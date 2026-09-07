@@ -842,20 +842,9 @@ fn simple_typ_var_bindings<'t>(p: &mut P<'t>) -> Vec<TypVarBinding> {
 }
 
 fn row_label<'t>(p: &mut P<'t>) -> Option<(Label, Typ)> {
-    // `row`'s stop condition treats a `String`/`RawString` as a possible row
-    // label start (quoted labels, e.g. `("my-label" :: Int)`), so this also
-    // has to recognize a *non*-label string - a `Typ::Str` used as an
-    // ordinary type, e.g. `Foo.Bar ("key")` - and bail out without
-    // consuming it. Committing via `label(p)?` first and only then checking
-    // for `::` would consume the string on the way to failing, and that
-    // partial consumption doesn't roll back: `sep_until` sees this row-field
-    // attempt fail, stops, and returns an empty `Row` with the string
-    // silently gone - `typ_atom`'s `alt!` then finds the very next token is
-    // already the closing paren it wanted and never falls through to the
-    // `Typ::Paren` alternative that should have parsed it. Checking with
-    // lookahead first (matching `record_label`/`record_binder`'s existing
-    // "peek before committing" style below) avoids ever consuming on a path
-    // that doesn't pan out.
+    // Must peek for `::` before committing to `label(p)?`: a plain `Typ::Str` (e.g.
+    // `Foo.Bar ("key")`) would otherwise get consumed here on the way to failing,
+    // and that partial consumption doesn't roll back through `sep_until`.
     if !matches!(p.peek2t(), (_, Some(T::ColonColon))) {
         return None;
     }
@@ -888,9 +877,8 @@ fn row<'t>(p: &mut P<'t>) -> Option<Row> {
 enum ExprOp {
     Op(QOp),
     Infix(Expr),
-    // Carries the atom this lookahead already had to fully parse just to
-    // confirm one exists - see `pratt_expr`'s outer lookahead, which reuses
-    // it as `rhs` instead of parsing the same atom a second time.
+    // Carries the atom the lookahead already parsed, so `pratt_expr` can reuse it
+    // as `rhs` instead of parsing it again.
     App(Expr),
 }
 
@@ -1050,9 +1038,7 @@ fn expr_mrg(op: ExprOp, lhs: Expr, rhs: Expr) -> Expr {
     match op {
         ExprOp::Op(op) => Expr::Op(b!(lhs), op, b!(rhs)),
         ExprOp::Infix(op) => Expr::Infix(b!(lhs), b!(op), b!(rhs)),
-        // `rhs` (extracted by `pratt_expr` before this call - see its own
-        // comment) is already the atom this variant carries; the payload
-        // itself is no longer needed here.
+        // `rhs` is already the atom this variant carries (see pratt_expr).
         ExprOp::App(_) => Expr::App(b!(lhs), b!(rhs)),
     }
 }
@@ -1087,22 +1073,9 @@ fn pratt_expr<'t>(p: &mut P<'t>, mut lhs: Expr, prec: usize) -> Option<Expr> {
         let op = expr_op(&mut fork)?;
         if expr_fop(&op).prec() >= prec {
             if matches!(op, ExprOp::App(_)) {
-                // `expr_op`'s default (App) branch had to fully parse the
-                // next atom just to confirm one exists - commit the fork's
-                // progress (and errors) instead of throwing that parse away
-                // and redoing it below via `expr_atom(p, ...)`. Without
-                // this, every App-argument atom is parsed twice per level
-                // (once here as a lookahead, once as the real `rhs`), and
-                // since an atom can itself contain further nested `App`s,
-                // that doubling recurses: `O(2^depth)` instead of
-                // `O(depth)` for a chain of calls each wrapping the next in
-                // a record/array literal - a real report (an XML-shaped
-                // test fixture, ~15 levels deep, all on one line) where
-                // even parsing - before printing was ever reached - never
-                // finished. Only the position is committed, matching
-                // `ttry!`'s own convention - a successful fork's errors
-                // (like `alt!`'s) are diagnostic-only and dropped once
-                // something downstream actually succeeds.
+                // Commit the fork's position instead of reparsing the atom via
+                // expr_atom below - reparsing here recurses O(2^depth) instead of
+                // O(depth) for nested App chains (caused a real hang).
                 p.i = fork.i;
             } else {
                 let _ = expr_op(p)?;
@@ -1114,9 +1087,8 @@ fn pratt_expr<'t>(p: &mut P<'t>, mut lhs: Expr, prec: usize) -> Option<Expr> {
     })(p)
     {
         let mut rhs = match &mut outer_lookahead {
-            // Reuse the atom the lookahead above already parsed (see its
-            // own comment) - replacing it with a placeholder is fine, since
-            // nothing reads an `ExprOp::App`'s payload again after this.
+            // Reuse the atom the lookahead already parsed; the placeholder left
+            // behind is never read again.
             ExprOp::App(atom) => std::mem::replace(atom, Expr::Error(Span::zero())),
             ExprOp::Op(_) | ExprOp::Infix(_) => {
                 expr_atom(p, Some("Expected an expression after the operator"))?
@@ -1543,12 +1515,9 @@ fn record_updates<'t>(p: &mut P<'t>) -> Option<(Span, Vec<RecordUpdate>, Span)> 
         record_update,
         next_is!(T::RightBrace),
     );
-    // A record update list is a `Separated` in the real grammar - at least
-    // one update, never zero - so `x {}` isn't "update x with no changes",
-    // it's a plain function application of `x` to an empty record literal.
-    // Failing here (the caller tries this transactionally, via `ttry!`/
-    // `alt!`) lets `{}` fall through to the ordinary atom/App path instead
-    // of being swallowed as a vacuous `Expr::Update`.
+    // A real record update list needs at least one update: `x {}` is `x` applied to
+    // an empty record literal, not a vacuous update. Failing here lets `{}` fall
+    // through to the ordinary atom/App path via the caller's `ttry!`/`alt!`.
     if updates.is_empty() {
         return None;
     }
@@ -1841,13 +1810,9 @@ fn inst_binding<'t>(p: &mut P<'t>) -> Option<InstBinding> {
 
 fn data_cnstr<'t>(p: &mut P<'t>) -> Option<(ProperName, Vec<Typ>)> {
     let n = proper(p)?;
-    // Each field is an atomic type (`atype`), same production instance heads
-    // and instance binders already use (`typ_atom`/`binder_atom` above) - not
-    // the full `typ` parser, which would greedily consume a whole
-    // application chain into one field. Two space-separated constructors
-    // (`C Foo Bar`) are two separate fields; an application as a single field
-    // needs explicit parens (`C (Foo Bar)`), same as real PureScript's
-    // `dataCtor ::= properName atype*` grammar.
+    // Fields are atomic types (`typ_atom`, not the full `typ` parser), matching
+    // PureScript's `dataCtor ::= properName atype*` - `C Foo Bar` is two fields,
+    // an application as one field needs explicit parens (`C (Foo Bar)`).
     let ts = many_until(p, "data cnstr", |p| typ_atom(p, None), next_is!(T::Pipe | T::LayTop));
     Some((n, ts))
 }
@@ -2368,9 +2333,6 @@ import A.B.C hiding (foo)
         assert_snapshot!(p_expr("foo { a = 1, b = { c = 1 }, d = { e: 1 } }"))
     }
 
-    /// Regression test: `foo {}` has zero updates, which isn't valid record
-    /// update syntax (a `Separated` update list needs at least one) - it's
-    /// `foo` applied to an empty record literal instead.
     #[test]
     fn expr_empty_braces_is_app_to_empty_record_not_a_vacuous_update() {
         assert_snapshot!(p_expr("foo {}"))
@@ -2665,20 +2627,8 @@ f :: forall n. Compare n (-1) GT => P n
         ))
     }
 
-    // Regression test: `pratt_expr`'s outer lookahead used to fully parse
-    // the next atom on a forked parser just to confirm an `App` continuation
-    // exists, then throw that parse away and parse the *same* atom again for
-    // real via `expr_atom` immediately after. Harmless in isolation, but
-    // since an atom can itself contain further nested `App`s (e.g. a call
-    // wrapping a record literal whose own field is another such call), that
-    // doubling recurses: `O(2^depth)` instead of `O(depth)` for a chain of
-    // calls each wrapping the next. A real report (an XML-shaped record
-    // literal, ~15 levels deep, all on one line) never finished *parsing*,
-    // well before printing was ever reached. Not a snapshot test - the tree
-    // for even a moderate depth is unwieldy, and the point of this test is
-    // that it completes at all (it would hang, or take unreasonably long,
-    // if the exponential behavior ever comes back) while still parsing
-    // cleanly to the expected nesting depth.
+    // Guards against pratt_expr's App lookahead reparsing atoms and recursing
+    // O(2^depth) instead of O(depth) on nested App chains (a real report hung here).
     #[test]
     fn deeply_nested_app_chain_parses_without_exponential_blowup() {
         use super::*;
@@ -2697,9 +2647,6 @@ f :: forall n. Compare n (-1) GT => P n
         let m = module(&mut p).expect("module should parse");
         assert!(p.errors.is_empty(), "parse errors: {:?}", p.errors);
 
-        // Follows the exact shape `Ctor { children: [ <next> ] }` builds:
-        // an `App` whose argument is a one-field `Record` whose value is a
-        // one-item `Array` holding the next level, bottoming out at `Leaf`.
         fn nesting_depth(e: &Expr) -> usize {
             let Expr::App(_, arg) = e else {
                 return 0;

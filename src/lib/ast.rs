@@ -380,13 +380,10 @@ pub struct Header(
     pub Vec<ImportDecl>,
     pub Span,
     pub Span,
-    /// Span of the export list's `(`, or `Span::zero()` when there's no
-    /// export list - lets the printer detect a source break right after
-    /// `(` the same way `Typ::Record`/`Expr::Array` do, instead of only
-    /// ever seeing breaks between adjacent exports.
+    /// Export list `(`/`)` spans (`Span::zero()` if there's no export list),
+    /// so the printer can detect a break right after `(` like `Typ::Record`/
+    /// `Expr::Array` do.
     pub Span,
-    /// Span of the export list's `)`, or `Span::zero()` when there's no
-    /// export list.
     pub Span,
 );
 
@@ -528,14 +525,10 @@ pub struct ClassMember(pub Name, pub Typ);
 pub struct Constraint(pub QProperName, pub Vec<Typ>);
 
 /// A comma-separated `(A, B) =>`/`(A, B) <=` constraint context, or the
-/// parenless single-constraint form `A =>`/`A <=`. `Span::zero()` for the
-/// open/close fields marks the parenless form (the single `Constraint`
-/// inside still carries its own real span, so `.span()` is never `Zero`
-/// either way) - carrying real bracket spans (rather than just `Vec<Constraint>`,
-/// which the old shape used and which threw away the parens' own source
-/// position entirely) is what lets the printer tell whether the source had
-/// this expanded across multiple lines, the same reason `Binder::Array`/
-/// `Binder::Record` needed their own brace spans.
+/// parenless single-constraint form `A =>`/`A <=` (`Span::zero()` open/close
+/// marks the parenless form). Carrying the real bracket spans, rather than
+/// just `Vec<Constraint>`, is what lets the printer tell whether the source
+/// had this expanded across multiple lines.
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Constraints(pub Span, pub Vec<Constraint>, pub Span);
 
@@ -625,19 +618,11 @@ pub enum Binder {
     Char(Char),
     Str(Str),
     Number(bool, Number),
-    /// The two `Span`s are the `[`/`]` brackets themselves - without them,
-    /// `.span()` (derived by merging every field, including the item list)
-    /// reduces to `Span::Zero` whenever the list is empty (`[]`, matching
-    /// nothing), an unrelated-to-any-real-position value `Span::merge`
-    /// treats as neutral. A printer computing "was there a blank line before
-    /// this case branch" from that span then can't tell `[]` was ever there
-    /// at all, silently losing an entire source row from the calculation.
+    /// `[`/`]` bracket spans, needed so `.span()` doesn't collapse to
+    /// `Span::Zero` for an empty `[]` (which would make `print_case_branch`'s
+    /// blank-line/break calculations lose that source row entirely).
     Array(Span, Vec<Binder>, Span),
-    /// Same reasoning as `Array` above - without the `{`/`}` brace spans,
-    /// `.span()` reduces to `Span::Zero` for the empty binder `{}`, which
-    /// `print_case_branch`'s "was there a blank line before this" (and "does
-    /// the RHS need to break") calculation reads as an unrelated-to-any-real-
-    /// position value instead of `{}`'s real, single-line position.
+    /// Same reasoning as `Array` above, for `{`/`}` and empty `{}`.
     Record(Span, Vec<RecordLabelBinder>, Span),
     Paren(Span, Box<Binder>, Span),
 }
@@ -747,12 +732,8 @@ pub struct CaseBranch(pub Vec<Binder>, pub GuardedExpr);
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DoStmt {
     Stmt(Option<Binder>, Box<Expr>),
-    /// The `Span` is the `let` keyword's own span - without it, `.span()`
-    /// (derived by merging every field) starts at the first binding instead,
-    /// which is *after* `let` whenever they print on separate lines (always,
-    /// for our own output - `let`-bindings are always one-per-line). A
-    /// printer computing "was there a blank line before this do-statement"
-    /// from that span would then undercount the gap by the row `let` itself
-    /// occupies, on every reparse of our own output.
+    /// The `Span` is the `let` keyword's own span, so `.span()` doesn't
+    /// start at the first binding (after `let`) and undercount a preceding
+    /// blank-line gap on reparse of our own output.
     Let(Span, Vec<LetBinding>),
 }
