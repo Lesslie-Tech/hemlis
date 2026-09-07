@@ -415,6 +415,8 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
         return;
     }
 
+    let mut any_bad = false;
+
     files
         .iter()
         .enumerate()
@@ -427,6 +429,9 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
                     "ERR: could not read '{}': {} (looked relative to the current directory, at '{}')",
                     arg, e, abs
                 );
+                if flags.contains(&Flag::Format) {
+                    any_bad = true;
+                }
             }
             Ok(src) => {
                 use std::io::BufWriter;
@@ -447,11 +452,13 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
                             if flags.contains(&Flag::Write) {
                                 if arg == "-" {
                                     eprintln!("ERR: cannot use -w with stdin ('-') input");
+                                    any_bad = true;
                                 } else if formatted != src {
                                     match fs::write(arg, &formatted) {
                                         Ok(()) => println!("formatted {}", arg),
                                         Err(e) => {
-                                            eprintln!("ERR: {} failed to write: {:?}", arg, e)
+                                            eprintln!("ERR: {} failed to write: {:?}", arg, e);
+                                            any_bad = true;
                                         }
                                     }
                                 }
@@ -461,6 +468,7 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
                         }
                         _ => {
                             eprintln!("ERR: {} did not parse cleanly, cannot format", arg);
+                            any_bad = true;
                         }
                     }
                 }
@@ -503,4 +511,8 @@ pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
                 }
             }
         });
+
+    if any_bad {
+        std::process::exit(1);
+    }
 }
