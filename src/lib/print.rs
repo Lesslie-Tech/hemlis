@@ -991,7 +991,46 @@ impl<'s> Printer<'s> {
 
     fn dedup_sort_imports(&self, items: &mut Vec<Import>) {
         items.sort_by_key(|a| self.import_sort_key(a));
-        items.dedup_by(|a, b| self.import_display_text(a) == self.import_display_text(b));
+        let mut deduped: Vec<Import> = Vec::with_capacity(items.len());
+        for item in items.drain(..) {
+            match deduped.last_mut() {
+                Some(last) if self.import_sort_key(last) == self.import_sort_key(&item) => {
+                    match self.merge_dup_import(last, &item) {
+                        Some(merged) => *last = merged,
+                        None => deduped.push(item),
+                    }
+                }
+                _ => deduped.push(item),
+            }
+        }
+        *items = deduped;
+    }
+
+    /// Merges two imports that share a sort key (same tier and bare name), if
+    /// one subsumes the other: a bare `Typ` is subsumed by any `TypDat` of the
+    /// same name, and `DataMember::All` (`(..)`) subsumes an explicit
+    /// constructor list. Returns `None` (keep both) for two `TypDat`s with
+    /// different, non-overlapping constructor lists - merging those would
+    /// attribute a made-up span to constructors from another import.
+    fn merge_dup_import(&self, a: &Import, b: &Import) -> Option<Import> {
+        match (a, b) {
+            (Import::Typ(_, _), Import::TypDat(..)) => Some(b.clone()),
+            (Import::TypDat(..), Import::Typ(_, _)) => Some(a.clone()),
+            (Import::TypDat(span, name, DataMember::All(_)), Import::TypDat(..))
+            | (Import::TypDat(span, name, DataMember::Some(_)), Import::TypDat(_, _, DataMember::All(_))) =>
+            {
+                Some(Import::TypDat(*span, *name, DataMember::All(*span)))
+            }
+            (Import::TypDat(span, name, DataMember::Some(a_names)), Import::TypDat(_, _, DataMember::Some(b_names))) => {
+                let same_set = a_names.len() == b_names.len()
+                    && a_names
+                        .iter()
+                        .all(|x| b_names.iter().any(|y| self.text(x.span()) == self.text(y.span())));
+                same_set.then(|| Import::TypDat(*span, *name, DataMember::Some(a_names.clone())))
+            }
+            _ if self.text(a.span()) == self.text(b.span()) => Some(a.clone()),
+            _ => None,
+        }
     }
 
     /// Sort key: (kind tier, bare name), not just rendered text. purs-tidy
@@ -1009,32 +1048,6 @@ impl<'s> Printer<'s> {
         }
     }
 
-    fn import_display_text(&self, i: &Import) -> String {
-        match i {
-            Import::Value(_, n) => self.text(n.span()).to_string(),
-            Import::Symbol(_, s) => self.text(s.span()).to_string(),
-            Import::Typ(_, n) => self.text(n.span()).to_string(),
-            Import::TypDat(_, n, dm) => {
-                format!("{}{}", self.text(n.span()), self.data_member_display_text(dm))
-            }
-            Import::TypSymbol(_, s) => format!("type {}", self.text(s.span())),
-            Import::Class(_, n) => format!("class {}", self.text(n.span())),
-        }
-    }
-
-    fn data_member_display_text(&self, dm: &DataMember) -> String {
-        match dm {
-            DataMember::All(_) => "(..)".to_string(),
-            DataMember::Some(names) => format!(
-                "({})",
-                names
-                    .iter()
-                    .map(|n| self.text(n.span()))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-    }
 
     fn print_merged_import(&mut self, m: &MergedImport) {
         self.raw("import ");
@@ -4854,6 +4867,80 @@ mod tests {
                 module Foo where
                 import Control.Bind (class Bind)
                 import Data.Array (head, tail)
+
+                foo = 1
+            "}
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn merging_a_bare_type_import_with_its_data_ctors_keeps_only_the_data_ctors() {
+        // A bare `AccessRight` import is subsumed by `AccessRight(..)` for the
+        // same type - keep only the more complete one, not both.
+        let src = indoc! {"
+            module Foo where
+
+            import Storage.AccessRight (AccessRight)
+            import Storage.AccessRight (AccessRight(..), userHasAccess)
+
+            foo = 1
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+                import Storage.AccessRight (AccessRight(..), userHasAccess)
+
+                foo = 1
+            "}
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn merging_identical_data_ctor_imports_keeps_one_copy() {
+        let src = indoc! {"
+            module Foo where
+
+            import Data.Foo (Foo(A, B))
+            import Data.Foo (Foo(A, B))
+
+            foo = 1
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+                import Data.Foo (Foo(A, B))
+
+                foo = 1
+            "}
+        );
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn merging_data_ctor_imports_with_different_ctor_lists_keeps_both() {
+        // `Foo(A, B)` and `Foo(B, C)` aren't the same set, so merging them
+        // would have to invent a span for constructors pulled from another
+        // import - keep both entries rather than guessing.
+        let src = indoc! {"
+            module Foo where
+
+            import Data.Foo (Foo(A, B))
+            import Data.Foo (Foo(B, C))
+
+            foo = 1
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+                import Data.Foo (Foo(A, B), Foo(B, C))
 
                 foo = 1
             "}
