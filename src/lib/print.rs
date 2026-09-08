@@ -1208,6 +1208,7 @@ impl<'s> Printer<'s> {
                     self.raw(if i == 0 { "= " } else { "| " });
                     self.lit(cname);
                     self.print_ctor_args(cname.span(), cargs);
+                    self.flush_trailing_comment(ctor_spans[i].hi().0);
                 }
                 self.indent_out();
             }
@@ -2028,14 +2029,19 @@ impl<'s> Printer<'s> {
             || Self::any_breaks(&segment_spans)
             || segments[1..].iter().any(|s| self.typ_paren_would_break(s));
         self.print_typ_glued(segments[0]);
-        for seg in &segments[1..] {
+        let mut prev_span = segment_spans[0];
+        for (seg, &cur_span) in segments[1..].iter().zip(&segment_spans[1..]) {
             if multiline {
-                self.newline();
+                let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+                if !just_flushed_comment {
+                    self.newline();
+                }
                 self.raw("-> ");
             } else {
                 self.raw(" -> ");
             }
             self.print_typ_glued(seg);
+            prev_span = cur_span;
         }
     }
 
@@ -2056,17 +2062,25 @@ impl<'s> Printer<'s> {
             || Self::any_breaks(&chain_spans)
             || self.typ_paren_would_break(body);
         self.print_constraint(constraints[0]);
-        for c in &constraints[1..] {
+        let mut prev_span = chain_spans[0];
+        for (c, &cur_span) in constraints[1..].iter().zip(&chain_spans[1..]) {
             if multiline {
-                self.newline();
+                let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+                if !just_flushed_comment {
+                    self.newline();
+                }
                 self.raw("=> ");
             } else {
                 self.raw(" => ");
             }
             self.print_constraint(c);
+            prev_span = cur_span;
         }
         if multiline {
-            self.newline();
+            let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+            if !just_flushed_comment {
+                self.newline();
+            }
             self.raw("=> ");
         } else {
             self.raw(" => ");
@@ -4247,6 +4261,24 @@ mod tests {
         assert_idempotent(src);
     }
 
+    /// Without `flush_trailing_comment` per constructor, the comment falls
+    /// through `flush_comments_before` and misattaches as a leading comment
+    /// on the next constructor's own line.
+    #[test]
+    fn data_ctor_trailing_comment_stays_on_the_ctor_it_trails() {
+        let src = indoc! {"
+            module Foo where
+
+            data Product
+              = A
+              | B -- DEPRECATED
+              | C -- DEPRECATED
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
     /// `newtype` wraps exactly one `Typ` (no arg list like `data`), so this
     /// has its own relocation logic, landing on the same shape as `Decl::Data`.
     #[test]
@@ -5103,6 +5135,24 @@ mod tests {
         assert_idempotent(src);
     }
 
+    #[test]
+    fn typ_arrow_chain_segment_keeps_its_trailing_comment() {
+        let src = indoc! {"
+            module Foo where
+
+            cancelThing
+              :: { a :: A, b :: B, c :: C } -- TODO: may not need this field
+              -> ThingId
+              -> ResultT
+                   _
+                   Effect
+                   Status
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
     // Same needs_hang gotcha, reached via print_sig_typ directly (no arrow chain involved).
     #[test]
     fn typ_app_paren_op_chain_directly_after_a_broken_sig_gets_an_extra_hang_level() {
@@ -5136,6 +5186,37 @@ mod tests {
                    , y :: Int
                    }
             f = x
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn typ_constrained_chain_constraint_keeps_its_trailing_comment() {
+        let src = indoc! {"
+            module Foo where
+
+            f
+              :: Eq a -- comment
+              => Show a
+              => a
+              -> String
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn typ_constrained_chain_last_constraint_keeps_its_trailing_comment() {
+        let src = indoc! {"
+            module Foo where
+
+            f
+              :: Eq a -- comment
+              => a
+              -> String
         "};
         let out = fmt(src);
         assert_eq!(out, src);
