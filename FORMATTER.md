@@ -232,8 +232,6 @@ merely happens to share its line, not the true last thing on it.
   way a top-level signature's does, and it's not wired into `Typ::Kinded`,
   `Binder::Typed`, `Expr::Typed`, or `Binder::Op`. Same class of gap if a
   case is found needing it.
-- No `textDocument/formatting` LSP handler yet (`src/main.rs`) — `-f`/`-w`/
-  `-c` on the debug `hemlis` CLI only.
 - No semantic-preservation check (`parse(format(x))` AST equals `parse(x)`
   AST, modulo spans) — only idempotence and clean-reparse are checked in
   practice. A targeted AST-diff test would be a stronger guarantee.
