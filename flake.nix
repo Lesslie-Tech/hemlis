@@ -15,6 +15,7 @@
         config.allowUnfreePredicate = pkg:
           builtins.elem (nixpkgs.lib.getName pkg) [
             "github-copilot-cli"
+            "claude-code"
           ];
       };
       toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchains.toml;
@@ -35,6 +36,7 @@
           bash
           github-copilot-cli
           opencode
+          claude-code
           nodejs
         ];
       };

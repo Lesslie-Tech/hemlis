@@ -3308,6 +3308,7 @@ impl LanguageServer for Backend {
                         resolve_provider: None,
                     },
                 )),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 position_encoding: Some(PositionEncodingKind::UTF8),
                 ..ServerCapabilities::default()
             },
@@ -3514,6 +3515,46 @@ impl LanguageServer for Backend {
 
     #[instrument(skip(self))]
     async fn did_save(&self, _: DidSaveTextDocumentParams) {}
+
+    #[instrument(skip(self))]
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let fi = or_!(self.find_fi(params.text_document.uri), { return Ok(None) });
+        // Clone the source so we can re-lex without holding the DashMap guard across
+        // an await point. Re-lexing is cheap; a future optimisation could store the
+        // parsed module and comments alongside the source to skip this second pass.
+        let source = or_!(self.fi_to_source.try_get(&fi).try_unwrap(), {
+            return Ok(None);
+        })
+        .clone();
+
+        let (l, comments) = lexer::lex(&source, fi);
+        let mut p = parser::P::new(&l, &self.names);
+        let m = parser::module(&mut p);
+        if p.i < p.tokens.len() {
+            p.errors.push(parser::Serror::NotAtEOF(p.span(), p.peekt()));
+        }
+        let m = match (m, p.errors.is_empty()) {
+            (Some(m), true) => m,
+            _ => return Ok(None),
+        };
+
+        let formatted = print::print_module(&source, &m, &comments);
+        if formatted == source {
+            return Ok(Some(vec![]));
+        }
+
+        let end_line = source.lines().count() as u32;
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: end_line, character: 0 },
+            },
+            new_text: formatted,
+        }]))
+    }
 
     #[instrument(skip(self))]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
