@@ -2042,7 +2042,7 @@ mod tests {
                 module Test where
 
                 import Prim.Ordering (Ordering, LT, GT, EQ)
-                ^ BurnAllUnusedImport
+                ^ Fix all unused imports
 
                 foo :: Ordering -> LT
                 foo x = x
@@ -2074,7 +2074,7 @@ mod tests {
                 module Test where
 
                 import Lib (MyType(..), hello)
-                ^ BurnAllUnusedImport
+                ^ Fix all unused imports
 
                 foo :: Int
                 foo = hello
@@ -2106,7 +2106,7 @@ mod tests {
                 module Test where
 
                 import Lib (class A, b)
-                                  ^ DeleteUnusedImport
+                                  ^ Remove unused import
 
                 foo = b
             "},
@@ -2136,7 +2136,7 @@ mod tests {
                 module Test where
 
                 import Lib (b, class A)
-                                     ^ DeleteUnusedImport
+                                     ^ Remove unused import
 
                 foo = b
             "},
@@ -4197,7 +4197,7 @@ impl LanguageServer for Backend {
         let delete_all = merged;
         if !delete_all.is_empty() {
             out.push(CodeAction {
-                title: "BurnAllUnusedImport".to_string(),
+                title: "Fix all unused imports".to_string(),
                 kind: Some(CodeActionKind::SOURCE_FIX_ALL),
                 is_preferred: None,
                 edit: Some(WorkspaceEdit::new(
@@ -4714,7 +4714,7 @@ impl LanguageServer for Backend {
                         .map(|(_, r)| *r)
                         .unwrap_or_else(|| span_to_range(&at.and_one_more_char()));
                     out.push(CodeAction {
-                        title: "DeleteUnusedImport".into(),
+                        title: "Remove unused import".into(),
                         kind: Some(CodeActionKind::QUICKFIX),
                         diagnostics: None,
                         edit: Some(WorkspaceEdit::new(
