@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_expr(r\"\n        do\n            a <- f 2\n            b <- g a\n            fazz 1 2\n            let \n                a = 1\n            pure (b + a)\n        \")"
 ---
 37 of 37
@@ -11,6 +11,8 @@ Module
   NULL
   (0, 0)->(0, 6)
   (0, 12)->(0, 17)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Def
    Name
     (2, 0)->(2, 1)
@@ -62,6 +64,7 @@ Module
          Number
           (6, 19)->(6, 20)
       DoStmt::Let
+       (7, 12)->(7, 15)
         LetBinding::Name
          Name
           (8, 16)->(8, 17)

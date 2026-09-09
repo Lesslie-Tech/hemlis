@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_expr(r\"\n        ado\n            a <- f 2\n            b <- g a\n            fazz 1 2\n            in b + a\n        \")"
 ---
 27 of 27
@@ -11,6 +11,8 @@ Module
   NULL
   (0, 0)->(0, 6)
   (0, 12)->(0, 17)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Def
    Name
     (2, 0)->(2, 1)

@@ -1,5 +1,6 @@
 use crate::ast::{self, Ast, Span, Ud};
 use crate::parser::op_fixity;
+use crate::source::{line_starts, source_text_with_starts, span_to_byte_range_with_starts};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,32 +41,6 @@ pub struct StyleDiagnostic {
 // ---------------------------------------------------------------------------
 // Source text helpers
 // ---------------------------------------------------------------------------
-
-fn line_starts(source: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (i, b) in source.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
-
-fn span_to_byte_range(source: &str, span: &Span) -> Option<(usize, usize)> {
-    if let Span::Known(_, lo, hi) = span {
-        let starts = line_starts(source);
-        let lo_byte = starts.get(lo.0).map(|s| s + lo.1)?;
-        let hi_byte = starts.get(hi.0).map(|s| s + hi.1)?;
-        Some((lo_byte, hi_byte))
-    } else {
-        None
-    }
-}
-
-fn source_text<'a>(source: &'a str, span: &Span) -> Option<&'a str> {
-    let (lo, hi) = span_to_byte_range(source, span)?;
-    source.get(lo..hi)
-}
 
 // ---------------------------------------------------------------------------
 // Forbidden operators (PAY-3096)
@@ -116,15 +91,20 @@ fn maybe_paren(text: &str, expr: &ast::Expr, target_prec: usize) -> String {
     }
 }
 
-fn rule_forbidden_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn rule_forbidden_operator(
+    expr: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     if let ast::Expr::Op(lhs, qop, rhs) = expr {
         let op_ud = (qop.1).0 .0;
         for forbidden in FORBIDDEN_OPS {
             if op_ud == Ud::new(forbidden.from) {
                 let op_span = (qop.1).0 .1;
                 let expr_span = expr.span();
-                let lhs_text = source_text(source, &lhs.span()).unwrap_or("_");
-                let rhs_text = source_text(source, &rhs.span()).unwrap_or("_");
+                let lhs_text = source_text_with_starts(source, starts, &lhs.span()).unwrap_or("_");
+                let rhs_text = source_text_with_starts(source, starts, &rhs.span()).unwrap_or("_");
 
                 let target_prec = op_fixity(Ud::new(forbidden.to)).prec();
                 let new_lhs = maybe_paren(rhs_text, rhs, target_prec);
@@ -220,7 +200,12 @@ fn maybe_paren_operand(text: &str, operand: &ast::Expr, outer_op: Ud, on_left: b
 /// operator and the function operand are rewritten), and the non-wrapped
 /// operand is parenthesized via the associativity-aware redundant-paren logic.
 /// (PAY-3693)
-fn rule_confusing_map_operator(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn rule_confusing_map_operator(
+    expr: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     let ast::Expr::Op(lhs, qop, rhs) = expr else {
         return;
     };
@@ -237,9 +222,9 @@ fn rule_confusing_map_operator(expr: &ast::Expr, source: &str, out: &mut Vec<Sty
 
     // Byte ranges so we can preserve the exact source layout between tokens.
     let (Some((lhs_lo, lhs_hi)), Some((op_lo, op_hi)), Some((rhs_lo, rhs_hi))) = (
-        span_to_byte_range(source, &lhs.span()),
-        span_to_byte_range(source, &op_span),
-        span_to_byte_range(source, &rhs.span()),
+        span_to_byte_range_with_starts(starts, &lhs.span()),
+        span_to_byte_range_with_starts(starts, &op_span),
+        span_to_byte_range_with_starts(starts, &rhs.span()),
     ) else {
         return;
     };
@@ -313,15 +298,20 @@ const SWAP_OPS: &[OpSwap] = &[
     }, // prec 1 → prec 4 (higher is safe)
 ];
 
-fn rule_operator_swap(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn rule_operator_swap(
+    expr: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     if let ast::Expr::Op(lhs, qop, rhs) = expr {
         let op_ud = (qop.1).0 .0;
         for swap in SWAP_OPS {
             if op_ud == Ud::new(swap.from) {
                 let op_span = (qop.1).0 .1;
                 let expr_span = expr.span();
-                let lhs_text = source_text(source, &lhs.span()).unwrap_or("_");
-                let rhs_text = source_text(source, &rhs.span()).unwrap_or("_");
+                let lhs_text = source_text_with_starts(source, starts, &lhs.span()).unwrap_or("_");
+                let rhs_text = source_text_with_starts(source, starts, &rhs.span()).unwrap_or("_");
 
                 let target_prec = op_fixity(Ud::new(swap.to)).prec();
                 let new_lhs = maybe_paren(rhs_text, rhs, target_prec);
@@ -348,7 +338,12 @@ fn rule_operator_swap(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnos
 }
 
 /// `f $ x` → `f (x)` and `x # f` → `f (x)`
-fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn rule_op_to_parens(
+    expr: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     if let ast::Expr::Op(lhs, qop, rhs) = expr {
         let op_ud = (qop.1).0 .0;
         let (func, arg) = if op_ud == Ud::new("$") {
@@ -362,8 +357,8 @@ fn rule_op_to_parens(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnost
         let op_span = (qop.1).0 .1;
 
         let expr_span = expr.span();
-        let func_text = source_text(source, &func.span()).unwrap_or("_");
-        let arg_text = source_text(source, &arg.span()).unwrap_or("_");
+        let func_text = source_text_with_starts(source, starts, &func.span()).unwrap_or("_");
+        let arg_text = source_text_with_starts(source, starts, &arg.span()).unwrap_or("_");
 
         // If arg is already parenthesized, use it as-is; otherwise wrap in parens
         let parened_arg = if matches!(arg.as_ref(), ast::Expr::Paren(..)) {
@@ -467,9 +462,14 @@ fn paren_is_unnecessary(inner: &ast::Expr, ctx: &ParenContext) -> bool {
     }
 }
 
-fn emit_remove_parens(child: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn emit_remove_parens(
+    child: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     if let ast::Expr::Paren(_, inner, _) = child {
-        let inner_text = source_text(source, &inner.span());
+        let inner_text = source_text_with_starts(source, starts, &inner.span());
         if let Some(text) = inner_text {
             let paren_span = child.span();
             out.push(StyleDiagnostic {
@@ -499,6 +499,7 @@ fn emit_remove_parens(child: &ast::Expr, source: &str, out: &mut Vec<StyleDiagno
 fn rule_unnecessary_parens(
     expr: &ast::Expr,
     source: &str,
+    starts: &[usize],
     inside_app_or_op: bool,
     outer_op: Option<(Ud, bool)>,
     tail_ok: bool,
@@ -531,7 +532,7 @@ fn rule_unnecessary_parens(
                 || whole_expr_removable
                 || same_op_removable);
         if removable {
-            emit_remove_parens(expr, source, out);
+            emit_remove_parens(expr, source, starts, out);
         }
     }
 }
@@ -562,9 +563,14 @@ fn is_typ_atom(typ: &ast::Typ) -> bool {
     )
 }
 
-fn emit_remove_typ_parens(typ: &ast::Typ, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn emit_remove_typ_parens(
+    typ: &ast::Typ,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     if let ast::Typ::Paren(_, inner, _) = typ {
-        let inner_text = source_text(source, &inner.span());
+        let inner_text = source_text_with_starts(source, starts, &inner.span());
         if let Some(text) = inner_text {
             let paren_span = typ.span();
             out.push(StyleDiagnostic {
@@ -583,6 +589,7 @@ fn emit_remove_typ_parens(typ: &ast::Typ, source: &str, out: &mut Vec<StyleDiagn
 fn rule_unnecessary_typ_parens(
     typ: &ast::Typ,
     source: &str,
+    starts: &[usize],
     inside_app_or_op: bool,
     outer_op: Option<Ud>,
     out: &mut Vec<StyleDiagnostic>,
@@ -603,7 +610,7 @@ fn rule_unnecessary_typ_parens(
                 || !inside_app_or_op
                 || same_op);
         if removable {
-            emit_remove_typ_parens(typ, source, out);
+            emit_remove_typ_parens(typ, source, starts, out);
         }
     }
 }
@@ -612,17 +619,22 @@ fn rule_unnecessary_typ_parens(
 // PAY-3099: if → case conversion
 // ---------------------------------------------------------------------------
 
-fn rule_if_to_case(expr: &ast::Expr, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn rule_if_to_case(
+    expr: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     let ast::Expr::IfThenElse(kw_span, cond, then_e, else_e) = expr else {
         return;
     };
-    let Some(cond_text) = source_text(source, &cond.span()) else {
+    let Some(cond_text) = source_text_with_starts(source, starts, &cond.span()) else {
         return;
     };
-    let Some(then_text) = source_text(source, &then_e.span()) else {
+    let Some(then_text) = source_text_with_starts(source, starts, &then_e.span()) else {
         return;
     };
-    let Some(else_text) = source_text(source, &else_e.span()) else {
+    let Some(else_text) = source_text_with_starts(source, starts, &else_e.span()) else {
         return;
     };
 
@@ -713,17 +725,17 @@ fn rule_unqualified_do(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
 /// expression positions. The whole-module allowance (when the module defines
 /// its own top-level `pure`) is handled by the caller.
 fn rule_unqualified_pure(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
-    if let ast::Expr::Ident(ast::QName(None, name)) = expr {
-        if (name.0).0 == Ud::new("pure") {
-            let span = expr.span();
-            out.push(StyleDiagnostic {
-                cursor_span: span,
-                expr_span: span,
-                action: StyleAction::Warn {
-                    message: "Unqualified `pure`; use a qualified `Applicative.pure`".into(),
-                },
-            });
-        }
+    if let ast::Expr::Ident(ast::QName(None, name)) = expr
+        && (name.0).0 == Ud::new("pure")
+    {
+        let span = expr.span();
+        out.push(StyleDiagnostic {
+            cursor_span: span,
+            expr_span: span,
+            action: StyleAction::Warn {
+                message: "Unqualified `pure`; use a qualified `Applicative.pure`".into(),
+            },
+        });
     }
 }
 
@@ -784,6 +796,7 @@ fn rule_import_exact_name(
     imp: &ast::ImportDecl,
     exported_modules: &[Ud],
     source: &str,
+    starts: &[usize],
     out: &mut Vec<StyleDiagnostic>,
 ) {
     let Some(alias) = &imp.to else {
@@ -796,8 +809,8 @@ fn rule_import_exact_name(
     let from_span = imp.from.span();
     let alias_span = alias.span();
     let (Some(from_text), Some(alias_text)) = (
-        source_text(source, &from_span),
-        source_text(source, &alias_span),
+        source_text_with_starts(source, starts, &from_span),
+        source_text_with_starts(source, starts, &alias_span),
     ) else {
         return;
     };
@@ -833,15 +846,20 @@ fn rule_import_exact_name(
 /// (e.g. `import Ctx.Time as TimeCtx`). Flag aliases that instead *start* with
 /// `Ctx` (`CtxTime`, `Ctx.Time`) and offer a rename that fixes the import alias
 /// and every qualified usage of it. (PAY-3692)
-fn rule_import_ctx_naming(imp: &ast::ImportDecl, source: &str, out: &mut Vec<StyleDiagnostic>) {
+fn rule_import_ctx_naming(
+    imp: &ast::ImportDecl,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
     let Some(alias) = &imp.to else {
         return;
     };
     let from_span = imp.from.span();
     let alias_span = alias.span();
     let (Some(from_text), Some(alias_text)) = (
-        source_text(source, &from_span),
-        source_text(source, &alias_span),
+        source_text_with_starts(source, starts, &from_span),
+        source_text_with_starts(source, starts, &alias_span),
     ) else {
         return;
     };
@@ -868,7 +886,8 @@ fn rule_import_ctx_naming(imp: &ast::ImportDecl, source: &str, out: &mut Vec<Sty
 
     // Rename the alias in the import plus every qualified usage of it. This is
     // safe within the module because qualified names are module-local.
-    let action = match qualifier_rename_edits(source, &alias_span, alias_text, &suggestion) {
+    let action = match qualifier_rename_edits(source, starts, &alias_span, alias_text, &suggestion)
+    {
         Some(edits) => StyleAction::WarnAndRename {
             message,
             title: format!("Rename alias `{alias_text}` to `{suggestion}`"),
@@ -890,6 +909,7 @@ fn rule_import_ctx_naming(imp: &ast::ImportDecl, source: &str, out: &mut Vec<Sty
 /// are all covered. Returns `None` if the alias span has no file id.
 fn qualifier_rename_edits(
     source: &str,
+    starts: &[usize],
     alias_span: &Span,
     old: &str,
     new: &str,
@@ -898,7 +918,6 @@ fn qualifier_rename_edits(
     let fi = alias_span.fi()?;
     let mut edits = vec![(*alias_span, new.to_string())];
 
-    let starts = line_starts(source);
     for (tok, byte_span) in crate::lexer::Token::lexer(source).spanned() {
         let Ok(crate::lexer::Token::Qual(q)) = tok else {
             continue;
@@ -910,8 +929,8 @@ fn qualifier_rename_edits(
         if !(q.starts_with(old) && q[old.len()..].starts_with('.')) {
             continue;
         }
-        let lo = byte_to_pos(&starts, byte_span.start);
-        let hi = byte_to_pos(&starts, byte_span.start + old.len());
+        let lo = byte_to_pos(starts, byte_span.start);
+        let hi = byte_to_pos(starts, byte_span.start + old.len());
         edits.push((Span::Known(fi, lo, hi), new.to_string()));
     }
     Some(edits)
@@ -949,13 +968,13 @@ fn reindent_block(text: &str, old_col: usize, new_col: usize) -> String {
 /// Build the `let … in …` replacement for a `body where binds` expression,
 /// preserving the bindings' internal layout by shifting them under the new
 /// `let`. Returns `None` if any span can't be resolved.
-fn build_let_fix(where_expr: &ast::Expr, source: &str) -> Option<String> {
+fn build_let_fix(where_expr: &ast::Expr, source: &str, starts: &[usize]) -> Option<String> {
     let ast::Expr::Where(_, body, binds) = where_expr else {
         return None;
     };
-    let body_text = source_text(source, &body.span())?;
+    let body_text = source_text_with_starts(source, starts, &body.span())?;
     let binds_span = binds.span();
-    let binds_text = source_text(source, &binds_span)?;
+    let binds_text = source_text_with_starts(source, starts, &binds_span)?;
 
     // The replacement starts where the body did, so `let` sits at that column.
     let let_col = where_expr.span().lo().1;
@@ -973,6 +992,7 @@ fn rule_prefer_let(
     where_expr: &ast::Expr,
     fixable: bool,
     source: &str,
+    starts: &[usize],
     out: &mut Vec<StyleDiagnostic>,
 ) {
     let ast::Expr::Where(where_span, _, _) = where_expr else {
@@ -980,7 +1000,7 @@ fn rule_prefer_let(
     };
     let message = "Prefer `let` over `where`".to_string();
     let action = fixable
-        .then(|| build_let_fix(where_expr, source))
+        .then(|| build_let_fix(where_expr, source, starts))
         .flatten()
         .map(|replacement| StyleAction::WarnAndFix {
             message: message.clone(),
@@ -1001,6 +1021,8 @@ fn rule_prefer_let(
 
 struct StyleChecker<'a> {
     source: &'a str,
+    /// Computed once so per-node span lookups don't rescan the source each time.
+    line_starts: Vec<usize>,
     diagnostics: Vec<StyleDiagnostic>,
     /// The module defines its own top-level `pure`, so the unqualified-`pure`
     /// rule is suppressed for the whole module. (PAY-3688)
@@ -1011,6 +1033,7 @@ impl<'a> StyleChecker<'a> {
     fn new(source: &'a str, module_defines_pure: bool) -> Self {
         Self {
             source,
+            line_starts: line_starts(source),
             diagnostics: Vec::new(),
             module_defines_pure,
         }
@@ -1037,19 +1060,20 @@ impl<'a> StyleChecker<'a> {
         tail_ok: bool,
     ) {
         // ===== RULES (add new rules here) =====
-        rule_forbidden_operator(expr, self.source, &mut self.diagnostics);
-        rule_confusing_map_operator(expr, self.source, &mut self.diagnostics);
-        rule_operator_swap(expr, self.source, &mut self.diagnostics);
-        rule_op_to_parens(expr, self.source, &mut self.diagnostics);
+        rule_forbidden_operator(expr, self.source, &self.line_starts, &mut self.diagnostics);
+        rule_confusing_map_operator(expr, self.source, &self.line_starts, &mut self.diagnostics);
+        rule_operator_swap(expr, self.source, &self.line_starts, &mut self.diagnostics);
+        rule_op_to_parens(expr, self.source, &self.line_starts, &mut self.diagnostics);
         rule_unnecessary_parens(
             expr,
             self.source,
+            &self.line_starts,
             inside_app_or_op,
             outer_op,
             tail_ok,
             &mut self.diagnostics,
         );
-        rule_if_to_case(expr, self.source, &mut self.diagnostics);
+        rule_if_to_case(expr, self.source, &self.line_starts, &mut self.diagnostics);
         rule_unqualified_do(expr, &mut self.diagnostics);
         if !self.module_defines_pure {
             rule_unqualified_pure(expr, &mut self.diagnostics);
@@ -1163,7 +1187,7 @@ impl<'a> StyleChecker<'a> {
     fn check_do_stmt(&mut self, stmt: &ast::DoStmt) {
         match stmt {
             ast::DoStmt::Stmt(_, e) => self.check_expr(e),
-            ast::DoStmt::Let(bindings) => self.check_let_bindings(bindings),
+            ast::DoStmt::Let(_, bindings) => self.check_let_bindings(bindings),
         }
     }
 
@@ -1203,7 +1227,7 @@ impl<'a> StyleChecker<'a> {
     /// `where` can be safely rewritten to `let … in`.
     fn check_where_body(&mut self, e: &ast::Expr, fixable: bool) {
         if let ast::Expr::Where(_, body, binds) = e {
-            rule_prefer_let(e, fixable, self.source, &mut self.diagnostics);
+            rule_prefer_let(e, fixable, self.source, &self.line_starts, &mut self.diagnostics);
             // `where` follows the body, so the body is non-tail.
             self.check_expr_nontail(body);
             self.check_let_bindings(binds);
@@ -1231,6 +1255,7 @@ impl<'a> StyleChecker<'a> {
         rule_unnecessary_typ_parens(
             typ,
             self.source,
+            &self.line_starts,
             inside_app_or_op,
             outer_op,
             &mut self.diagnostics,
@@ -1307,7 +1332,7 @@ impl<'a> StyleChecker<'a> {
             }
             ast::Decl::Instance(_, head, bindings) => {
                 if let Some(constraints) = &head.0 {
-                    for c in constraints {
+                    for c in constraints.iter() {
                         self.check_constraint(c);
                     }
                 }
@@ -1323,7 +1348,7 @@ impl<'a> StyleChecker<'a> {
             }
             ast::Decl::Class(constraints, _, _, _, members) => {
                 if let Some(constraints) = constraints {
-                    for c in constraints {
+                    for c in constraints.iter() {
                         self.check_constraint(c);
                     }
                 }
@@ -1405,9 +1430,13 @@ fn docstring_prefix_fix(comment: &str) -> Option<(usize, String)> {
 /// emit a fixable warning that normalizes them to `-- | `. Comments are not in
 /// the AST, so this is a lexer-level pass. String literals are lexed as
 /// separate tokens, so `--|` inside a string is never seen here. (PAY-3690)
-fn check_docstring_comments(source: &str, fi: ast::Fi, out: &mut Vec<StyleDiagnostic>) {
+fn check_docstring_comments(
+    source: &str,
+    starts: &[usize],
+    fi: ast::Fi,
+    out: &mut Vec<StyleDiagnostic>,
+) {
     use logos::Logos as _;
-    let starts = line_starts(source);
     for (tok, byte_span) in crate::lexer::Token::lexer(source).spanned() {
         let Ok(crate::lexer::Token::LineComment(_)) = tok else {
             continue;
@@ -1416,7 +1445,7 @@ fn check_docstring_comments(source: &str, fi: ast::Fi, out: &mut Vec<StyleDiagno
         let Some((prefix_len, replacement)) = docstring_prefix_fix(text) else {
             continue;
         };
-        let (line, col) = byte_to_pos(&starts, byte_span.start);
+        let (line, col) = byte_to_pos(starts, byte_span.start);
         let span = Span::Known(fi, (line, col), (line, col + prefix_len));
         out.push(StyleDiagnostic {
             cursor_span: span,
@@ -1464,10 +1493,16 @@ pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<Styl
             })
             .collect();
         for imp in &header.2 {
-            rule_import_exact_name(imp, &exported_modules, source, &mut checker.diagnostics);
-            rule_import_ctx_naming(imp, source, &mut checker.diagnostics);
+            rule_import_exact_name(
+                imp,
+                &exported_modules,
+                source,
+                &checker.line_starts,
+                &mut checker.diagnostics,
+            );
+            rule_import_ctx_naming(imp, source, &checker.line_starts, &mut checker.diagnostics);
         }
     }
-    check_docstring_comments(source, fi, &mut checker.diagnostics);
+    check_docstring_comments(source, &checker.line_starts, fi, &mut checker.diagnostics);
     checker.diagnostics
 }

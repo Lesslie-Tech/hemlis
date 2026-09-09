@@ -57,43 +57,42 @@ fn lex_qual<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> &'t str {
 }
 
 fn lex_symbol<'t>(lex: &mut logos::Lexer<'t, Token<'t>>) -> &'t str {
-    if let Some(at) = lex.remainder().find(")") {
-        if at != 0
-            && lex
-                .remainder()
-                .get(0..at)
-                .map(|x| {
-                    x.chars().all(|x| {
-                        matches!(
-                            x,
-                            '!' | '#'
-                                | '$'
-                                | '%'
-                                | '&'
-                                | '*'
-                                | '+'
-                                | '.'
-                                | '-'
-                                | '\\'
-                                | '|'
-                                | '/'
-                                | '<'
-                                | '='
-                                | '>'
-                                | '?'
-                                | '@'
-                                | '^'
-                                | '~'
-                                | ':'
-                                | ';'
-                                | '¤'
-                        )
-                    })
+    if let Some(at) = lex.remainder().find(")")
+        && at != 0
+        && lex
+            .remainder()
+            .get(0..at)
+            .map(|x| {
+                x.chars().all(|x| {
+                    matches!(
+                        x,
+                        '!' | '#'
+                            | '$'
+                            | '%'
+                            | '&'
+                            | '*'
+                            | '+'
+                            | '.'
+                            | '-'
+                            | '\\'
+                            | '|'
+                            | '/'
+                            | '<'
+                            | '='
+                            | '>'
+                            | '?'
+                            | '@'
+                            | '^'
+                            | '~'
+                            | ':'
+                            | ';'
+                            | '¤'
+                    )
                 })
-                .unwrap_or(false)
-        {
-            lex.bump(at + 1);
-        }
+            })
+            .unwrap_or(false)
+    {
+        lex.bump(at + 1);
     }
     lex.slice()
 }
@@ -257,7 +256,55 @@ impl Delim {
     }
 }
 
-pub fn lex(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
+/// Lexes `content` into the layout-processed token stream plus every comment token
+/// (with its span), collected separately so comments never influence layout decisions.
+pub fn lex(content: &str, fi: Fi) -> (Vec<SourceToken<'_>>, Vec<SourceToken<'_>>) {
+    let comments = lex_comments(content, fi);
+
+    (lex_tokens(content, fi), comments)
+}
+
+fn lex_comments(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
+    let mut indent = 0;
+    let mut scanned_to = 0;
+    let mut line = 0;
+    let mut comments = Vec::new();
+
+    for (t, s) in Token::lexer(content).spanned() {
+        let token_start = scanned_to;
+        let line_after = line + content[token_start..s.end].matches('\n').count();
+        scanned_to = s.end;
+
+        // A multi-line block comment has no separate Indent token for its inner
+        // lines, so its last line's start must be computed directly (see lex_tokens).
+        let start_indent = indent;
+        let end_indent = if line_after != line {
+            let last_nl = content[token_start..s.end].rfind('\n').unwrap();
+            let new_indent = token_start + last_nl + 1;
+            indent = new_indent;
+            new_indent
+        } else {
+            indent
+        };
+
+        match &t {
+            Ok(Token::Indent(at)) => {
+                indent = s.end.saturating_sub(*at);
+            }
+            Ok(Token::LineComment(_) | Token::BlockComment(_)) => {
+                let span =
+                    Span::Known(fi, (line, s.start - start_indent), (line_after, s.end - end_indent));
+                comments.push((t, span));
+            }
+            _ => {}
+        }
+        line = line_after;
+    }
+
+    comments
+}
+
+fn lex_tokens(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
     let mut indent = 0;
     let mut state = vec![((0, 0), Delim::LytRoot), ((0, 0), Delim::LytWhere)];
     let mut out = Vec::new();
@@ -291,10 +338,24 @@ pub fn lex(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
     let mut scanned_to = 0;
     let mut line = 0;
     for (i, (t, s)) in toks.iter().enumerate() {
-        let line_after = line + content[scanned_to..s.end].matches('\n').count();
+        let token_start = scanned_to;
+        let line_after = line + content[token_start..s.end].matches('\n').count();
         scanned_to = s.end;
 
-        let span = Span::Known(fi, (line, s.start - indent), (line_after, s.end - indent));
+        // A token with embedded newlines (multi-line raw string/block comment) gets no
+        // Indent token for its inner lines, so its last line's start is computed here
+        // directly and carried forward as `indent` for whatever token follows it.
+        let start_indent = indent;
+        let end_indent = if line_after != line {
+            let last_nl = content[token_start..s.end].rfind('\n').unwrap();
+            let new_indent = token_start + last_nl + 1;
+            indent = new_indent;
+            new_indent
+        } else {
+            indent
+        };
+
+        let span = Span::Known(fi, (line, s.start - start_indent), (line_after, s.end - end_indent));
         match t {
             Ok(Token::Indent(at)) => {
                 // We need to know the indentation of every token - even if there are tokens before it.
@@ -311,7 +372,7 @@ pub fn lex(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
                 // println!("{:?} {:?}", tt, state);
                 let mut c = C {
                     t: *tt,
-                    at: (s.start - indent, line),
+                    at: (s.start - start_indent, line),
                     next,
                     s: span,
                     state,
@@ -375,10 +436,10 @@ impl<'t> C<'t> {
     where
         P: Fn(Delim) -> bool,
     {
-        if let Some((_, d)) = self.state.last() {
-            if p(*d) {
-                self.state.pop();
-            }
+        if let Some((_, d)) = self.state.last()
+            && p(*d)
+        {
+            self.state.pop();
         }
     }
 
@@ -848,10 +909,12 @@ fn process(c: &mut C<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indoc::indoc;
     use insta::assert_snapshot;
 
     fn p(s: &'static str) -> String {
         lex(s, Fi(0))
+            .0
             .iter()
             .map(|x| format!("{:?}", x.0))
             .collect::<Vec<_>>()
@@ -866,6 +929,46 @@ mod tests {
     #[test]
     fn some_tokens() {
         assert_snapshot!(p("module A where (a, b, c)\nimport B as B\nfoo = 1 + B.t"));
+    }
+
+    #[test]
+    fn comments_are_captured_separately() {
+        let (toks, comments) = lex(
+            indoc! {"
+                foo = 1 -- hi
+                {- block -}
+                bar = 2"},
+            Fi(0),
+        );
+        assert!(
+            toks.iter()
+                .all(|(t, _)| !matches!(t, Ok(Token::LineComment(_) | Token::BlockComment(_)))),
+            "comments must not appear in the layout token stream: {:?}",
+            toks
+        );
+        assert_eq!(
+            comments
+                .iter()
+                .map(|(t, _)| format!("{:?}", t))
+                .collect::<Vec<_>>(),
+            vec![
+                "Ok(LineComment(\"-- hi\"))".to_string(),
+                "Ok(BlockComment(\"{- block -}\"))".to_string(),
+            ]
+        );
+        assert_eq!(comments[0].1, Span::Known(Fi(0), (0, 8), (0, 13)));
+        assert_eq!(comments[1].1, Span::Known(Fi(0), (1, 0), (1, 11)));
+    }
+
+    #[test]
+    fn comments_do_not_affect_layout() {
+        let with = p(indoc! {"
+            foo = 1 -- hi
+            bar = 2"});
+        let without = p(indoc! {"
+            foo = 1
+            bar = 2"});
+        assert_eq!(with, without);
     }
 
     #[test]

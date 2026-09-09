@@ -1,8 +1,8 @@
 ---
 source: src/lib/parser.rs
-expression: "p_expr(\"if a == 2 then b else c\")"
+expression: "p_expr(\"a :< b :< c\")"
 ---
-15 of 15
+12 of 12
 ===
 Module
  Header
@@ -17,29 +17,29 @@ Module
    Name
     (2, 0)->(2, 1)
    GuardedExpr::Unconditional
-    Expr::IfThenElse
-     (2, 4)->(2, 6)
+    Expr::Op
      Expr::Op
       Expr::Ident
        QName
         NULL
         Name
-         (2, 7)->(2, 8)
+         (2, 4)->(2, 5)
       QOp
        NULL
        Op
-        (2, 9)->(2, 11)
-      Expr::Number
-       Number
-        (2, 12)->(2, 13)
+        (2, 6)->(2, 8)
+      Expr::Ident
+       QName
+        NULL
+        Name
+         (2, 9)->(2, 10)
+     QOp
+      NULL
+      Op
+       (2, 11)->(2, 13)
      Expr::Ident
       QName
        NULL
        Name
-        (2, 19)->(2, 20)
-     Expr::Ident
-      QName
-       NULL
-       Name
-        (2, 26)->(2, 27)
+        (2, 14)->(2, 15)
 ===

@@ -1,8 +1,8 @@
 ---
 source: src/lib/parser.rs
-expression: "p_expr(\"foo { a : 1 }\")"
+expression: "p_expr(\"foo {}\")"
 ---
-13 of 13
+10 of 10
 ===
 Module
  Header
@@ -25,11 +25,5 @@ Module
         (2, 4)->(2, 7)
      Expr::Record
       (2, 8)->(2, 9)
-       RecordLabelExpr::Field
-        Label
-         (2, 10)->(2, 11)
-        Expr::Number
-         Number
-          (2, 14)->(2, 15)
-      (2, 16)->(2, 17)
+      (2, 9)->(2, 10)
 ===

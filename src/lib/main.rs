@@ -19,7 +19,7 @@ fn main() {
             parsing_options = true;
             continue;
         }
-        if parsing_options && arg.starts_with("-") {
+        if parsing_options && arg.starts_with("-") && arg != "-" {
             match arg.as_ref() {
                 "-t" | "--tokens" => lib_flags.insert(LibFlag::Tokens),
                 "-a" | "--tree" => lib_flags.insert(LibFlag::Tree),
@@ -27,6 +27,9 @@ fn main() {
                 "-e" | "--exports" => lib_flags.insert(LibFlag::Exports),
                 "-i" | "--imports" => lib_flags.insert(LibFlag::Imports),
                 "-x" | "--xx" => lib_flags.insert(LibFlag::Resolved),
+                "-f" | "--format" => lib_flags.insert(LibFlag::Format),
+                "-w" | "--write" => lib_flags.insert(LibFlag::Write),
+                "-c" | "--check" => lib_flags.insert(LibFlag::Check),
                 "-r" | "--resolve" => flags.insert(Flag::Resolve),
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),

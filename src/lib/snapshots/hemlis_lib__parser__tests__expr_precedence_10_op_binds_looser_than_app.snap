@@ -1,0 +1,47 @@
+---
+source: src/lib/parser.rs
+expression: "p_expr(\"f a .&. g b\")"
+---
+12 of 12
+===
+Module
+ Header
+  MName
+   (0, 7)->(0, 11)
+  NULL
+  (0, 0)->(0, 6)
+  (0, 12)->(0, 17)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
+  Decl::Def
+   Name
+    (2, 0)->(2, 1)
+   GuardedExpr::Unconditional
+    Expr::Op
+     Expr::App
+      Expr::Ident
+       QName
+        NULL
+        Name
+         (2, 4)->(2, 5)
+      Expr::Ident
+       QName
+        NULL
+        Name
+         (2, 6)->(2, 7)
+     QOp
+      NULL
+      Op
+       (2, 8)->(2, 11)
+     Expr::App
+      Expr::Ident
+       QName
+        NULL
+        Name
+         (2, 12)->(2, 13)
+      Expr::Ident
+       QName
+        NULL
+        Name
+         (2, 14)->(2, 15)
+===

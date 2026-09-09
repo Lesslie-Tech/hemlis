@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_module(r\"\nmodule H () where\n\nh = A. B. C.\n        \")"
 ---
 12 of 12
@@ -10,6 +10,8 @@ Module
    (1, 7)->(1, 8)
   (1, 0)->(1, 6)
   (1, 12)->(1, 17)
+  (1, 9)->(1, 10)
+  (1, 10)->(1, 11)
   Decl::Def
    Name
     (3, 0)->(3, 1)

@@ -257,10 +257,10 @@ impl<'s> N<'s> {
             return;
         }
         let from_name = Name(Scope::Module, from.0 .0, from.0 .0, Visibility::Public);
-        if let Some(usages) = self.global_usages.get(&from_name) {
-            if usages.iter().any(|(_, sort)| sort == &Sort::Export) {
-                return;
-            }
+        if let Some(usages) = self.global_usages.get(&from_name)
+            && usages.iter().any(|(_, sort)| sort == &Sort::Export)
+        {
+            return;
         }
         if let Some(to) = to {
             let n = to.0 .0;
@@ -393,14 +393,13 @@ impl<'s> N<'s> {
                                         for m in mem {
                                             if let Some(name) =
                                                 fields.iter().find(|name| name.name() == m.0 .0)
+                                                && !self.is_used(name)
                                             {
-                                                if !self.is_used(name) {
-                                                    self.errors.push(
-                                                        NRerrors::UnusedImportedConstructor(
-                                                            m.0 .0, m.0 .1,
-                                                        ),
-                                                    );
-                                                }
+                                                self.errors.push(
+                                                    NRerrors::UnusedImportedConstructor(
+                                                        m.0 .0, m.0 .1,
+                                                    ),
+                                                );
                                             }
                                         }
                                     } else if all_unused && ty_unused {
@@ -1072,7 +1071,7 @@ impl<'s> N<'s> {
                         self.resolve(Type, None, n.0);
                     }
                 }
-                for c in cs.iter().flatten() {
+                for c in cs.iter().flat_map(|c| c.iter()) {
                     self.constraint(c);
                 }
                 for ast::ClassMember(_, typ) in mem.iter() {
@@ -1145,7 +1144,7 @@ impl<'s> N<'s> {
         for t in ts.iter() {
             self.typ_define_vars(t);
         }
-        for ast::Constraint(_, ts) in cs.iter().flatten() {
+        for ast::Constraint(_, ts) in cs.iter().flat_map(|c| c.iter()) {
             for t in ts.iter() {
                 self.typ_define_vars(t);
             }
@@ -1155,7 +1154,7 @@ impl<'s> N<'s> {
             self.typ(t);
         }
         self.pop(sf, a.span());
-        for c in cs.iter().flatten() {
+        for c in cs.iter().flat_map(|c| c.iter()) {
             self.constraint(c);
         }
         self.resolveq(Class, d.0, d.1 .0)
@@ -1264,7 +1263,7 @@ impl<'s> N<'s> {
                         ast::DoStmt::Stmt(None, e) => {
                             self.expr(e);
                         }
-                        ast::DoStmt::Let(ls) => {
+                        ast::DoStmt::Let(_, ls) => {
                             self.let_binders(ls);
                         }
                     }
@@ -1283,7 +1282,7 @@ impl<'s> N<'s> {
                         ast::DoStmt::Stmt(_, e) => {
                             self.expr(e);
                         }
-                        ast::DoStmt::Let(_) => {}
+                        ast::DoStmt::Let(_, _) => {}
                     }
                 }
                 for s in stmts.iter() {
@@ -1292,7 +1291,7 @@ impl<'s> N<'s> {
                             self.binder(b);
                         }
                         ast::DoStmt::Stmt(None, _) => {}
-                        ast::DoStmt::Let(ls) => {
+                        ast::DoStmt::Let(_, ls) => {
                             self.let_binders(ls);
                         }
                     }
@@ -1487,12 +1486,12 @@ impl<'s> N<'s> {
             ast::Binder::Char(_) => (),
             ast::Binder::Str(_) => (),
             ast::Binder::Number(_, _) => (),
-            ast::Binder::Array(ts) => {
+            ast::Binder::Array(_, ts, _) => {
                 for b in ts.iter() {
                     self.binder(b);
                 }
             }
-            ast::Binder::Record(bs) => {
+            ast::Binder::Record(_, bs, _) => {
                 for b in bs.iter() {
                     match b {
                         ast::RecordLabelBinder::Pun(l) => {

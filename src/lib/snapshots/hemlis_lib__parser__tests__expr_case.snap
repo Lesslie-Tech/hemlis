@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_expr(r\"\n        case 1 + 1 of\n            2 -> foo\n            3 | Just _ <- foo bar -> baz\n                    where\n                        baz = 3\n        \")"
 ---
 33 of 33
@@ -11,6 +11,8 @@ Module
   NULL
   (0, 0)->(0, 6)
   (0, 12)->(0, 17)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Def
    Name
     (2, 0)->(2, 1)

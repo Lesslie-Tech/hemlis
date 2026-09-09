@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     fs::{self},
+    io::{self, Read},
 };
 
 use dashmap::DashMap;
@@ -9,6 +11,8 @@ pub mod ast;
 pub mod lexer;
 pub mod nr;
 pub mod parser;
+pub mod print;
+pub mod source;
 pub mod style;
 
 use crate::ast::Ast;
@@ -129,6 +133,9 @@ pub enum Flag {
     Imports,
     Exports,
     Resolved,
+    Format,
+    Write,
+    Check,
 }
 
 pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
@@ -142,7 +149,7 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
                 panic!("ERR: {} {:?}", arg, e);
             }
             Ok(src) => {
-                let l = lexer::lex(&src, ast::Fi(i));
+                let (l, _comments) = lexer::lex(&src, ast::Fi(i));
                 let mut p = parser::P::new(&l, &names);
                 if let Some(m) = parser::module(&mut p) {
                     let header = m.0.clone()?;
@@ -312,62 +319,245 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
     }
 }
 
-pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
-    files
-        .iter()
-        .enumerate()
-        .for_each(|(i, arg)| match fs::read_to_string(arg.clone()) {
-            Err(e) => {
-                panic!("ERR: {} {:?}", arg, e);
+/// Reads `arg` as a file path, except `"-"`, which reads stdin instead
+/// (matches `purs-tidy` and most other CLI formatters).
+fn read_source(arg: &str) -> io::Result<String> {
+    if arg == "-" {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        Ok(buf)
+    } else {
+        fs::read_to_string(arg)
+    }
+}
+
+enum CheckOutcome {
+    Formatted,
+    Unformatted,
+    ParseError,
+    ReadError(String),
+}
+
+fn check_one_file(i: usize, arg: &str) -> CheckOutcome {
+    let src = match read_source(arg) {
+        Ok(s) => s,
+        Err(e) => return CheckOutcome::ReadError(format!("{:?}", e)),
+    };
+
+    let (l, comments) = lexer::lex(&src, ast::Fi(i));
+    let n = DashMap::new();
+    let mut p = parser::P::new(&l, &n);
+    let out = parser::module(&mut p);
+    if p.i < p.tokens.len() {
+        p.errors.push(parser::Serror::NotAtEOF(p.span(), p.peekt()));
+    }
+
+    match (&out, p.errors.is_empty()) {
+        (Some(m), true) => {
+            let formatted = print::print_module(&src, m, &comments);
+            if formatted == src {
+                CheckOutcome::Formatted
+            } else {
+                CheckOutcome::Unformatted
             }
-            Ok(src) => {
-                use std::io::BufWriter;
+        }
+        _ => CheckOutcome::ParseError,
+    }
+}
 
-                let l = lexer::lex(&src, ast::Fi(i));
-                let n = DashMap::new();
-                let mut p = parser::P::new(&l, &n);
+/// Checks whether each file is already formatted, without writing anything.
+/// Files are checked in parallel (one rayon task per file). Prints which
+/// files are not formatted and exits with status 1 if any file is
+/// unformatted, fails to parse, or fails to read.
+fn check_format(files: Vec<String>) {
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
-                let out = parser::module(&mut p);
-                if p.i < p.tokens.len() {
-                    p.errors.push(parser::Serror::NotAtEOF(p.span(), p.peekt()))
-                }
+    let outcomes: Vec<CheckOutcome> = files
+        .par_iter()
+        .enumerate()
+        .map(|(i, arg)| check_one_file(i, arg))
+        .collect();
 
-                if flags.contains(&Flag::Tokens)
-                    || flags.contains(&Flag::Tree)
-                    || !p.errors.is_empty()
-                {
-                    let mut buf = BufWriter::new(Vec::new());
-                    out.show(0, &mut buf).unwrap();
-                    let inner = String::from_utf8(
-                        buf.into_inner().map_err(|x| format!("{:?}", x)).unwrap(),
-                    )
+    let mut any_bad = false;
+    for (arg, outcome) in files.iter().zip(outcomes.iter()) {
+        match outcome {
+            CheckOutcome::Unformatted => {
+                println!("not formatted: {}", arg);
+                any_bad = true;
+            }
+            CheckOutcome::ParseError => {
+                eprintln!("ERR: {} did not parse cleanly, cannot format", arg);
+                any_bad = true;
+            }
+            CheckOutcome::ReadError(e) => {
+                let abs = env::current_dir()
+                    .map(|cwd| cwd.join(arg).display().to_string())
+                    .unwrap_or_else(|_| arg.clone());
+                eprintln!(
+                    "ERR: could not read '{}': {} (looked relative to the current directory, at '{}')",
+                    arg, e, abs
+                );
+                any_bad = true;
+            }
+            CheckOutcome::Formatted => {}
+        }
+    }
+
+    if any_bad {
+        std::process::exit(1);
+    }
+}
+
+enum FormatResult {
+    Ok { formatted: String, changed: bool },
+    ParseError,
+}
+
+/// Everything `parse_modules`'s per-file loop needs to print/write for one
+/// file, computed in parallel (see `parse_modules`) - only the actual
+/// stdout/stderr/disk side effects stay sequential, so output stays in file
+/// order the way it did before parallelizing.
+struct FileResult {
+    read_err: Option<String>,
+    format_result: Option<FormatResult>,
+    debug_dump: Option<String>,
+}
+
+fn process_one_file(flags: &BTreeSet<Flag>, i: usize, arg: &str) -> FileResult {
+    use std::io::BufWriter;
+
+    let src = match read_source(arg) {
+        Err(e) => {
+            return FileResult {
+                read_err: Some(e.to_string()),
+                format_result: None,
+                debug_dump: None,
+            };
+        }
+        Ok(src) => src,
+    };
+
+    let (l, comments) = lexer::lex(&src, ast::Fi(i));
+    let n = DashMap::new();
+    let mut p = parser::P::new(&l, &n);
+
+    let out = parser::module(&mut p);
+    if p.i < p.tokens.len() {
+        p.errors.push(parser::Serror::NotAtEOF(p.span(), p.peekt()))
+    }
+
+    let format_result = flags.contains(&Flag::Format).then(|| {
+        match (&out, p.errors.is_empty()) {
+            (Some(m), true) => {
+                let formatted = print::print_module(&src, m, &comments);
+                let changed = formatted != src;
+                FormatResult::Ok { formatted, changed }
+            }
+            _ => FormatResult::ParseError,
+        }
+    });
+
+    let debug_dump = (flags.contains(&Flag::Tokens) || flags.contains(&Flag::Tree) || !p.errors.is_empty())
+        .then(|| {
+            let mut buf = BufWriter::new(Vec::new());
+            out.show(0, &mut buf).unwrap();
+            let inner =
+                String::from_utf8(buf.into_inner().map_err(|x| format!("{:?}", x)).unwrap())
                     .map_err(|x| format!("{:?}", x))
                     .unwrap();
-                    println!(
-                        "{} of {}\n===\n{}\n===\n{}\n===\n{}",
-                        p.i,
-                        p.tokens.len(),
-                        p.errors
-                            .iter()
-                            .map(|x| { format!("{:?}\n", x) })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        if flags.contains(&Flag::Tokens) {
-                            p.tokens
-                                .iter()
-                                .map(|(a, s)| format!("{:?} {:?}", a, s))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        } else {
-                            "".to_string()
-                        },
-                        if flags.contains(&Flag::Tree) {
-                            inner
-                        } else {
-                            "".to_string()
+            format!(
+                "{} of {}\n===\n{}\n===\n{}\n===\n{}",
+                p.i,
+                p.tokens.len(),
+                p.errors
+                    .iter()
+                    .map(|x| { format!("{:?}\n", x) })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                if flags.contains(&Flag::Tokens) {
+                    p.tokens
+                        .iter()
+                        .map(|(a, s)| format!("{:?} {:?}", a, s))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    "".to_string()
+                },
+                if flags.contains(&Flag::Tree) { inner } else { "".to_string() }
+            )
+        });
+
+    FileResult { read_err: None, format_result, debug_dump }
+}
+
+pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
+    if flags.contains(&Flag::Format) && flags.contains(&Flag::Check) {
+        check_format(files);
+        return;
+    }
+
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
+    // Lexing/parsing/formatting is the expensive part and each file is
+    // independent, so it runs in parallel (one rayon task per file, same
+    // pattern as `check_format`) - only the actual stdout/stderr/disk
+    // effects below stay sequential, in original file order.
+    let results: Vec<FileResult> = files
+        .par_iter()
+        .enumerate()
+        .map(|(i, arg)| process_one_file(&flags, i, arg))
+        .collect();
+
+    let mut any_bad = false;
+
+    for (arg, result) in files.iter().zip(results) {
+        if let Some(e) = result.read_err {
+            let abs = env::current_dir()
+                .map(|cwd| cwd.join(arg).display().to_string())
+                .unwrap_or_else(|_| arg.clone());
+            eprintln!(
+                "ERR: could not read '{}': {} (looked relative to the current directory, at '{}')",
+                arg, e, abs
+            );
+            if flags.contains(&Flag::Format) {
+                any_bad = true;
+            }
+            continue;
+        }
+
+        if let Some(fr) = result.format_result {
+            match fr {
+                FormatResult::Ok { formatted, changed } => {
+                    if flags.contains(&Flag::Write) {
+                        if arg == "-" {
+                            eprintln!("ERR: cannot use -w with stdin ('-') input");
+                            any_bad = true;
+                        } else if changed {
+                            match fs::write(arg, &formatted) {
+                                Ok(()) => println!("formatted {}", arg),
+                                Err(e) => {
+                                    eprintln!("ERR: {} failed to write: {:?}", arg, e);
+                                    any_bad = true;
+                                }
+                            }
                         }
-                    );
+                    } else {
+                        print!("{}", formatted);
+                    }
+                }
+                FormatResult::ParseError => {
+                    eprintln!("ERR: {} did not parse cleanly, cannot format", arg);
+                    any_bad = true;
                 }
             }
-        });
+        }
+
+        if let Some(dump) = result.debug_dump {
+            println!("{}", dump);
+        }
+    }
+
+    if any_bad {
+        std::process::exit(1);
+    }
 }

@@ -380,6 +380,11 @@ pub struct Header(
     pub Vec<ImportDecl>,
     pub Span,
     pub Span,
+    /// Export list `(`/`)` spans (`Span::zero()` if there's no export list),
+    /// so the printer can detect a break right after `(` like `Typ::Record`/
+    /// `Expr::Array` do.
+    pub Span,
+    pub Span,
 );
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
@@ -435,7 +440,7 @@ pub enum Decl {
 
     ClassKind(ProperName, Typ),
     Class(
-        Option<Vec<Constraint>>,
+        Option<Constraints>,
         ProperName,
         Vec<TypVarBinding>,
         Option<Vec<FunDep>>,
@@ -511,13 +516,27 @@ impl InstBinding {
 }
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct InstHead(pub Option<Vec<Constraint>>, pub QProperName, pub Vec<Typ>);
+pub struct InstHead(pub Option<Constraints>, pub QProperName, pub Vec<Typ>);
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ClassMember(pub Name, pub Typ);
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Constraint(pub QProperName, pub Vec<Typ>);
+
+/// A comma-separated `(A, B) =>`/`(A, B) <=` constraint context, or the
+/// parenless single-constraint form `A =>`/`A <=` (`Span::zero()` open/close
+/// marks the parenless form). Carrying the real bracket spans, rather than
+/// just `Vec<Constraint>`, is what lets the printer tell whether the source
+/// had this expanded across multiple lines.
+#[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Constraints(pub Span, pub Vec<Constraint>, pub Span);
+
+impl Constraints {
+    pub fn iter(&self) -> std::slice::Iter<'_, Constraint> {
+        self.1.iter()
+    }
+}
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct FunDep(pub Vec<Name>, pub Vec<Name>);
@@ -599,8 +618,12 @@ pub enum Binder {
     Char(Char),
     Str(Str),
     Number(bool, Number),
-    Array(Vec<Binder>),
-    Record(Vec<RecordLabelBinder>),
+    /// `[`/`]` bracket spans, needed so `.span()` doesn't collapse to
+    /// `Span::Zero` for an empty `[]` (which would make `print_case_branch`'s
+    /// blank-line/break calculations lose that source row entirely).
+    Array(Span, Vec<Binder>, Span),
+    /// Same reasoning as `Array` above, for `{`/`}` and empty `{}`.
+    Record(Span, Vec<RecordLabelBinder>, Span),
     Paren(Span, Box<Binder>, Span),
 }
 
@@ -708,6 +731,9 @@ pub struct CaseBranch(pub Vec<Binder>, pub GuardedExpr);
 
 #[derive(hemlis_macros::Ast, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DoStmt {
-    Stmt(Option<Binder>, Expr),
-    Let(Vec<LetBinding>),
+    Stmt(Option<Binder>, Box<Expr>),
+    /// The `Span` is the `let` keyword's own span, so `.span()` doesn't
+    /// start at the first binding (after `let`) and undercount a preceding
+    /// blank-line gap on reparse of our own output.
+    Let(Span, Vec<LetBinding>),
 }

@@ -1,5 +1,5 @@
 ---
-source: src/parser.rs
+source: src/lib/parser.rs
 expression: "p_expr(\"(1 + 1) * 2 + foo @A `a + b` A.B.C.d A.B.+ q :: Int\")"
 ---
 30 of 30
@@ -11,6 +11,8 @@ Module
   NULL
   (0, 0)->(0, 6)
   (0, 12)->(0, 17)
+  (0, 0)->(0, 0)
+  (0, 0)->(0, 0)
   Decl::Def
    Name
     (2, 0)->(2, 1)

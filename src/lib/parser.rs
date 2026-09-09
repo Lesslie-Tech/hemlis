@@ -234,7 +234,10 @@ fn header<'t>(p: &mut P<'t>) -> Option<Header> {
     let m = p.span();
     kw_module(p)?;
     let name = mname(p)?;
-    let exports = exports(p);
+    let (exports, exports_open, exports_close) = match exports(p) {
+        Some((open, exports, close)) => (Some(exports), open, close),
+        None => (None, Span::zero(), Span::zero()),
+    };
     p.recover();
     let w = p.span();
     kw_where(p)?;
@@ -242,7 +245,15 @@ fn header<'t>(p: &mut P<'t>) -> Option<Header> {
         p.skip();
     }
     let imports = imports(p);
-    Some(Header(name, exports, imports, m, w))
+    Some(Header(
+        name,
+        exports,
+        imports,
+        m,
+        w,
+        exports_open,
+        exports_close,
+    ))
 }
 
 // TODO: pick the errros from the branch that moved the most consumed tokens
@@ -395,12 +406,14 @@ where
     Some(out)
 }
 
-fn exports<'t>(p: &mut P<'t>) -> Option<Vec<Export>> {
+fn exports<'t>(p: &mut P<'t>) -> Option<(Span, Vec<Export>, Span)> {
     if matches!(p.peekt(), Some(T::LeftParen)) {
+        let open = p.span();
         kw_lp(p);
         let exports = sep_until(p, "export", kw_comma, export, next_is!(T::RightParen));
+        let close = p.span();
         kw_rp(p);
-        Some(exports)
+        Some((open, exports, close))
     } else {
         None
     }
@@ -594,8 +607,8 @@ fn typ_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Typ> {
                 p: Serror::Info(p.span(), "row or paren"),
                 |p: &mut P<'t>| {
                     let r = row(p)?;
-                    kw_rp(p)?;
                     let end = p.span();
+                    kw_rp(p)?;
                     Some(Typ::Row(S(r, start.merge(end))))
                 },
                 |p: &mut P<'t>| {
@@ -829,6 +842,12 @@ fn simple_typ_var_bindings<'t>(p: &mut P<'t>) -> Vec<TypVarBinding> {
 }
 
 fn row_label<'t>(p: &mut P<'t>) -> Option<(Label, Typ)> {
+    // Must peek for `::` before committing to `label(p)?`: a plain `Typ::Str` (e.g.
+    // `Foo.Bar ("key")`) would otherwise get consumed here on the way to failing,
+    // and that partial consumption doesn't roll back through `sep_until`.
+    if !matches!(p.peek2t(), (_, Some(T::ColonColon))) {
+        return None;
+    }
     let l = label(p)?;
     kw_coloncolon(p)?;
     let t = typ(p)?;
@@ -858,7 +877,9 @@ fn row<'t>(p: &mut P<'t>) -> Option<Row> {
 enum ExprOp {
     Op(QOp),
     Infix(Expr),
-    App,
+    // Carries the atom the lookahead already parsed, so `pratt_expr` can reuse it
+    // as `rhs` instead of parsing it again.
+    App(Expr),
 }
 
 fn expr_op<'t>(p: &mut P<'t>) -> Option<ExprOp> {
@@ -871,10 +892,11 @@ fn expr_op<'t>(p: &mut P<'t>) -> Option<ExprOp> {
             Some(ExprOp::Infix(e))
         }
         _ => {
-            if matches!(expr_atom(p, None)?, Expr::Error(_)) {
+            let atom = expr_atom(p, None)?;
+            if matches!(atom, Expr::Error(_)) {
                 None
             } else {
-                Some(ExprOp::App)
+                Some(ExprOp::App(atom))
             }
         }
     }
@@ -884,8 +906,16 @@ fn expr_fop(t: &ExprOp) -> Prec {
     use Prec::*;
     match t {
         ExprOp::Op(qop) => op_fixity((qop.1).0 .0),
-        ExprOp::Infix(_) => L(10),
-        ExprOp::App => L(11),
+        // Backtick infix and application both bind tighter than any
+        // declared operator fixity - `op_fixity` tops out at real
+        // PureScript precedence 10 (encoded as 11, see its own doc comment),
+        // so these sit one and two slots above that, not one/two above the
+        // old real-world max of 9. Application must stay strictly tighter
+        // than backtick infix, which must stay strictly tighter than every
+        // declared operator, no matter how high a codebase's own fixity
+        // declarations go.
+        ExprOp::Infix(_) => L(11),
+        ExprOp::App(_) => L(12),
     }
 }
 
@@ -895,6 +925,9 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     use Prec::*;
     // Precedence 0
     if ud == Ud::new("$") {
+        return R(1);
+    }
+    if ud == Ud::new("#>") {
         return R(1);
     }
     // Precedence 1
@@ -917,6 +950,9 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new("||") {
         return R(3);
     }
+    if ud == Ud::new(":||") {
+        return R(3);
+    }
     // Precedence 3
     if ud == Ud::new("&&") {
         return R(4);
@@ -929,6 +965,9 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     }
     if ud == Ud::new("<??>") {
         return L(4);
+    }
+    if ud == Ud::new(":&&") {
+        return R(4);
     }
     // Precedence 4
     if ud == Ud::new("==") {
@@ -970,11 +1009,59 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new("$>") {
         return L(5);
     }
+    if ud == Ud::new(">?") {
+        return L(5);
+    }
+    if ud == Ud::new(">=?") {
+        return L(5);
+    }
+    if ud == Ud::new("<?") {
+        return L(5);
+    }
+    if ud == Ud::new("<=?") {
+        return L(5);
+    }
+    if ud == Ud::new("<*?") {
+        return L(5);
+    }
+    if ud == Ud::new("<||>") {
+        return L(5);
+    }
+    if ud == Ud::new("<&&>") {
+        return L(5);
+    }
+    if ud == Ud::new(":<") {
+        return L(5);
+    }
+    if ud == Ud::new(":<=") {
+        return L(5);
+    }
+    if ud == Ud::new(":>") {
+        return L(5);
+    }
+    if ud == Ud::new(":>=") {
+        return L(5);
+    }
+    if ud == Ud::new(":=") {
+        return L(5);
+    }
+    if ud == Ud::new(":/=") {
+        return L(5);
+    }
+    if ud == Ud::new("¤") {
+        return R(5);
+    }
     // Precedence 5
     if ud == Ud::new("<>") {
         return R(6);
     }
     if ud == Ud::new(":|") {
+        return R(6);
+    }
+    if ud == Ud::new(":*") {
+        return L(6);
+    }
+    if ud == Ud::new(":<>") {
         return R(6);
     }
     // Precedence 6
@@ -987,6 +1074,18 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new(":") {
         return R(7);
     }
+    if ud == Ud::new(":+") {
+        return L(7);
+    }
+    if ud == Ud::new(":-") {
+        return L(7);
+    }
+    // A conflicting declaration also exists elsewhere (`infixl 9`, for an
+    // indexing operator) - only one fixity can be picked for a bare symbol,
+    // and this is the one in use.
+    if ud == Ud::new("!") {
+        return R(7);
+    }
     // Precedence 7
     if ud == Ud::new("*") {
         return L(8);
@@ -995,6 +1094,12 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
         return L(8);
     }
     if ud == Ud::new("%") {
+        return L(8);
+    }
+    if ud == Ud::new("%%") {
+        return L(8);
+    }
+    if ud == Ud::new("//") {
         return L(8);
     }
     // Precedence 8
@@ -1008,6 +1113,16 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new(">>>") {
         return R(10);
     }
+    // Precedence 10
+    if ud == Ud::new(".&.") {
+        return L(11);
+    }
+    if ud == Ud::new(".|.") {
+        return L(11);
+    }
+    if ud == Ud::new(".^.") {
+        return L(11);
+    }
     // Unknown operator
     R(1)
 }
@@ -1016,7 +1131,8 @@ fn expr_mrg(op: ExprOp, lhs: Expr, rhs: Expr) -> Expr {
     match op {
         ExprOp::Op(op) => Expr::Op(b!(lhs), op, b!(rhs)),
         ExprOp::Infix(op) => Expr::Infix(b!(lhs), b!(op), b!(rhs)),
-        ExprOp::App => Expr::App(b!(lhs), b!(rhs)),
+        // `rhs` is already the atom this variant carries (see pratt_expr).
+        ExprOp::App(_) => Expr::App(b!(lhs), b!(rhs)),
     }
 }
 
@@ -1045,10 +1161,16 @@ fn expr_where<'t>(p: &mut P<'t>) -> Option<Expr> {
 }
 
 fn pratt_expr<'t>(p: &mut P<'t>, mut lhs: Expr, prec: usize) -> Option<Expr> {
-    while let Some(outer_lookahead) = (|p: &mut P<'t>| {
-        let op = expr_op(&mut p.fork())?;
+    while let Some(mut outer_lookahead) = (|p: &mut P<'t>| {
+        let mut fork = p.fork();
+        let op = expr_op(&mut fork)?;
         if expr_fop(&op).prec() >= prec {
-            if !matches!(op, ExprOp::App) {
+            if matches!(op, ExprOp::App(_)) {
+                // Commit the fork's position instead of reparsing the atom via
+                // expr_atom below - reparsing here recurses O(2^depth) instead of
+                // O(depth) for nested App chains (caused a real hang).
+                p.i = fork.i;
+            } else {
                 let _ = expr_op(p)?;
             }
             Some(op)
@@ -1057,7 +1179,14 @@ fn pratt_expr<'t>(p: &mut P<'t>, mut lhs: Expr, prec: usize) -> Option<Expr> {
         }
     })(p)
     {
-        let mut rhs = expr_atom(p, Some("Expected an expression after the operator"))?;
+        let mut rhs = match &mut outer_lookahead {
+            // Reuse the atom the lookahead already parsed; the placeholder left
+            // behind is never read again.
+            ExprOp::App(atom) => std::mem::replace(atom, Expr::Error(Span::zero())),
+            ExprOp::Op(_) | ExprOp::Infix(_) => {
+                expr_atom(p, Some("Expected an expression after the operator"))?
+            }
+        };
         while let Some(next) = (|p: &mut P<'t>| {
             let op = expr_op(&mut p.fork())?;
             expr_fop(&op).next(expr_fop(&outer_lookahead).prec())
@@ -1258,17 +1387,18 @@ fn do_statement<'t>(p: &mut P<'t>) -> Option<DoStmt> {
             let b = binder(p)?;
             kw_left_arrow(p)?;
             let e = expr(p)?;
-            Some(Some(DoStmt::Stmt(Some(b), e)))
+            Some(Some(DoStmt::Stmt(Some(b), b!(e))))
         },
         |p: &mut P<'t>| {
             let e = expr(p)?;
-            Some(Some(DoStmt::Stmt(None, e)))
+            Some(Some(DoStmt::Stmt(None, b!(e))))
         },
         |p: &mut P<'t>| {
+            let start = p.span();
             kw_let(p)?;
             // Handle inline ones?
             let b = sep_until_(p, "let-bindings", let_binding)?;
-            Some(Some(DoStmt::Let(b)))
+            Some(Some(DoStmt::Let(start, b)))
         },
     )?
 }
@@ -1362,6 +1492,7 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
         }
         (Some(T::Number(_)), _) => Some(Binder::Number(false, number(p)?)),
         (Some(T::LeftSquare), _) => {
+            let start = p.span();
             kw_ls(p)?;
             let bs = sep_until(
                 p,
@@ -1370,10 +1501,12 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
                 binder,
                 next_is!(T::RightSquare),
             );
+            let end = p.span();
             kw_rs(p)?;
-            Some(Binder::Array(bs))
+            Some(Binder::Array(start, bs, end))
         }
         (Some(T::LeftBrace), _) => {
+            let start = p.span();
             kw_lb(p)?;
             let bs = sep_until(
                 p,
@@ -1382,8 +1515,9 @@ fn binder_atom<'t>(p: &mut P<'t>, err: Option<&'static str>) -> Option<Binder> {
                 record_binder,
                 next_is!(T::RightBrace),
             );
+            let end = p.span();
             kw_rb(p)?;
-            Some(Binder::Record(bs))
+            Some(Binder::Record(start, bs, end))
         }
         (Some(T::LeftParen), _) => {
             let start = p.span();
@@ -1474,6 +1608,12 @@ fn record_updates<'t>(p: &mut P<'t>) -> Option<(Span, Vec<RecordUpdate>, Span)> 
         record_update,
         next_is!(T::RightBrace),
     );
+    // A real record update list needs at least one update: `x {}` is `x` applied to
+    // an empty record literal, not a vacuous update. Failing here lets `{}` fall
+    // through to the ordinary atom/App path via the caller's `ttry!`/`alt!`.
+    if updates.is_empty() {
+        return None;
+    }
     let end = p.span();
     kw_rb(p)?;
     Some((start, updates, end))
@@ -1763,25 +1903,30 @@ fn inst_binding<'t>(p: &mut P<'t>) -> Option<InstBinding> {
 
 fn data_cnstr<'t>(p: &mut P<'t>) -> Option<(ProperName, Vec<Typ>)> {
     let n = proper(p)?;
-    let ts = many_until(p, "data cnstr", typ, next_is!(T::Pipe | T::LayTop));
+    // Fields are atomic types (`typ_atom`, not the full `typ` parser), matching
+    // PureScript's `dataCtor ::= properName atype*` - `C Foo Bar` is two fields,
+    // an application as one field needs explicit parens (`C (Foo Bar)`).
+    let ts = many_until(p, "data cnstr", |p| typ_atom(p, None), next_is!(T::Pipe | T::LayTop));
     Some((n, ts))
 }
 
-fn constraints<'t>(p: &mut P<'t>, l: bool) -> Option<Vec<Constraint>> {
+fn constraints<'t>(p: &mut P<'t>, l: bool) -> Option<Constraints> {
     alt!(p: Serror::Info(p.span(), "constraints"),
         |p: &mut P<'t>| {
+            let open = p.span();
             kw_lp(p)?;
             let cs = sep_until(p, "constraints-sep", kw_comma, typ, next_is!(T::RightParen))
                 .into_iter()
                 .map(|x| x.cast_to_constraint())
                 .collect::<Option<Vec<_>>>()?;
+            let close = p.span();
             kw_rp(p)?;
             if l {
                 kw_left_imply(p)?;
             } else {
                 kw_right_imply(p)?;
             }
-            Some(Some(cs))
+            Some(Some(Constraints(open, cs, close)))
         },
         |p: &mut P<'t>| {
             // NOTE: There's just parsing conflicts everywhere :(
@@ -1791,10 +1936,10 @@ fn constraints<'t>(p: &mut P<'t>, l: bool) -> Option<Vec<Constraint>> {
             } else {
                 kw_right_imply(p)?;
             }
-            Some(Some(vec![t]))
+            Some(Some(Constraints(Span::zero(), vec![t], Span::zero())))
         },
         |_: &mut P<'t>| {
-            Some(None::<Vec<Constraint>>)
+            Some(None::<Constraints>)
         }
     )?
 }
@@ -1926,7 +2071,7 @@ impl<'s> P<'s> {
     fn prev(&self) -> (Option<Token<'s>>, Span) {
         (
             self.tokens.get(self.i - 1).and_then(|x| x.0.ok()),
-            self.span(),
+            self.tokens.get(self.i - 1).map(|x| x.1).unwrap_or(Span::Zero),
         )
     }
 
@@ -2026,10 +2171,10 @@ impl<'s> P<'s> {
             if self.i > self.tokens.len() {
                 break;
             }
-            if let (Some(x), _) = self.peek_() {
-                if f(x) {
-                    return true;
-                }
+            if let (Some(x), _) = self.peek_()
+                && f(x)
+            {
+                return true;
             }
             self.skip();
         }
@@ -2040,11 +2185,11 @@ impl<'s> P<'s> {
     where
         F: Fn(Token<'s>) -> bool,
     {
-        if let (Some(x), _) = self.peek() {
-            if f(x) {
-                self.next();
-                return Some(());
-            }
+        if let (Some(x), _) = self.peek()
+            && f(x)
+        {
+            self.next();
+            return Some(());
         }
         self.raise(Serror::Unexpected(self.span(), self.peekt(), err));
         None
@@ -2071,7 +2216,7 @@ mod tests {
                 use crate::lexer;
                 use std::io::BufWriter;
 
-                let l = lexer::lex(&src, Fi(0));
+                let (l, _comments) = lexer::lex(&src, Fi(0));
                 let d = dashmap::DashMap::new();
                 let mut p = P::new(&l, &d);
 
@@ -2261,6 +2406,32 @@ import A.B.C hiding (foo)
         ))
     }
 
+    /// A precedence-10 operator (the real PureScript max, one above the
+    /// previous highest-known `<<<`/`>>>` at 9) must still bind looser than
+    /// application on both sides - regression test for a real bug where
+    /// application and this operator's internal encoding collided at the
+    /// same slot, mis-parsing this as `(f a .&. g) b`.
+    #[test]
+    fn expr_precedence_10_op_binds_looser_than_app() {
+        assert_snapshot!(p_expr("f a .&. g b"))
+    }
+
+    /// A left-associative operator newly added to `op_fixity` (`infixl 4`)
+    /// chains without parens on repetition, the same way `+`/`<>`/etc
+    /// already do.
+    #[test]
+    fn expr_new_left_assoc_op_chains_without_parens() {
+        assert_snapshot!(p_expr("a :< b :< c"))
+    }
+
+    /// A right-associative operator newly added to `op_fixity` (`infixr 2`)
+    /// chains without parens on repetition, the same way `||`/`<>`/etc
+    /// already do.
+    #[test]
+    fn expr_new_right_assoc_op_chains_without_parens() {
+        assert_snapshot!(p_expr("a :|| b :|| c"))
+    }
+
     #[test]
     fn expr_record() {
         assert_snapshot!(p_expr("{ a, b: 1 }"))
@@ -2279,6 +2450,11 @@ import A.B.C hiding (foo)
     #[test]
     fn expr_record_update_full() {
         assert_snapshot!(p_expr("foo { a = 1, b = { c = 1 }, d = { e: 1 } }"))
+    }
+
+    #[test]
+    fn expr_empty_braces_is_app_to_empty_record_not_a_vacuous_update() {
+        assert_snapshot!(p_expr("foo {}"))
     }
 
     #[test]
@@ -2568,5 +2744,49 @@ module Test where
 f :: forall n. Compare n (-1) GT => P n
 "
         ))
+    }
+
+    // Guards against pratt_expr's App lookahead reparsing atoms and recursing
+    // O(2^depth) instead of O(depth) on nested App chains (a real report hung here).
+    #[test]
+    fn deeply_nested_app_chain_parses_without_exponential_blowup() {
+        use super::*;
+        use crate::lexer;
+
+        let depth = 25;
+        let mut inner = "Leaf".to_string();
+        for _ in 0..depth {
+            inner = format!("Ctor {{ children: [ {} ] }}", inner);
+        }
+        let src = format!("module A where\n\nx = {}\n", inner);
+
+        let (l, _comments) = lexer::lex(&src, Fi(0));
+        let d = dashmap::DashMap::new();
+        let mut p = P::new(&l, &d);
+        let m = module(&mut p).expect("module should parse");
+        assert!(p.errors.is_empty(), "parse errors: {:?}", p.errors);
+
+        fn nesting_depth(e: &Expr) -> usize {
+            let Expr::App(_, arg) = e else {
+                return 0;
+            };
+            let Expr::Record(_, fields, _) = arg.as_ref() else {
+                panic!("expected the App's argument to be a record: {:?}", arg);
+            };
+            let [RecordLabelExpr::Field(_, value)] = fields.as_slice() else {
+                panic!("expected exactly one record field: {:?}", fields);
+            };
+            let Expr::Array(_, items, _) = value else {
+                panic!("expected the field's value to be an array: {:?}", value);
+            };
+            let [item] = items.as_slice() else {
+                panic!("expected exactly one array item: {:?}", items);
+            };
+            1 + nesting_depth(item)
+        }
+        let Decl::Def(_, _, GuardedExpr::Unconditional(e)) = &m.1[0] else {
+            panic!("expected a single value declaration");
+        };
+        assert_eq!(nesting_depth(e), depth);
     }
 }
