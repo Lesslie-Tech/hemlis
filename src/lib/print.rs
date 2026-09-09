@@ -1717,11 +1717,28 @@ impl<'s> Printer<'s> {
     /// only the fallback anchor for a clause with no guards; normally the
     /// last guard is checked instead (see `print_guarded_expr`).
     fn print_guard_clause(&mut self, before: Span, guards: &[Guard], e: &Expr, arrow: &str) {
+        // A source break between guards (each on its own line, like
+        // `case`'s multi-scrutinee list) keeps them one per line instead of
+        // always collapsing onto `|`'s own line - see
+        // `case_multiple_scrutinees_that_would_break_print_one_per_line` for
+        // the identical shape.
+        let spans: Vec<Span> = guards.iter().map(|g| g.span()).collect();
+        let multiline = Self::any_breaks(&spans);
+        let mut prev_span = before;
         for (i, g) in guards.iter().enumerate() {
             if i > 0 {
-                self.raw(", ");
+                if multiline {
+                    let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+                    if !just_flushed_comment {
+                        self.newline();
+                    }
+                    self.raw(", ");
+                } else {
+                    self.raw(", ");
+                }
             }
             self.print_guard(g);
+            prev_span = g.span();
         }
         let before = guards.last().map_or(before, |g| g.span());
         self.print_arrow_rhs(before, arrow, e);
@@ -2937,6 +2954,29 @@ mod tests {
                 in
                 -- NOTE: explanation
                 y
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `print_guard_clause`'s comma-separated guard list had no
+    /// break-awareness at all - it always collapsed onto one line
+    /// regardless of source layout, unlike `print_guarded_expr`'s own
+    /// clause-list (`|`-separated alternatives), which already respects a
+    /// source break the same way `case`'s multi-scrutinee list does.
+    #[test]
+    fn case_branch_guards_that_broke_in_source_stay_one_per_line() {
+        let src = indoc! {"
+            module Foo where
+
+            f x =
+              case x of
+                Pat
+                  | GuardA a <- x
+                  , GuardB b <- x
+                  , c ->
+                    result a b c
         "};
         let out = fmt(src);
         assert_eq!(out, src);

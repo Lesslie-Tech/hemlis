@@ -906,8 +906,16 @@ fn expr_fop(t: &ExprOp) -> Prec {
     use Prec::*;
     match t {
         ExprOp::Op(qop) => op_fixity((qop.1).0 .0),
-        ExprOp::Infix(_) => L(10),
-        ExprOp::App(_) => L(11),
+        // Backtick infix and application both bind tighter than any
+        // declared operator fixity - `op_fixity` tops out at real
+        // PureScript precedence 10 (encoded as 11, see its own doc comment),
+        // so these sit one and two slots above that, not one/two above the
+        // old real-world max of 9. Application must stay strictly tighter
+        // than backtick infix, which must stay strictly tighter than every
+        // declared operator, no matter how high a codebase's own fixity
+        // declarations go.
+        ExprOp::Infix(_) => L(11),
+        ExprOp::App(_) => L(12),
     }
 }
 
@@ -917,6 +925,9 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     use Prec::*;
     // Precedence 0
     if ud == Ud::new("$") {
+        return R(1);
+    }
+    if ud == Ud::new("#>") {
         return R(1);
     }
     // Precedence 1
@@ -939,6 +950,9 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new("||") {
         return R(3);
     }
+    if ud == Ud::new(":||") {
+        return R(3);
+    }
     // Precedence 3
     if ud == Ud::new("&&") {
         return R(4);
@@ -951,6 +965,9 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     }
     if ud == Ud::new("<??>") {
         return L(4);
+    }
+    if ud == Ud::new(":&&") {
+        return R(4);
     }
     // Precedence 4
     if ud == Ud::new("==") {
@@ -992,11 +1009,59 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new("$>") {
         return L(5);
     }
+    if ud == Ud::new(">?") {
+        return L(5);
+    }
+    if ud == Ud::new(">=?") {
+        return L(5);
+    }
+    if ud == Ud::new("<?") {
+        return L(5);
+    }
+    if ud == Ud::new("<=?") {
+        return L(5);
+    }
+    if ud == Ud::new("<*?") {
+        return L(5);
+    }
+    if ud == Ud::new("<||>") {
+        return L(5);
+    }
+    if ud == Ud::new("<&&>") {
+        return L(5);
+    }
+    if ud == Ud::new(":<") {
+        return L(5);
+    }
+    if ud == Ud::new(":<=") {
+        return L(5);
+    }
+    if ud == Ud::new(":>") {
+        return L(5);
+    }
+    if ud == Ud::new(":>=") {
+        return L(5);
+    }
+    if ud == Ud::new(":=") {
+        return L(5);
+    }
+    if ud == Ud::new(":/=") {
+        return L(5);
+    }
+    if ud == Ud::new("¤") {
+        return R(5);
+    }
     // Precedence 5
     if ud == Ud::new("<>") {
         return R(6);
     }
     if ud == Ud::new(":|") {
+        return R(6);
+    }
+    if ud == Ud::new(":*") {
+        return L(6);
+    }
+    if ud == Ud::new(":<>") {
         return R(6);
     }
     // Precedence 6
@@ -1009,6 +1074,18 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new(":") {
         return R(7);
     }
+    if ud == Ud::new(":+") {
+        return L(7);
+    }
+    if ud == Ud::new(":-") {
+        return L(7);
+    }
+    // A conflicting declaration also exists (`infixl 9 ix` in
+    // Foreign.Index) - only one fixity can be picked for a bare symbol, and
+    // this is the one in use.
+    if ud == Ud::new("!") {
+        return R(7);
+    }
     // Precedence 7
     if ud == Ud::new("*") {
         return L(8);
@@ -1017,6 +1094,12 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
         return L(8);
     }
     if ud == Ud::new("%") {
+        return L(8);
+    }
+    if ud == Ud::new("%%") {
+        return L(8);
+    }
+    if ud == Ud::new("//") {
         return L(8);
     }
     // Precedence 8
@@ -1029,6 +1112,16 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     }
     if ud == Ud::new(">>>") {
         return R(10);
+    }
+    // Precedence 10
+    if ud == Ud::new(".&.") {
+        return L(11);
+    }
+    if ud == Ud::new(".|.") {
+        return L(11);
+    }
+    if ud == Ud::new(".^.") {
+        return L(11);
     }
     // Unknown operator
     R(1)
@@ -2311,6 +2404,32 @@ import A.B.C hiding (foo)
         assert_snapshot!(p_expr(
             "(1 + 1) * 2 + foo @A `a + b` A.B.C.d A.B.+ q :: Int"
         ))
+    }
+
+    /// A precedence-10 operator (the real PureScript max, one above the
+    /// previous highest-known `<<<`/`>>>` at 9) must still bind looser than
+    /// application on both sides - regression test for a real bug where
+    /// application and this operator's internal encoding collided at the
+    /// same slot, mis-parsing this as `(f a .&. g) b`.
+    #[test]
+    fn expr_precedence_10_op_binds_looser_than_app() {
+        assert_snapshot!(p_expr("f a .&. g b"))
+    }
+
+    /// A left-associative operator newly added to `op_fixity` (pay-backend's
+    /// `Kanon.Query` comparison operators, `infixl 4`) chains without parens
+    /// on repetition, the same way `+`/`<>`/etc already do.
+    #[test]
+    fn expr_new_left_assoc_op_chains_without_parens() {
+        assert_snapshot!(p_expr("a :< b :< c"))
+    }
+
+    /// A right-associative operator newly added to `op_fixity`
+    /// (pay-backend's `Kanon.Query` boolean-or, `infixr 2`) chains without
+    /// parens on repetition, the same way `||`/`<>`/etc already do.
+    #[test]
+    fn expr_new_right_assoc_op_chains_without_parens() {
+        assert_snapshot!(p_expr("a :|| b :|| c"))
     }
 
     #[test]
