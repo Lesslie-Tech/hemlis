@@ -6290,6 +6290,12 @@ async fn main() {
                 eprintln!("{}", hemlis_lib::version());
                 std::process::exit(0);
             }
+            // An empty argv entry carries no instruction, so refusing to start
+            // over one is never useful. Some LSP clients emit one
+            // unavoidably: pepebecker.vscode-lsp-config (the VS Code setup in
+            // the README) builds argv as `args: [server.args]`, so an empty or
+            // omitted `args` still spawns us with one empty argument.
+            "" => {}
             x => {
                 eprintln!("Unknown arg: {}", x);
                 std::process::exit(1);
