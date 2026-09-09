@@ -1080,9 +1080,9 @@ pub(crate) fn op_fixity(ud: Ud) -> Prec {
     if ud == Ud::new(":-") {
         return L(7);
     }
-    // A conflicting declaration also exists (`infixl 9 ix` in
-    // Foreign.Index) - only one fixity can be picked for a bare symbol, and
-    // this is the one in use.
+    // A conflicting declaration also exists elsewhere (`infixl 9`, for an
+    // indexing operator) - only one fixity can be picked for a bare symbol,
+    // and this is the one in use.
     if ud == Ud::new("!") {
         return R(7);
     }
@@ -2416,17 +2416,17 @@ import A.B.C hiding (foo)
         assert_snapshot!(p_expr("f a .&. g b"))
     }
 
-    /// A left-associative operator newly added to `op_fixity` (pay-backend's
-    /// `Kanon.Query` comparison operators, `infixl 4`) chains without parens
-    /// on repetition, the same way `+`/`<>`/etc already do.
+    /// A left-associative operator newly added to `op_fixity` (`infixl 4`)
+    /// chains without parens on repetition, the same way `+`/`<>`/etc
+    /// already do.
     #[test]
     fn expr_new_left_assoc_op_chains_without_parens() {
         assert_snapshot!(p_expr("a :< b :< c"))
     }
 
-    /// A right-associative operator newly added to `op_fixity`
-    /// (pay-backend's `Kanon.Query` boolean-or, `infixr 2`) chains without
-    /// parens on repetition, the same way `||`/`<>`/etc already do.
+    /// A right-associative operator newly added to `op_fixity` (`infixr 2`)
+    /// chains without parens on repetition, the same way `||`/`<>`/etc
+    /// already do.
     #[test]
     fn expr_new_right_assoc_op_chains_without_parens() {
         assert_snapshot!(p_expr("a :|| b :|| c"))
