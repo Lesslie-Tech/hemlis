@@ -44,6 +44,14 @@ struct Printer<'s> {
     /// once something else has been glued in front, ordinary relocation
     /// resumes.
     glued_floor: Option<usize>,
+    /// True screen column corresponding to `out`'s own position 0, for as
+    /// long as `out` holds no `\n` yet - `current_column()`'s char count
+    /// alone is only the real column for the top-level buffer (which starts
+    /// at column 0); a scratch buffer swapped in by `render_at_column`/
+    /// `render_indented` starts empty but virtually continues from wherever
+    /// printing had reached before the swap, which this remembers. Once a
+    /// real `\n` lands in `out`, its own written indent makes this moot.
+    out_floor: usize,
 }
 
 /// One or more source `ImportDecl`s for the same (module, alias, hiding-ness),
@@ -79,6 +87,7 @@ impl<'s> Printer<'s> {
             indent: 0,
             in_broken_sig: false,
             glued_floor: None,
+            out_floor: 0,
         }
     }
 
@@ -97,16 +106,13 @@ impl<'s> Printer<'s> {
     }
 
     /// Column of wherever printing continues on the current line. At a
-    /// fresh line this equals `self.indent`; mid-line (something glued
-    /// after `:: `/`-> `/etc.) it's the real width printed so far.
+    /// fresh line this is `out_floor` (usually 0, or a scratch buffer's
+    /// virtual starting column); mid-line (something glued after
+    /// `:: `/`-> `/etc.) it's that plus the real width printed since.
     fn current_column(&self) -> usize {
         match self.out.rfind('\n') {
             Some(i) => self.out[i + 1..].chars().count(),
-            // Empty `out` (start of print, or a fresh scratch buffer
-            // swapped in by `render_indented`/`render_at_column`, whose
-            // `with_indent_at` set `self.indent` without writing spaces).
-            None if self.out.is_empty() => self.indent,
-            None => self.out.chars().count(),
+            None => self.out_floor + self.out.chars().count(),
         }
     }
 
@@ -141,6 +147,22 @@ impl<'s> Printer<'s> {
         self.out.truncate(trimmed_len);
         self.out.push('\n');
         for _ in 0..self.indent {
+            self.out.push(' ');
+        }
+    }
+
+    /// Like `newline()`, but forces the line to have exactly `col` spaces of
+    /// indent even if we're already at a fresh line - `newline()`'s no-op
+    /// short-circuit trusts an existing fresh line's width, which is wrong
+    /// right after something (e.g. `flush_comments_before`) left one at a
+    /// different indent than `col`.
+    fn realign_to(&mut self, col: usize) {
+        let trimmed = self.out.trim_end_matches(' ').len();
+        self.out.truncate(trimmed);
+        if !self.out.is_empty() && !self.out.ends_with('\n') {
+            self.out.push('\n');
+        }
+        for _ in 0..col {
             self.out.push(' ');
         }
     }
@@ -200,7 +222,9 @@ impl<'s> Printer<'s> {
         for _ in 0..levels {
             self.indent_in();
         }
+        let saved_floor = std::mem::replace(&mut self.out_floor, self.indent);
         print_inner(self);
+        self.out_floor = saved_floor;
         for _ in 0..levels {
             self.indent_out();
         }
@@ -211,7 +235,9 @@ impl<'s> Printer<'s> {
     /// `with_indent_at`), used by `print_paren_block` for a glued `(`.
     fn render_at_column(&mut self, col: usize, print_inner: impl FnOnce(&mut Self)) -> String {
         let saved = std::mem::take(&mut self.out);
+        let saved_floor = std::mem::replace(&mut self.out_floor, col);
         self.with_indent_at(col, print_inner);
+        self.out_floor = saved_floor;
         std::mem::replace(&mut self.out, saved)
     }
 
@@ -298,7 +324,7 @@ impl<'s> Printer<'s> {
     ///   hangs under the exact column after `( ` (a type-level arrow/`::`
     ///   never relocates, so this must account for the glued prefix's real
     ///   width); an expr just hangs one level deeper as usual.
-    fn print_paren_block(&mut self, force_block: bool, print_inner: impl FnOnce(&mut Self)) {
+    fn print_paren_block(&mut self, force_block: bool, close: Span, print_inner: impl FnOnce(&mut Self)) {
         // A paren is its own bracketed context - reset so it doesn't inherit
         // an enclosing broken-signature's forced expansion (see `print_row`).
         let outer_in_broken_sig = self.in_broken_sig;
@@ -308,11 +334,21 @@ impl<'s> Printer<'s> {
         let open_col = self.current_column();
         let inner_text = self.render_at_column(open_col + 2, print_inner);
         self.in_broken_sig = outer_in_broken_sig;
+        let has_comment_before_close =
+            self.comments.get(self.comment_idx).is_some_and(|(_, s)| s.lo().0 < close.lo().0);
         self.raw("(");
-        if inner_text.contains('\n') || force_block {
+        if inner_text.contains('\n') || force_block || has_comment_before_close {
             self.raw(" ");
             self.raw(&inner_text);
-            self.with_indent_at(open_col, Self::newline);
+            if has_comment_before_close {
+                let hang_col = inner_text
+                    .rsplit('\n')
+                    .next()
+                    .map(|l| l.len() - l.trim_start().len())
+                    .unwrap_or(open_col);
+                self.with_indent_at(hang_col, |p| p.flush_comments_before(close.lo().0));
+            }
+            self.realign_to(open_col);
         } else {
             self.raw(&inner_text);
         }
@@ -367,6 +403,61 @@ impl<'s> Printer<'s> {
                 self.insert_blank_line();
             }
         }
+    }
+
+    /// `flush_comments_before`, for a boundary keyword with no span of its
+    /// own (`in`, after a `let`/`ado` bindings block) - `line` is only an
+    /// upper bound (the following expression's line), not the keyword's
+    /// actual line, so unlike `flush_comments_before` this never inserts a
+    /// blank line after the last flushed comment (still preserved between
+    /// two comments, where both positions are real).
+    fn flush_comments_before_keyword(&mut self, line: usize) {
+        while self.comment_idx < self.comments.len() {
+            let (_, span) = &self.comments[self.comment_idx];
+            if span.lo().0 >= line {
+                break;
+            }
+            let hi = span.hi().0;
+            self.emit_pending_comment();
+            if let Some((_, s)) = self.comments.get(self.comment_idx)
+                && s.lo().0 < line
+                && s.lo().0 > hi + 1
+            {
+                self.insert_blank_line();
+            }
+        }
+    }
+
+    /// The source line a boundary keyword with no span of its own (`in`,
+    /// after a `let`/`do`/`ado` bindings block) actually sits on - needed to
+    /// split `flush_comments_before_keyword`'s callers so a comment
+    /// *trailing* the keyword (a leading comment on the body) isn't also
+    /// swept up and printed before it. The grammar guarantees the gap
+    /// between `after_line` (the last binding's own end) and `before_line`
+    /// (the body's first line) holds only whitespace, comments (already
+    /// known via `self.comments`), and exactly one `in` token - so the
+    /// first line in that gap which is neither blank nor a pending
+    /// comment's own line must be it.
+    fn keyword_line(&self, after_line: usize, before_line: usize) -> usize {
+        let mut line = after_line + 1;
+        let mut idx = self.comment_idx;
+        while line < before_line {
+            if idx < self.comments.len() && self.comments[idx].1.lo().0 == line {
+                line = self.comments[idx].1.hi().0 + 1;
+                idx += 1;
+                continue;
+            }
+            let start = match self.line_starts.get(line) {
+                Some(s) => *s,
+                None => break,
+            };
+            let end = self.line_starts.get(line + 1).copied().unwrap_or(self.source.len());
+            if !self.source[start..end].trim().is_empty() {
+                return line;
+            }
+            line += 1;
+        }
+        before_line
     }
 
     /// The line whatever prints next for `before_line` actually starts on:
@@ -545,7 +636,10 @@ impl<'s> Printer<'s> {
                 broke = true;
             }
             if broke {
-                self.newline();
+                let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+                if !just_flushed_comment {
+                    self.newline();
+                }
             } else {
                 self.raw(" ");
             }
@@ -555,6 +649,22 @@ impl<'s> Printer<'s> {
         if broke {
             self.indent_out();
         }
+    }
+
+    /// Whether `print_ctor_args` would break `cargs` onto their own lines -
+    /// same condition as its loop, without the printing side effects, so a
+    /// caller (`Decl::Data`'s single-ctor `multiline` check) can decide
+    /// whether to relocate `= Ctor` itself before any printing happens.
+    fn ctor_args_would_break(&mut self, cname_span: Span, cargs: &[Typ]) -> bool {
+        let mut prev_span = cname_span;
+        for a in cargs {
+            let cur_span = a.span();
+            if Self::breaks_before(prev_span, cur_span) || self.typ_would_break(a) {
+                return true;
+            }
+            prev_span = cur_span;
+        }
+        false
     }
 
     /// `print_spine_args` for a data constructor's argument types, but two
@@ -572,7 +682,10 @@ impl<'s> Printer<'s> {
                 broke = true;
             }
             if broke {
-                self.newline();
+                let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+                if !just_flushed_comment {
+                    self.newline();
+                }
             } else {
                 self.raw(" ");
             }
@@ -614,7 +727,10 @@ impl<'s> Printer<'s> {
                 self.indent_in();
                 broke = true;
             }
-            self.newline();
+            let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+            if !just_flushed_comment {
+                self.newline();
+            }
             self.print_expr(a);
             prev_span = cur_span;
         }
@@ -795,6 +911,16 @@ impl<'s> Printer<'s> {
         // Reached either because the source already forced this, or because
         // the flat attempt just rolled back.
         {
+            // A comment fully preceding `open` (its own line above, not
+            // sharing `open`'s line at all) must print before `open` at the
+            // ambient indent - see `print_row`'s identical fix. Flushing it
+            // only once the first item's own `flush_comments_before` ran
+            // (further down) would leave `open` stranded alone on a line
+            // with nothing hung under it, since `self.indent` isn't raised
+            // to `open`'s column until after this.
+            if open_span != Span::zero() {
+                self.flush_comments_before(open_span.lo().0);
+            }
             // If an outer construct already broke to a fresh line before this
             // call, don't also bump our own indent level - only take a level
             // when we're the one initiating the break, else items end up one
@@ -820,10 +946,28 @@ impl<'s> Printer<'s> {
             let saved_indent = self.indent;
             self.indent = open_col;
             self.raw(open);
-            self.raw(" ");
+            // A comment can trail `open` itself (`[ -- size` before the first
+            // item, with nothing else sharing that line) - glue it right
+            // there instead of letting the first item's own
+            // `flush_comments_before` strand it unindented on its own line
+            // with no memory of `open`'s column. Guarded to only the item's
+            // own line matching a lone `open`, since a comment on a line
+            // `open` shares with the first item's own content (a flat-glued
+            // attempt) belongs to that item instead.
+            let open_alone_on_its_line = open_span != Span::zero()
+                && items.first().is_some_and(|it| span_of(it).lo().0 > open_span.hi().0);
+            let comment_after_open =
+                open_alone_on_its_line && self.flush_trailing_comment(open_span.hi().0);
+            if !comment_after_open {
+                self.raw(" ");
+            }
             for (i, item) in items.iter().enumerate() {
+                let extra_hang = i == 0 && comment_after_open;
                 if i > 0 {
                     self.newline();
+                } else if extra_hang {
+                    self.indent_in();
+                    self.realign_to(self.indent);
                 }
                 // Flush before the leading comma, not after - a comment
                 // belongs above the `, item` pair, not stranding the comma
@@ -851,6 +995,9 @@ impl<'s> Printer<'s> {
                 // comment trailing the last item had nowhere to flush before
                 // the closing bracket and could relocate into unrelated code.
                 self.flush_trailing_comment(span_of(item).hi().0);
+                if extra_hang {
+                    self.indent_out();
+                }
             }
             // Catches a comment on its own line before the close, which
             // flush_trailing_comment above doesn't (it only catches one
@@ -1196,7 +1343,7 @@ impl<'s> Printer<'s> {
                 // pair to compare), so also check its own args directly -
                 // otherwise `= Ctor` stays flat while its args relocate away.
                 let multiline = Self::any_breaks(&ctor_spans)
-                    || (ctors.len() == 1 && ctors[0].1.iter().any(|a| self.typ_would_break(a)));
+                    || (ctors.len() == 1 && self.ctor_args_would_break(ctors[0].0.span(), &ctors[0].1));
                 self.indent_in();
                 for (i, (cname, cargs)) in ctors.iter().enumerate() {
                     if multiline {
@@ -1794,10 +1941,10 @@ impl<'s> Printer<'s> {
                 self.raw(" ");
                 self.print_binder(a);
             }
-            Binder::Paren(_, inner, _) => {
-                self.raw("(");
-                self.print_binder(inner);
-                self.raw(")");
+            Binder::Paren(open, inner, close) => {
+                let force_block =
+                    Self::breaks_before(*open, inner.span()) || Self::breaks_before(inner.span(), *close);
+                self.print_paren_block(force_block, *close, |p| p.print_binder(inner));
             }
             Binder::Array(open, items, close) => {
                 self.list(
@@ -1864,8 +2011,8 @@ impl<'s> Printer<'s> {
                 self.raw(&i.0 .0.to_string());
             }
             Typ::Hole(h) => self.lit(h),
-            Typ::Paren(_, inner, _) => {
-                self.print_paren_block(false, |p| p.print_typ(inner));
+            Typ::Paren(_, inner, close) => {
+                self.print_paren_block(false, *close, |p| p.print_typ(inner));
             }
             Typ::Arr(a, b) => self.print_typ_arrow_chain(a, b),
             Typ::App(..) => {
@@ -1949,10 +2096,10 @@ impl<'s> Printer<'s> {
                 }
             }
             Typ::Record(row) => {
-                self.print_row("{", "}", row.1.hi().0, true, &row.0);
+                self.print_row("{", "}", row.1.lo().0, row.1.hi().0, true, &row.0);
             }
             Typ::Row(row) => {
-                self.print_row("(", ")", row.1.hi().0, false, &row.0);
+                self.print_row("(", ")", row.1.lo().0, row.1.hi().0, false, &row.0);
             }
             Typ::Error(_) => self.raw_fallback(t),
         }
@@ -2036,6 +2183,7 @@ impl<'s> Printer<'s> {
                 if !just_flushed_comment {
                     self.newline();
                 }
+                self.flush_comments_before(cur_span.lo().0);
                 self.raw("-> ");
             } else {
                 self.raw(" -> ");
@@ -2069,6 +2217,7 @@ impl<'s> Printer<'s> {
                 if !just_flushed_comment {
                     self.newline();
                 }
+                self.flush_comments_before(cur_span.lo().0);
                 self.raw("=> ");
             } else {
                 self.raw(" => ");
@@ -2081,6 +2230,7 @@ impl<'s> Printer<'s> {
             if !just_flushed_comment {
                 self.newline();
             }
+            self.flush_comments_before(body.span().lo().0);
             self.raw("=> ");
         } else {
             self.raw(" => ");
@@ -2093,7 +2243,7 @@ impl<'s> Printer<'s> {
     /// architecture but not reusing it - a row's optional `| tail` doesn't
     /// fit `list()`'s comma-only shape. `close_line` is the closing
     /// bracket's own line.
-    fn print_row(&mut self, open: &str, close: &str, close_line: usize, pad: bool, row: &Row) {
+    fn print_row(&mut self, open: &str, close: &str, open_line: usize, close_line: usize, pad: bool, row: &Row) {
         let Row(fields, tail) = row;
         if fields.is_empty() && tail.is_none() {
             self.raw(open);
@@ -2145,14 +2295,34 @@ impl<'s> Printer<'s> {
             }
             self.raw(close);
         } else {
+            // A comment fully preceding `open` (its own line above `{`, not
+            // sharing `open`'s line at all) must print before `{` at the
+            // ambient ("outer") ident - flushing it after `open` (like any
+            // other pending comment would, via the first field's own
+            // `flush_comments_before`) would instead strand `{` alone with
+            // nothing hung under it, since `self.indent` isn't raised to
+            // `open`'s column until after this.
+            self.flush_comments_before(open_line);
             // Hang every line from the column `open` prints at, like `list()`.
             let saved_indent = self.indent;
             self.indent = self.current_column();
             self.raw(open);
-            self.raw(" ");
+            // A comment can trail `open` itself, with nothing else sharing
+            // that line - see `list()`'s identical `comment_after_open`.
+            let open_alone_on_its_line =
+                fields.first().is_some_and(|(l, _)| l.span().lo().0 > open_line);
+            let comment_after_open =
+                open_alone_on_its_line && self.flush_trailing_comment(open_line);
+            if !comment_after_open {
+                self.raw(" ");
+            }
             for (i, (label, typ)) in fields.iter().enumerate() {
+                let extra_hang = i == 0 && comment_after_open;
                 if i > 0 {
                     self.newline();
+                } else if extra_hang {
+                    self.indent_in();
+                    self.realign_to(self.indent);
                 }
                 // Flush before the leading comma, not after - see `list()`.
                 self.flush_comments_before(label.span().lo().0);
@@ -2162,6 +2332,9 @@ impl<'s> Printer<'s> {
                 self.lit(label);
                 self.print_field_typ(label.span(), typ);
                 self.flush_trailing_comment(typ.span().hi().0);
+                if extra_hang {
+                    self.indent_out();
+                }
             }
             if let Some(tail) = tail {
                 self.newline();
@@ -2203,7 +2376,7 @@ impl<'s> Printer<'s> {
             Expr::Paren(open, inner, close) => {
                 let force_block =
                     Self::breaks_before(*open, inner.span()) || Self::breaks_before(inner.span(), *close);
-                self.print_paren_block(force_block, |p| p.print_expr(inner));
+                self.print_paren_block(force_block, *close, |p| p.print_expr(inner));
             }
             Expr::Negate(inner) => {
                 self.raw("-");
@@ -2484,23 +2657,34 @@ impl<'s> Printer<'s> {
                 } else {
                     self.indent_in();
                     self.print_siblings_body(stmts, |s| s.span(), |p, s| p.print_do_stmt(s));
+                    let after = stmts.last().map_or(kw.hi().0, |s| s.span().hi().0);
+                    let in_line = self.keyword_line(after, result.span().lo().0);
+                    self.flush_comments_before_keyword(in_line);
                     self.newline();
                     self.raw("in ");
+                    // A comment can also trail `in` itself, before `result` -
+                    // `print_expr`'s own leading-comment flush picks it up.
                     self.print_expr(result);
                     self.indent_out();
                 }
             }
             Expr::Let(kw, bindings, body) => {
                 self.raw("let");
+                let base_indent = self.indent;
                 let glued = self.print_let_kw_bindings(*kw, bindings);
                 // Only a bindings block that broke onto its own lines needs
                 // `in` pushed onto a fresh line below it.
                 if glued {
                     self.raw(" ");
                 } else {
-                    self.newline();
+                    let after = bindings.last().map_or(kw.hi().0, |b| b.span().hi().0);
+                    let in_line = self.keyword_line(after, body.span().lo().0);
+                    self.with_indent_at(base_indent + INDENT, |p| p.flush_comments_before_keyword(in_line));
+                    self.realign_to(base_indent);
                 }
                 self.raw("in");
+                // A comment can also trail `in` itself, before `body` -
+                // `print_expr`'s own leading-comment flush picks it up.
                 // The parser captures no span for `in` itself: a gap of
                 // exactly one line after a glued binding means body shares
                 // `in`'s line; two or more means it breaks onto another.
@@ -2533,6 +2717,33 @@ impl<'s> Printer<'s> {
                 spans.extend(scrutinees.iter().map(|s| s.span()));
                 let multiline =
                     Self::any_breaks(&spans) || scrutinees.iter().any(|s| self.expr_would_break(s));
+                // A single-branch case with no source break anywhere between
+                // `case` and the branch's own body can stay flat, same as
+                // everything else that only explodes because the source
+                // already broke it - PureScript's layout rule requires every
+                // OTHER branch to start its own line, so this can never
+                // trigger for more than one branch anyway.
+                if !multiline
+                    && branches.len() == 1
+                    && !Self::breaks_before(*spans.last().unwrap(), branches[0].span())
+                {
+                    let mark = self.out.len();
+                    let comment_idx_before = self.comment_idx;
+                    self.raw(" ");
+                    for (i, s) in scrutinees.iter().enumerate() {
+                        if i > 0 {
+                            self.raw(", ");
+                        }
+                        self.print_expr(s);
+                    }
+                    self.raw(" of ");
+                    self.print_case_branch(&branches[0]);
+                    if !self.out[mark..].contains('\n') {
+                        return;
+                    }
+                    self.out.truncate(mark);
+                    self.comment_idx = comment_idx_before;
+                }
                 if multiline {
                     self.indent_in();
                     for (i, s) in scrutinees.iter().enumerate() {
@@ -2646,6 +2857,90 @@ mod tests {
         let once = fmt(src);
         let twice = fmt(&once);
         assert_eq!(once, twice, "formatting is not idempotent");
+    }
+
+    /// A comment fully preceding `{` (its own line above, not sharing `{`'s
+    /// line at all) used to only get flushed once the first field's own
+    /// `flush_comments_before` ran - by then `self.indent` had already been
+    /// raised to `{`'s column, so `{` was left stranded alone on a line with
+    /// nothing hung under it instead of staying glued to the first field.
+    #[test]
+    fn typ_record_comment_fully_before_open_brace_stays_above_it() {
+        let src = indoc! {"
+            module Foo where
+
+            type Response =
+              -- explanation comment
+              { \"DocumentType\" :: Int -- inline
+              , count :: Int
+              }
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `list()`'s counterpart to
+    /// `typ_record_comment_fully_before_open_brace_stays_above_it` - a
+    /// comment fully preceding `[` (its own line above, not sharing `[`'s
+    /// line) used to only get flushed once the first item's own
+    /// `flush_comments_before` ran, by which point `self.indent` had already
+    /// moved to `[`'s column, stranding `[` alone with nothing hung under it.
+    #[test]
+    fn list_comment_fully_before_open_bracket_stays_above_it() {
+        let src = indoc! {"
+            module Foo where
+
+            xs =
+              -- explanation comment
+              [ a -- inline
+              , b
+              ]
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// The `in` keyword has no span of its own in the AST, so a comment
+    /// *trailing* it (a leading comment on the body) used to get swept up by
+    /// the same flush that handles a comment before `in`
+    /// (see `let_binding_trailing_comment_before_in_stays_before_in`) and
+    /// print above `in` instead of below it.
+    #[test]
+    fn let_in_body_leading_comment_stays_after_in() {
+        let src = indoc! {"
+            module Foo where
+
+            f x =
+              let
+                y = 1
+              in
+              -- NOTE: explanation of the following case
+              case x of
+                _ -> y
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `do`/`ado`'s own `in` (see `Expr::Ado`) has the identical gap.
+    #[test]
+    fn ado_in_result_leading_comment_stays_after_in() {
+        let src = indoc! {"
+            module Foo where
+
+            f x =
+              ado
+                y <- Just x
+                in
+                -- NOTE: explanation
+                y
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
     }
 
     #[test]
@@ -3931,6 +4226,31 @@ mod tests {
         assert_idempotent(src);
     }
 
+    /// A single-branch `case` written flat in the source with no break
+    /// anywhere between `case` and the branch's own body used to explode
+    /// unconditionally - `print_indented_siblings` always put branches on
+    /// their own lines regardless of source layout, unlike every other
+    /// construct (App args, Op operands, record fields) which only breaks
+    /// when the source already did. That forced explosion then cascaded
+    /// outward through the surrounding App/Op "would this break" checks,
+    /// blowing up an otherwise-flat call chain that only contained the case
+    /// as a lambda body deep inside one operand.
+    #[test]
+    fn case_single_branch_with_no_source_break_stays_flat() {
+        let src = indoc! {"
+            module Foo where
+
+            run k m =
+              Wrap (m >>= veither (\\a -> case k a of Wrapped b -> b) (Applicative.pure >>> Applicative.pure))
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A single-branch `case` still relocates/explodes like normal when the
+    /// source itself already broke somewhere before the branch - only a
+    /// fully flat source case is eligible to stay flat.
     #[test]
     fn case_relocates_off_a_glued_arrow_even_for_a_single_trivial_branch() {
         let src = indoc! {"
@@ -5153,6 +5473,28 @@ mod tests {
         assert_idempotent(src);
     }
 
+    /// Same as `typ_arrow_chain_segment_keeps_its_trailing_comment`, for a
+    /// comment on its own line right before a `->` segment instead of
+    /// trailing after the previous one.
+    #[test]
+    fn typ_arrow_chain_leading_comment_before_a_segment_stays_before_it() {
+        let src = indoc! {"
+            module Foo where
+
+            cancelThing
+              :: AccessToken
+              -- comment before ThingId
+              -> ThingId
+              -> ResultT
+                   _
+                   Effect
+                   Status
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
     // Same needs_hang gotcha, reached via print_sig_typ directly (no arrow chain involved).
     #[test]
     fn typ_app_paren_op_chain_directly_after_a_broken_sig_gets_an_extra_hang_level() {
@@ -5167,6 +5509,194 @@ mod tests {
                    )
                    LinkRowR
             tableLinkRow = Db.table @\"row_link_v0\"
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A comment on its own line after a `Typ::Op` chain's last operand, but
+    /// still before the enclosing paren's `)`, must stay right there - not
+    /// escape all the way out to wherever the next comment flush happens to
+    /// be (previously the end of the whole declaration).
+    #[test]
+    fn typ_op_chain_comment_before_the_closing_paren_stays_inside_it() {
+        let src = indoc! {"
+            module Foo where
+
+            tableLinkRow
+              :: Db.Table
+                   ( Db.Pk (\"row_a\" .. \"row_b\")
+                       .. Db.Index \"row_b\"
+                       .. Db.Name \"row_link_v0\"
+                       -- NOTE: extra note
+                   )
+                   LinkRowR
+            tableLinkRow = Db.table @\"row_link_v0\"
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A `Binder::Paren` around a constructor pattern whose own arg (a
+    /// record binder) breaks must relocate like `Expr::Paren`/`Typ::Paren`
+    /// do - `( ` glued to a fresh line, the closing `)` back at the paren's
+    /// own column - not just glue `(`/`)` directly onto the inner content.
+    #[test]
+    fn binder_paren_around_a_breaking_record_pattern_relocates_like_expr_paren() {
+        let src = indoc! {"
+            module Foo where
+
+            viewFundingItem
+              isCreated
+              ( BankfileFundingItem
+                  { additionalInformation
+                  , amount
+                  , valueDate
+                  }
+              ) = valueDate
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A comment on its own line after a `let` block's last binding, but
+    /// still before `in`, must stay right there - not get deferred to
+    /// `print_expr(body)`'s own leading-comment flush and print after `in`.
+    #[test]
+    fn let_binding_trailing_comment_before_in_stays_before_in() {
+        let src = indoc! {"
+            module Foo where
+
+            f =
+              let
+                x = 1
+                -- y = someDebugExpr x
+              in
+              x
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A comment trailing `open` itself (`[ -- size`, before any item) used
+    /// to strand the first item unindented on its own line, with `[` left
+    /// alone above it - the item now hangs one level deeper instead.
+    #[test]
+    fn list_leading_comment_after_open_bracket_hangs_the_first_item() {
+        let src = indoc! {"
+            module Foo where
+
+            h1Styles :: Array String
+            h1Styles =
+              [ -- size
+                \"text-2xl\"
+              ]
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Same `comment_after_open` gap as `list()`'s (see
+    /// `list_leading_comment_after_open_bracket_hangs_the_first_item`), for
+    /// `print_row`'s independent copy of the same "hang from `open`'s own
+    /// column" logic (used by `Typ::Record`/`Typ::Row`, not `Expr`s).
+    #[test]
+    fn typ_record_leading_comment_after_open_brace_hangs_the_first_field() {
+        let src = indoc! {"
+            module Foo where
+
+            type Response =
+              { -- explanation
+                id :: String -- an id
+              }
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `current_column()` used to fall back to a raw char count once a
+    /// scratch buffer (from `render_at_column`/`render_indented`) held any
+    /// text without a `\n`, forgetting the virtual column that buffer
+    /// started at - collapsing a doubly-nested glued literal's own indent
+    /// decisions (here, a record glued inside an array glued inside a
+    /// paren) down near column 0 instead of hanging under their real column.
+    #[test]
+    fn doubly_nested_glued_literal_keeps_its_real_hang_column() {
+        let src = indoc! {"
+            module Foo where
+
+            x =
+              ( [ { id: TransactionId \"a\"
+                  , amount: MoneyString.moneyString SEK \"10.10\" # unreachableEither [ TO ]
+                  } # Storage.Transaction
+                ] # Veither.pure # Just
+              )
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// `= Ctor` must relocate whole when its arg breaks only because the
+    /// source put it on its own line (not because the arg is inherently
+    /// multi-line) - the single-ctor `multiline` check used to only ask
+    /// `typ_would_break`, missing this `breaks_before`-only case that
+    /// `print_ctor_args`'s own loop already reacts to.
+    #[test]
+    fn data_single_ctor_arg_on_its_own_source_line_relocates_whole_line() {
+        let src = indoc! {"
+            module Foo where
+
+            data Memory
+              = Memory
+                  (Map CompanyId CompanyMem)
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// An App arg's trailing comment (here, the record arg trailing before
+    /// the array arg breaks onto its own line) used to fall through
+    /// unflushed into the outer list's `flush_comments_before` for the next
+    /// item, landing on its own line instead of staying glued.
+    #[test]
+    fn app_arg_trailing_comment_stays_glued_to_the_arg_it_trails() {
+        let src = indoc! {"
+            module Foo where
+
+            x =
+              [ Html.div { class: \"flex flex-col\" } --responsive layout
+                  [ a
+                  , b
+                  ]
+              , c
+              ]
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Same as `let_binding_trailing_comment_before_in_stays_before_in`, for
+    /// `ado`'s own `in` - unlike `let`'s, `ado`'s `in` hangs at the
+    /// statements' own (deeper) indent, not the block's base indent.
+    #[test]
+    fn ado_statement_trailing_comment_before_in_stays_before_in() {
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              ado
+                x <- bar
+                -- y <- someDebugM x
+                in x
         "};
         let out = fmt(src);
         assert_eq!(out, src);
@@ -5215,6 +5745,27 @@ mod tests {
 
             f
               :: Eq a -- comment
+              => a
+              -> String
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A comment on its own line right before a `=>` segment (a leading
+    /// comment for the constraint/body that follows) must stay right there -
+    /// not escape past the rest of the chain to the end of the declaration.
+    #[test]
+    fn typ_constrained_chain_leading_comment_before_a_segment_stays_before_it() {
+        let src = indoc! {"
+            module Foo where
+
+            f
+              :: Eq a
+              -- comment before Show
+              => Show a
+              -- comment before body
               => a
               -> String
         "};
