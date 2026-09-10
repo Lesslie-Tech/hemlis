@@ -161,9 +161,9 @@ impl Backend {
         let line = pos.line as usize;
         let col = pos.character as usize;
         let col = match encoding_is_utf16() {
+            // Blocking read - see the note in `pos_from_tup`.
             true => LINE_INDEX
-                .try_get(&fi)
-                .try_unwrap()
+                .get(&fi)
                 .map_or(col, |ix| ix.byte_col(line, col)),
             false => col,
         };
@@ -6263,9 +6263,13 @@ fn hash_exports(exports: &[Export]) -> u64 {
 /// column through unchanged - both only ever carry column 0 in practice.
 fn pos_from_tup(fi: Option<ast::Fi>, (line, col): ast::Pos) -> Position {
     let col = match (encoding_is_utf16(), fi) {
+        // A blocking read, deliberately: `try_get` reports Locked whenever
+        // any other key in the same shard is being written, and treating that
+        // as "no table" would silently emit an unconverted byte column. The
+        // only writer is `record_line_index`, which inserts and releases at
+        // once, and no position is converted while holding that guard.
         (true, Some(fi)) => LINE_INDEX
-            .try_get(&fi)
-            .try_unwrap()
+            .get(&fi)
             .map_or(col, |ix| ix.utf16_col(line, col)),
         _ => col,
     };
