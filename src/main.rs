@@ -34,14 +34,44 @@ macro_rules! or_ {
     }
 }
 
-fn span_to_range(s: &ast::Span) -> Range {
-    range(s.lo(), s.hi())
+/// Per-file byte-column <-> UTF-16-column tables, keyed by `Fi`.
+///
+/// This is a process-global rather than a `Backend` field because the
+/// functions that build LSP positions (`span_to_range`, `create_error`,
+/// `create_warning`, ...) are free functions reached from deep inside the
+/// analysis code, and threading a table through all of them would touch every
+/// caller. An `ast::Span` already carries its `Fi`, so the file is always
+/// known at the point of conversion.
+static LINE_INDEX: std::sync::LazyLock<DashMap<ast::Fi, source::LineIndex>> =
+    std::sync::LazyLock::new(DashMap::new);
+
+/// The position encoding agreed with the client during `initialize`.
+static ENCODING: std::sync::OnceLock<PositionEncodingKind> = std::sync::OnceLock::new();
+
+/// Whether positions crossing the wire are UTF-16 code-unit columns.
+///
+/// Defaults to true: per the LSP spec `utf-16` is the default encoding, so
+/// before `initialize` has run that is what we must assume.
+fn encoding_is_utf16() -> bool {
+    match ENCODING.get() {
+        Some(e) => *e == PositionEncodingKind::UTF16,
+        None => true,
+    }
 }
 
-fn range(lo: ast::Pos, hi: ast::Pos) -> Range {
+/// Store the column table for `fi`. Call whenever a file's source is stored.
+fn record_line_index(fi: ast::Fi, src: &str) {
+    LINE_INDEX.insert(fi, source::LineIndex::new(src));
+}
+
+fn span_to_range(s: &ast::Span) -> Range {
+    range(s.fi(), s.lo(), s.hi())
+}
+
+fn range(fi: Option<ast::Fi>, lo: ast::Pos, hi: ast::Pos) -> Range {
     Range {
-        start: pos_from_tup(lo),
-        end: pos_from_tup(hi),
+        start: pos_from_tup(fi, lo),
+        end: pos_from_tup(fi, hi),
     }
 }
 
@@ -122,12 +152,29 @@ impl StyleMode {
 }
 
 impl Backend {
+    /// Convert a client-supplied `Position` into hemlis' internal
+    /// `(line, byte_col)` representation.
+    ///
+    /// A no-op when the negotiated encoding is utf-8, since the client is then
+    /// already speaking byte columns.
+    fn to_byte_pos(&self, fi: ast::Fi, pos: Position) -> ast::Pos {
+        let line = pos.line as usize;
+        let col = pos.character as usize;
+        let col = match encoding_is_utf16() {
+            true => LINE_INDEX
+                .try_get(&fi)
+                .try_unwrap()
+                .map_or(col, |ix| ix.byte_col(line, col)),
+            false => col,
+        };
+        (line, col)
+    }
+
     fn resolve_name(&self, uri: &Uri, pos: Position) -> Option<Name> {
-        let m = self
-            .fi_to_ud
-            .try_get(&*self.uri_to_fi.try_get(uri).try_unwrap()?)
-            .try_unwrap()?;
-        let pos = (pos.line as usize, pos.character as usize + 1);
+        let fi = *self.uri_to_fi.try_get(uri).try_unwrap()?;
+        let m = self.fi_to_ud.try_get(&fi).try_unwrap()?;
+        let (line, col) = self.to_byte_pos(fi, pos);
+        let pos = (line, col + 1);
         let lut = self.resolved.try_get(&m).try_unwrap()?;
         let cur = lut.lower_bound(Bound::Included(&(pos, pos)));
         let ((lo, hi), name) = cur.peek_prev()?;
@@ -138,18 +185,17 @@ impl Backend {
     }
 
     fn resolve_name_and_range(&self, uri: &Uri, pos: Position) -> Option<(Name, Range)> {
-        let m = self
-            .fi_to_ud
-            .try_get(&*self.uri_to_fi.try_get(uri).try_unwrap()?)
-            .try_unwrap()?;
-        let pos = (pos.line as usize, pos.character as usize + 1);
+        let fi = *self.uri_to_fi.try_get(uri).try_unwrap()?;
+        let m = self.fi_to_ud.try_get(&fi).try_unwrap()?;
+        let (line, col) = self.to_byte_pos(fi, pos);
+        let pos = (line, col + 1);
         let lut = self.resolved.try_get(&m).try_unwrap()?;
         let cur = lut.lower_bound(Bound::Included(&(pos, pos)));
         let ((lo, hi), name) = cur.peek_prev()?;
         if !(*lo <= pos && pos <= *hi) {
             return None;
         }
-        Some((*name, range(*lo, *hi)))
+        Some((*name, range(Some(fi), *lo, *hi)))
     }
 
     fn got_refresh(&self, fi: ast::Fi, version: Option<i32>) -> bool {
@@ -361,12 +407,21 @@ mod tests {
     /// Edits are applied in reverse order so that earlier edits don't
     /// shift the positions of later ones.
     fn apply_edits(source: &str, edits: &mut [TextEdit]) -> String {
-        // Convert (line, col) to byte offset
+        // Convert (line, utf-16 col) to a byte offset. The server reports
+        // columns in the negotiated encoding - utf-16 here, since the test
+        // client offers none - so the column has to be walked, not just added.
         let to_offset = |source: &str, line: u32, col: u32| -> usize {
             let mut offset = 0;
             for (i, l) in source.lines().enumerate() {
                 if i == line as usize {
-                    return offset + (col as usize).min(l.len());
+                    let mut units = 0u32;
+                    for (byte_idx, c) in l.char_indices() {
+                        if units >= col {
+                            return offset + byte_idx;
+                        }
+                        units += c.len_utf16() as u32;
+                    }
+                    return offset + l.len();
                 }
                 offset += l.len() + 1; // +1 for \n
             }
@@ -530,15 +585,15 @@ mod tests {
 
         // The `^` in the marker line is visually aligned under the target
         // character. Since the marker line is ASCII-only, `^` byte offset ==
-        // visual column. Map that visual column to the byte offset in the
-        // content line, which may contain multibyte UTF-8 characters.
+        // visual column. Send it as a UTF-16 code-unit column, which is what a
+        // real client hands us - the server converts to a byte column itself.
         let visual_col = marker_line.find('^').unwrap();
         let content_line = lines[marker_idx - 1];
         let caret_col = content_line
-            .char_indices()
-            .nth(visual_col)
-            .map(|(byte_idx, _)| byte_idx)
-            .unwrap_or(content_line.len()) as u32;
+            .chars()
+            .take(visual_col)
+            .map(char::len_utf16)
+            .sum::<usize>() as u32;
 
         let cleaned: Vec<&str> = lines
             .iter()
@@ -578,13 +633,14 @@ mod tests {
         let target_line = (marker_idx - 1) as u32;
         let content_line = lines[marker_idx - 1];
 
-        // Map visual columns to byte offsets in the (possibly multibyte) content line.
+        // Map visual columns to UTF-16 code-unit columns, matching the
+        // encoding the server reports positions in.
         let to_byte = |visual: usize| -> u32 {
             content_line
-                .char_indices()
-                .nth(visual)
-                .map(|(byte_idx, _)| byte_idx)
-                .unwrap_or(content_line.len()) as u32
+                .chars()
+                .take(visual)
+                .map(char::len_utf16)
+                .sum::<usize>() as u32
         };
         let start_col = to_byte(first_tilde);
         // The end column is exclusive: the byte offset just past the last `~`.
@@ -1986,7 +2042,7 @@ mod tests {
                 module Test where
 
                 import Prim.Ordering (Ordering, LT, GT, EQ)
-                ^ BurnAllUnusedImport
+                ^ Fix all unused imports
 
                 foo :: Ordering -> LT
                 foo x = x
@@ -2018,7 +2074,7 @@ mod tests {
                 module Test where
 
                 import Lib (MyType(..), hello)
-                ^ BurnAllUnusedImport
+                ^ Fix all unused imports
 
                 foo :: Int
                 foo = hello
@@ -2050,7 +2106,7 @@ mod tests {
                 module Test where
 
                 import Lib (class A, b)
-                                  ^ DeleteUnusedImport
+                                  ^ Remove unused import
 
                 foo = b
             "},
@@ -2080,7 +2136,7 @@ mod tests {
                 module Test where
 
                 import Lib (b, class A)
-                                     ^ DeleteUnusedImport
+                                     ^ Remove unused import
 
                 foo = b
             "},
@@ -3233,6 +3289,25 @@ mod tests {
 impl LanguageServer for Backend {
     #[instrument(skip(self))]
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Positions are byte columns internally, so utf-8 is free for us and
+        // utf-16 costs a conversion. Prefer utf-8 when the client offers it -
+        // Neovim and Helix do - and otherwise fall back to utf-16, which the
+        // spec requires every client to support and which is the only legal
+        // answer when the client offers nothing (VS Code).
+        let position_encoding = match params
+            .capabilities
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.as_ref())
+        {
+            Some(encodings) if encodings.contains(&PositionEncodingKind::UTF8) => {
+                PositionEncodingKind::UTF8
+            }
+            _ => PositionEncodingKind::UTF16,
+        };
+        let _ = ENCODING.set(position_encoding.clone());
+        tracing::info!("negotiated position encoding {:?}", position_encoding);
+
         let dynamic_watch = params
             .capabilities
             .workspace
@@ -3309,7 +3384,7 @@ impl LanguageServer for Backend {
                     },
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
-                position_encoding: Some(PositionEncodingKind::UTF8),
+                position_encoding: Some(position_encoding),
                 ..ServerCapabilities::default()
             },
         })
@@ -3594,8 +3669,8 @@ impl LanguageServer for Backend {
                     .try_unwrap()?;
                 let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
                 let position = params.text_document_position_params.position;
-                let word_under_cursor =
-                    try_find_word(&source, position.line as usize, position.character as usize)?;
+                let (line, col) = self.to_byte_pos(fi, position);
+                let word_under_cursor = try_find_word(&source, line, col)?;
                 if word_under_cursor != "foreign" {
                     return None;
                 };
@@ -3607,7 +3682,7 @@ impl LanguageServer for Backend {
                 uri.to_mut().set_extension("erl");
                 Some(GotoDefinitionResponse::Scalar(Location {
                     uri: Uri::from_file_path(uri)?,
-                    range: range((0, 0), (0, 0)),
+                    range: range(None, (0, 0), (0, 0)),
                 }))
             }
         }();
@@ -3772,10 +3847,9 @@ impl LanguageServer for Backend {
         let completions = || -> Option<Vec<CompletionItem>> {
             let fi = *self.uri_to_fi.try_get(&uri).try_unwrap()?;
             let me = *self.fi_to_ud.try_get(&fi).try_unwrap()?;
-            let line = position.line as usize;
+            let (line, col) = self.to_byte_pos(fi, position);
             let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
-            let to_complete =
-                try_find_word(&source, line, position.character as usize)?.to_string();
+            let to_complete = try_find_word(&source, line, col)?.to_string();
             drop(source);
 
             tracing::info!("completion for \"{:?}\"", to_complete);
@@ -4123,7 +4197,7 @@ impl LanguageServer for Backend {
         let delete_all = merged;
         if !delete_all.is_empty() {
             out.push(CodeAction {
-                title: "BurnAllUnusedImport".to_string(),
+                title: "Fix all unused imports".to_string(),
                 kind: Some(CodeActionKind::SOURCE_FIX_ALL),
                 is_preferred: None,
                 edit: Some(WorkspaceEdit::new(
@@ -4141,10 +4215,7 @@ impl LanguageServer for Backend {
         }
 
         for (s, f) in fixables.iter() {
-            if !s.contains((
-                params.range.start.line as usize,
-                params.range.start.character as usize,
-            )) {
+            if !s.contains(self.to_byte_pos(fi, params.range.start)) {
                 continue;
             }
             match f {
@@ -4234,7 +4305,7 @@ impl LanguageServer for Backend {
                                     edit: Some(WorkspaceEdit::new(
                                         [(
                                             uri.clone(),
-                                            vec![TextEdit::new(range(at.lo(), at.hi()), alias_str)],
+                                            vec![TextEdit::new(span_to_range(&at), alias_str)],
                                         )]
                                         .into(),
                                     )),
@@ -4265,7 +4336,7 @@ impl LanguageServer for Backend {
                                         [(
                                             uri.clone(),
                                             vec![TextEdit::new(
-                                                range(end_of_imports, end_of_imports),
+                                                range(Some(fi), end_of_imports, end_of_imports),
                                                 format!(
                                                     "import {} as {}\n",
                                                     module_str, target_alias
@@ -4310,7 +4381,7 @@ impl LanguageServer for Backend {
                                                     [(
                                                         uri.clone(),
                                                         vec![TextEdit::new(
-                                                            range(at.lo(), at.hi()),
+                                                            span_to_range(&at),
                                                             usage,
                                                         )],
                                                     )]
@@ -4458,7 +4529,7 @@ impl LanguageServer for Backend {
                                                     [(
                                                         uri.clone(),
                                                         vec![TextEdit::new(
-                                                            range((l, c), (l, c)),
+                                                            range(Some(fi), (l, c), (l, c)),
                                                             format!("{}, ", import_item),
                                                         )],
                                                     )]
@@ -4487,7 +4558,7 @@ impl LanguageServer for Backend {
                                                 [(
                                                     uri.clone(),
                                                     vec![TextEdit::new(
-                                                        range(end_of_imports, end_of_imports),
+                                                        range(Some(fi), end_of_imports, end_of_imports),
                                                         format!(
                                                             "import {} ({})\n",
                                                             module_str, import_item
@@ -4522,7 +4593,7 @@ impl LanguageServer for Backend {
                                                     [(
                                                         uri.clone(),
                                                         vec![TextEdit::new(
-                                                            range(end_of_imports, end_of_imports),
+                                                            range(Some(fi), end_of_imports, end_of_imports),
                                                             format!(
                                                                 "import {} as {}\n",
                                                                 module_str, ns_str
@@ -4569,6 +4640,7 @@ impl LanguageServer for Backend {
                                                         vec![
                                                             TextEdit::new(
                                                                 range(
+                                                                    Some(fi),
                                                                     end_of_imports,
                                                                     end_of_imports,
                                                                 ),
@@ -4578,7 +4650,7 @@ impl LanguageServer for Backend {
                                                                 ),
                                                             ),
                                                             TextEdit::new(
-                                                                range(at.lo(), at.hi()),
+                                                                span_to_range(&at),
                                                                 qualified_usage,
                                                             ),
                                                         ],
@@ -4642,7 +4714,7 @@ impl LanguageServer for Backend {
                         .map(|(_, r)| *r)
                         .unwrap_or_else(|| span_to_range(&at.and_one_more_char()));
                     out.push(CodeAction {
-                        title: "DeleteUnusedImport".into(),
+                        title: "Remove unused import".into(),
                         kind: Some(CodeActionKind::QUICKFIX),
                         diagnostics: None,
                         edit: Some(WorkspaceEdit::new(
@@ -4707,10 +4779,7 @@ impl LanguageServer for Backend {
         if let Some(module_guard) = self.modules.try_get(&me).try_unwrap() {
             let module = module_guard.value();
             for (s, f) in fixables.iter() {
-                if !s.contains((
-                    params.range.start.line as usize,
-                    params.range.start.character as usize,
-                )) {
+                if !s.contains(self.to_byte_pos(fi, params.range.start)) {
                     continue;
                 }
                 if let Fixable::RenameWithUnderscore(at) = f {
@@ -5147,10 +5216,10 @@ fn remove_nth_range(spans: &[ast::Span], idx: usize, only_item_extra_char: bool)
         }
     } else if idx < spans.len() - 1 {
         // First or middle item: delete from its start to the next item's start (eats trailing separator).
-        range(spans[idx].lo(), spans[idx + 1].lo())
+        range(spans[idx].fi(), spans[idx].lo(), spans[idx + 1].lo())
     } else {
         // Last item: delete from previous item's end to this item's end (eats leading separator).
-        range(spans[idx - 1].hi(), spans[idx].hi())
+        range(spans[idx].fi(), spans[idx - 1].hi(), spans[idx].hi())
     }
 }
 
@@ -5186,7 +5255,7 @@ fn create_error(
     message: String,
     related: Vec<(String, Location)>,
 ) -> tower_lsp_server::ls_types::Diagnostic {
-    let range = Range::new(pos_from_tup(span.lo()), pos_from_tup(span.hi()));
+    let range = span_to_range(&span);
     Diagnostic::new(
         range,
         Some(DiagnosticSeverity::ERROR),
@@ -5214,7 +5283,7 @@ fn create_warning(
     message: String,
     related: Vec<(String, Location)>,
 ) -> tower_lsp_server::ls_types::Diagnostic {
-    let range = Range::new(pos_from_tup(span.lo()), pos_from_tup(span.hi()));
+    let range = span_to_range(&span);
     Diagnostic::new(
         range,
         Some(DiagnosticSeverity::WARNING),
@@ -5616,6 +5685,7 @@ impl Backend {
                         tracing::error!("FAILED TO GENERATE FI");
                     };
                     self.fi_to_source.insert(fi, source.to_string());
+                    record_line_index(fi, &source);
                     self.fi_to_uri.insert(fi, uri.clone());
                     self.fi_to_version.insert(fi, None);
                     let (m, fi) = self.parse(fi, &source);
@@ -6127,6 +6197,7 @@ impl Backend {
 
         // I have to copy it! :(
         self.fi_to_source.insert(fi, source.to_string());
+        record_line_index(fi, source);
         tracing::info!("!! {:?} A {:?}", version, uri.to_string());
         self.fi_to_uri.insert(fi, uri.clone());
         tracing::info!("!! {:?} B {:?}", version, uri.to_string());
@@ -6185,7 +6256,19 @@ fn hash_exports(exports: &[Export]) -> u64 {
     hasher.finish()
 }
 
-fn pos_from_tup((line, col): ast::Pos) -> Position {
+/// Build an LSP `Position` from an internal `(line, byte_col)` pair.
+///
+/// `fi` identifies the file the position belongs to, so its column table can
+/// be found. `None` (a `Span::Zero`) and files with no table yet pass the
+/// column through unchanged - both only ever carry column 0 in practice.
+fn pos_from_tup(fi: Option<ast::Fi>, (line, col): ast::Pos) -> Position {
+    let col = match (encoding_is_utf16(), fi) {
+        (true, Some(fi)) => LINE_INDEX
+            .try_get(&fi)
+            .try_unwrap()
+            .map_or(col, |ix| ix.utf16_col(line, col)),
+        _ => col,
+    };
     Position::new(
         line.try_into().unwrap_or(u32::MAX),
         col.try_into().unwrap_or(u32::MAX),
@@ -6207,6 +6290,12 @@ async fn main() {
                 eprintln!("{}", hemlis_lib::version());
                 std::process::exit(0);
             }
+            // An empty argv entry carries no instruction, so refusing to start
+            // over one is never useful. Some LSP clients emit one
+            // unavoidably: pepebecker.vscode-lsp-config (the VS Code setup in
+            // the README) builds argv as `args: [server.args]`, so an empty or
+            // omitted `args` still spawns us with one empty argument.
+            "" => {}
             x => {
                 eprintln!("Unknown arg: {}", x);
                 std::process::exit(1);
