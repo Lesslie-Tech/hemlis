@@ -6290,6 +6290,11 @@ async fn main() {
                 eprintln!("{}", hemlis_lib::version());
                 std::process::exit(0);
             }
+            // stdio is the only transport we speak, so the conventional
+            // `--stdio` flag is a no-op rather than an error. Clients pass it
+            // without being asked: vscode-languageclient appends it whenever
+            // the extension requests TransportKind.stdio.
+            "--stdio" => {}
             // An empty argv entry carries no instruction, so refusing to start
             // over one is never useful. Some LSP clients emit one
             // unavoidably: pepebecker.vscode-lsp-config (the VS Code setup in
