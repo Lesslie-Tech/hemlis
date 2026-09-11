@@ -64,6 +64,13 @@ fn record_line_index(fi: ast::Fi, src: &str) {
     LINE_INDEX.insert(fi, source::LineIndex::new(src));
 }
 
+/// Editors expose non-`file` buffers (e.g. neovim's `fugitive://` blobs) as regular
+/// text documents. We must not index these: they can declare the same module as the
+/// real on-disk file, which then shows up as a phantom duplicate in hover/references.
+fn is_file_uri(uri: &Uri) -> bool {
+    uri.scheme().as_str().eq_ignore_ascii_case("file")
+}
+
 fn span_to_range(s: &ast::Span) -> Range {
     range(s.fi(), s.lo(), s.hi())
 }
@@ -3539,6 +3546,10 @@ impl LanguageServer for Backend {
     #[instrument(skip(self, params))]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri.clone();
+        if !is_file_uri(&uri) {
+            tracing::info!("Ignoring non-file buffer {:?}", uri.to_string());
+            return;
+        }
         let fi = self.find_fi(uri.clone());
         if let Some(fi) = fi {
             self.open_files.insert(fi, ());
@@ -3567,6 +3578,9 @@ impl LanguageServer for Backend {
 
     #[instrument(skip(self, params))]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        if !is_file_uri(&params.text_document.uri) {
+            return;
+        }
         if let Some((fi, version, to_notify)) = self.on_change(TextDocumentItem {
             text: &params.content_changes[0].text,
             uri: params.text_document.uri.clone(),
