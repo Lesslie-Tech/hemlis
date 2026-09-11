@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, env};
 
-use hemlis_lib::{Flag as LibFlag, parse_and_resolve_names, parse_modules, version};
+use hemlis_lib::{parse_and_resolve_names, parse_modules, version, Flag as LibFlag};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum Flag {
@@ -30,6 +30,7 @@ fn main() {
                 "-f" | "--format" => lib_flags.insert(LibFlag::Format),
                 "-w" | "--write" => lib_flags.insert(LibFlag::Write),
                 "-c" | "--check" => lib_flags.insert(LibFlag::Check),
+                "--ignore-missing" => lib_flags.insert(LibFlag::IgnoreMissing),
                 "-r" | "--resolve" => flags.insert(Flag::Resolve),
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),

@@ -136,6 +136,7 @@ pub enum Flag {
     Format,
     Write,
     Check,
+    IgnoreMissing,
 }
 
 pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
@@ -335,13 +336,13 @@ enum CheckOutcome {
     Formatted,
     Unformatted,
     ParseError,
-    ReadError(String),
+    ReadError(io::Error),
 }
 
 fn check_one_file(i: usize, arg: &str) -> CheckOutcome {
     let src = match read_source(arg) {
         Ok(s) => s,
-        Err(e) => return CheckOutcome::ReadError(format!("{:?}", e)),
+        Err(e) => return CheckOutcome::ReadError(e),
     };
 
     let (l, comments) = lexer::lex(&src, ast::Fi(i));
@@ -369,7 +370,7 @@ fn check_one_file(i: usize, arg: &str) -> CheckOutcome {
 /// Files are checked in parallel (one rayon task per file). Prints which
 /// files are not formatted and exits with status 1 if any file is
 /// unformatted, fails to parse, or fails to read.
-fn check_format(files: Vec<String>) {
+fn check_format(files: Vec<String>, ignore_missing: bool) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     let outcomes: Vec<CheckOutcome> = files
@@ -389,12 +390,13 @@ fn check_format(files: Vec<String>) {
                 eprintln!("ERR: {} did not parse cleanly, cannot format", arg);
                 any_bad = true;
             }
+            CheckOutcome::ReadError(e) if ignore_missing && e.kind() == io::ErrorKind::NotFound => {}
             CheckOutcome::ReadError(e) => {
                 let abs = env::current_dir()
                     .map(|cwd| cwd.join(arg).display().to_string())
                     .unwrap_or_else(|_| arg.clone());
                 eprintln!(
-                    "ERR: could not read '{}': {} (looked relative to the current directory, at '{}')",
+                    "ERR: could not read '{}': {:?} (looked relative to the current directory, at '{}')",
                     arg, e, abs
                 );
                 any_bad = true;
@@ -492,7 +494,7 @@ fn process_one_file(flags: &BTreeSet<Flag>, i: usize, arg: &str) -> FileResult {
 
 pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
     if flags.contains(&Flag::Format) && flags.contains(&Flag::Check) {
-        check_format(files);
+        check_format(files, flags.contains(&Flag::IgnoreMissing));
         return;
     }
 
