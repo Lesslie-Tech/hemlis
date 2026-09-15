@@ -1,0 +1,20 @@
+{
+  "name": "hemlis",
+  "description": "Editor integrations for the hemlis PureScript language server.",
+  "owner": {
+    "name": "Lesslie",
+    "url": "https://github.com/Lesslie-Tech"
+  },
+  "plugins": [
+    {
+      "name": "hemlis-lsp",
+      "source": "./editors/claude-code",
+      "description": "PureScript code intelligence via the hemlis language server",
+      "version": "1.0.0",
+      "category": "development",
+      "author": {
+        "name": "Lesslie"
+      }
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "hemlis": {
+    "command": "hemlis-language-server",
+    "extensionToLanguage": {
+      ".purs": "purescript"
+    },
+    "workspaceFolder": "${CLAUDE_PROJECT_DIR}",
+    "startupTimeout": 30000,
+    "maxRestarts": 5,
+    "diagnostics": true
+  }
+}

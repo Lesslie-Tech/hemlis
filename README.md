@@ -97,3 +97,16 @@ command = "hemlis-language-server"
 name = "purescript"
 language-servers = [ "hemlis-language-server", "purescript-language-server" ]
 ```
+
+### Claude Code
+This repo ships a Claude Code plugin that wires up `hemlis-language-server` as
+an LSP server, giving Claude go-to-definition, references, hover, symbol search
+and diagnostics on `.purs` files.
+
+```
+/plugin marketplace add Lesslie-Tech/hemlis
+/plugin install hemlis-lsp@hemlis
+```
+
+See [editors/claude-code/README.md](editors/claude-code/README.md) for scopes,
+configuration and troubleshooting.

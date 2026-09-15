@@ -132,6 +132,11 @@ struct Backend {
     /// If false, the server sets up its own native file watcher.
     client_watch_dynamic_registration: std::sync::OnceLock<bool>,
 
+    /// The roots the client handed us in `initialize`. `workspace/workspaceFolders`
+    /// is a server->client request that a client may simply not implement - Claude
+    /// Code declares no support for it - and without these we would scan nothing.
+    initialize_folders: std::sync::OnceLock<Vec<WorkspaceFolder>>,
+
     /// Controls when style diagnostics and code actions are produced.
     style_mode: RwLock<StyleMode>,
 }
@@ -525,6 +530,7 @@ mod tests {
             fixables: Default::default(),
             open_files: Default::default(),
             client_watch_dynamic_registration: std::sync::OnceLock::new(),
+            initialize_folders: std::sync::OnceLock::new(),
             style_mode: std::sync::RwLock::new(StyleMode::default()),
         })
         .finish();
@@ -3324,6 +3330,27 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         let _ = self.client_watch_dynamic_registration.set(dynamic_watch);
 
+        // Remember the roots `initialize` carried, so `workspace_roots` has
+        // something to fall back on when the client answers nothing.
+        let initialize_folders = params
+            .workspace_folders
+            .filter(|f| !f.is_empty())
+            .or_else(|| {
+                #[allow(deprecated)]
+                params.root_uri.map(|uri| {
+                    let name = uri
+                        .path()
+                        .as_str()
+                        .rsplit('/')
+                        .find(|s| !s.is_empty())
+                        .unwrap_or_default()
+                        .to_string();
+                    vec![WorkspaceFolder { uri, name }]
+                })
+            })
+            .unwrap_or_default();
+        let _ = self.initialize_folders.set(initialize_folders);
+
         // Read style mode from initializationOptions
         if let Some(opts) = params.initialization_options
             && let Some(style) = opts.get("style").and_then(|v| v.as_str())
@@ -3402,13 +3429,7 @@ impl LanguageServer for Backend {
         let folders = {
             tracing::info!("version {}", hemlis_lib::version());
             tracing::info!("Scanning...");
-            let folders = self
-                .client
-                .workspace_folders()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let folders = self.workspace_roots().await;
             self.load_workspace(folders.clone());
             tracing::info!("Done scanning");
             let mut futures = Vec::new();
@@ -3422,7 +3443,18 @@ impl LanguageServer for Backend {
             let mut write = self.has_started.write().unwrap();
             *write = true;
         }
-        {
+        // Only ask the client to register the watcher if it said it can, and treat a
+        // refusal as a refusal rather than a crash: a client is allowed to answer
+        // `client/registerCapability` with MethodNotFound (Claude Code does), and
+        // panicking here took the whole server down before the fallback below could
+        // run.
+        let client_can_register = self
+            .client_watch_dynamic_registration
+            .get()
+            .copied()
+            .unwrap_or(false);
+
+        let registered = if client_can_register {
             let registration = Registration {
                 id: "workspace/didChangeWatchedFiles".to_string(),
                 method: "workspace/didChangeWatchedFiles".to_string(),
@@ -3435,19 +3467,23 @@ impl LanguageServer for Backend {
                 })),
             };
 
-            self.client
-                .register_capability(vec![registration])
-                .await
-                .unwrap();
-        }
+            match self.client.register_capability(vec![registration]).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(
+                        "client rejected registerCapability for workspace/didChangeWatchedFiles ({e}) - using the native watcher instead"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
 
         // Fall back to a native file watcher when the client doesn't support dynamic
-        // registration of workspace/didChangeWatchedFiles (e.g. neovim on Linux).
-        let use_native_watcher = !self
-            .client_watch_dynamic_registration
-            .get()
-            .copied()
-            .unwrap_or(false);
+        // registration of workspace/didChangeWatchedFiles (e.g. neovim on Linux), or
+        // when it turned the registration down.
+        let use_native_watcher = !registered;
 
         if use_native_watcher {
             let watch_dirs: Vec<std::path::PathBuf> = folders
@@ -5051,13 +5087,7 @@ impl LanguageServer for Backend {
                 .log_message(MessageType::INFO, "Loading entire workspace...".to_string())
                 .await;
 
-            let folders = self
-                .client
-                .workspace_folders()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let folders = self.workspace_roots().await;
             self.load_workspace(folders);
             self.client
                 .log_message(MessageType::INFO, "Done loading!".to_string())
@@ -5668,6 +5698,37 @@ impl Backend {
 
     fn name(&self, ud: &ast::Ud) -> Option<String> {
         Some(self.names.try_get(ud).try_unwrap()?.value().clone())
+    }
+
+    /// The folders to scan: whatever the client reports, falling back to the roots
+    /// from `initialize` when the client does not implement the request or answers
+    /// with nothing.
+    async fn workspace_roots(&self) -> Vec<WorkspaceFolder> {
+        let reported = self
+            .client
+            .workspace_folders()
+            .await
+            .ok()
+            .flatten()
+            .filter(|f| !f.is_empty());
+
+        match reported {
+            Some(folders) => folders,
+            None => {
+                let fallback = self.initialize_folders.get().cloned().unwrap_or_default();
+                if fallback.is_empty() {
+                    tracing::warn!(
+                        "client reported no workspace folders and `initialize` carried none - nothing to scan"
+                    );
+                } else {
+                    tracing::info!(
+                        "client reported no workspace folders - falling back to the {} root(s) from `initialize`",
+                        fallback.len()
+                    );
+                }
+                fallback
+            }
+        }
     }
 
     #[instrument(skip(self))]
@@ -6397,6 +6458,7 @@ async fn main() {
         open_files: DashMap::new(),
 
         client_watch_dynamic_registration: std::sync::OnceLock::new(),
+        initialize_folders: std::sync::OnceLock::new(),
         style_mode: RwLock::new(StyleMode::default()),
     })
     .finish();

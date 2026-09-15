@@ -1,0 +1,12 @@
+{
+  "name": "hemlis-lsp",
+  "description": "PureScript code intelligence for Claude Code via the hemlis language server: go-to-definition, find references, hover, symbol search and diagnostics.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Lesslie"
+  },
+  "homepage": "https://github.com/Lesslie-Tech/hemlis",
+  "repository": "https://github.com/Lesslie-Tech/hemlis",
+  "license": "See LICENSE in the hemlis repository",
+  "keywords": ["purescript", "lsp", "hemlis", "code-intelligence"]
+}
