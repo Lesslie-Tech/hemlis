@@ -3697,6 +3697,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        self.await_scanned().await;
         let definition = || -> Option<GotoDefinitionResponse> {
             if let Some(name) = self.resolve_name(
                 &params.text_document_position_params.text_document.uri,
@@ -3741,6 +3742,7 @@ impl LanguageServer for Backend {
 
     #[instrument(skip(self))]
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        self.await_scanned().await;
         let reference_list = || -> Option<Vec<Location>> {
             let name = self.resolve_name(
                 &params.text_document_position.text_document.uri,
@@ -3772,6 +3774,7 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<WorkspaceSymbolResponse>> {
+        self.await_scanned().await;
         let mut symbols = Vec::new();
         for i in self.previouse_defines.iter() {
             let fi = i.key();
@@ -3833,6 +3836,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
+        self.await_scanned().await;
         let mut symbols = Vec::new();
         let fi_inner = if let Some(fi) = self
             .uri_to_fi
@@ -5105,6 +5109,7 @@ impl LanguageServer for Backend {
 
     #[instrument(skip(self))]
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.await_scanned().await;
         let name = or_!(
             self.resolve_name(
                 &params.text_document_position_params.text_document.uri,
@@ -5698,6 +5703,35 @@ impl Backend {
 
     fn name(&self, ud: &ast::Ud) -> Option<String> {
         Some(self.names.try_get(ud).try_unwrap()?.value().clone())
+    }
+
+    /// Wait for the initial workspace scan to finish.
+    ///
+    /// Queries that arrive before the scan completes would otherwise read an empty
+    /// index and answer "nothing found", which a client cannot tell apart from "no
+    /// such symbol". Scanning a large workspace takes a few seconds and clients do
+    /// ask immediately - Claude Code fires a workspace/symbol as soon as it starts -
+    /// so waiting briefly gives a correct answer where returning early gives a
+    /// confidently wrong one.
+    async fn await_scanned(&self) {
+        // Generous: the scan is seconds, but a cap means a wedged scan degrades to
+        // the old empty answer rather than hanging the client forever.
+        const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+        let start = std::time::Instant::now();
+        let mut waited = false;
+        while start.elapsed() < MAX_WAIT {
+            if self.has_started.try_read().map(|x| *x).unwrap_or(false) {
+                if waited {
+                    tracing::info!("waited {:?} for the initial scan", start.elapsed());
+                }
+                return;
+            }
+            waited = true;
+            tokio::time::sleep(POLL).await;
+        }
+        tracing::warn!("initial scan still not done after {MAX_WAIT:?} - answering anyway");
     }
 
     /// The folders to scan: whatever the client reports, falling back to the roots
