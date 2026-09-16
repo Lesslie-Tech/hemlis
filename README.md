@@ -103,6 +103,13 @@ This repo ships a Claude Code plugin that wires up `hemlis-language-server` as
 an LSP server, giving Claude go-to-definition, references, hover, symbol search
 and diagnostics on `.purs` files.
 
+It's enabled team-wide via the checked-in [.claude/settings.json](.claude/settings.json):
+anyone who opens this repo in Claude Code gets a one-time folder-trust prompt,
+after which the `hemlis` marketplace and `hemlis-lsp` plugin are enabled
+automatically. No manual `/plugin install` needed.
+
+If you want it in other PureScript projects too, install it yourself:
+
 ```
 /plugin marketplace add Lesslie-Tech/hemlis
 /plugin install hemlis-lsp@hemlis

@@ -28,15 +28,19 @@ the connection, it does not ship the binary:
 which hemlis-language-server
 ```
 
-Then, in Claude Code:
+If you're working in the `hemlis` repo itself, the plugin is already enabled
+team-wide via the checked-in [`.claude/settings.json`](../../.claude/settings.json) —
+just trust the folder when Claude Code prompts you.
+
+To use it in other PureScript projects, install it yourself:
 
 ```
 /plugin marketplace add Lesslie-Tech/hemlis
 /plugin install hemlis-lsp@hemlis
 ```
 
-Each person installs it for themselves. Pick **user** scope to get it in every
-PureScript project you open, or **local** scope for a single repo.
+Pick **user** scope to get it in every PureScript project you open, or
+**local** scope for a single repo.
 
 Check it came up with `/plugin`: `hemlis-lsp` should appear under **Installed**
 listing the `hemlis` LSP server, and the **Errors** tab should be empty. If the

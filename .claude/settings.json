@@ -1,0 +1,13 @@
+{
+  "extraKnownMarketplaces": {
+    "hemlis": {
+      "source": {
+        "source": "github",
+        "repo": "Lesslie-Tech/hemlis"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "hemlis-lsp@hemlis": true
+  }
+}
