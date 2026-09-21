@@ -3297,6 +3297,102 @@ mod tests {
         )
         .await;
     }
+
+    /// Deleting a module the LSP already knows about must purge its state and
+    /// re-resolve everything that imported it - otherwise names from the
+    /// deleted module keep resolving as if the file still existed.
+    #[tokio::test]
+    async fn did_change_watched_files_deleted_purges_module_and_cascades() {
+        let (mut service, diagnostics) = build_test_service();
+
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let lib_uri = "file:///Lib.purs";
+        let test_uri = "file:///Test.purs";
+
+        lsp_notify(
+            &mut service,
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": lib_uri,
+                    "languageId": "purescript",
+                    "version": 1,
+                    "text": "module Lib where\n\nhello :: Int\nhello = 0\n"
+                }
+            }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        lsp_notify(
+            &mut service,
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": test_uri,
+                    "languageId": "purescript",
+                    "version": 1,
+                    "text": "module Test where\n\nimport Lib (hello)\n\nfoo :: Int\nfoo = hello\n"
+                }
+            }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Sanity check: Test.purs resolves cleanly against Lib while it still exists.
+        assert!(
+            diagnostics
+                .lock()
+                .unwrap()
+                .get(test_uri)
+                .is_none_or(|d| d.is_empty()),
+            "Test.purs should have no diagnostics before Lib.purs is deleted"
+        );
+
+        // Simulate the file watcher reporting that Lib.purs was deleted from disk.
+        lsp_notify(
+            &mut service,
+            "workspace/didChangeWatchedFiles",
+            serde_json::json!({
+                "changes": [
+                    { "uri": lib_uri, "type": 3 }
+                ]
+            }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Lib.purs' own stale diagnostics must be cleared out.
+        assert!(
+            diagnostics
+                .lock()
+                .unwrap()
+                .get(lib_uri)
+                .is_none_or(|d| d.is_empty()),
+            "Lib.purs should have its diagnostics cleared once deleted"
+        );
+
+        // Test.purs imported the now-deleted module - it must be re-resolved and
+        // surface an error instead of silently keeping `hello` resolved.
+        let test_diagnostics = diagnostics.lock().unwrap().get(test_uri).cloned();
+        assert!(
+            test_diagnostics.is_some_and(|d| !d.is_empty()),
+            "Test.purs should get an error once its import (Lib.purs) is deleted"
+        );
+    }
 }
 
 impl LanguageServer for Backend {
@@ -4340,7 +4436,7 @@ impl LanguageServer for Backend {
                             .unwrap_or_else(|| namespace_str.clone());
 
                         // Already-imported qualified aliases that are similar to the typed name
-                        for (alias_opt, _) in imported.iter() {
+                        for alias_opt in imported.keys() {
                             let Some(alias) = alias_opt else { continue };
                             let alias_str = self.name_(alias);
                             let sim = similarity_score(
@@ -4359,7 +4455,7 @@ impl LanguageServer for Backend {
                                     edit: Some(WorkspaceEdit::new(
                                         [(
                                             uri.clone(),
-                                            vec![TextEdit::new(span_to_range(&at), alias_str)],
+                                            vec![TextEdit::new(span_to_range(at), alias_str)],
                                         )]
                                         .into(),
                                     )),
@@ -4369,7 +4465,7 @@ impl LanguageServer for Backend {
                         }
 
                         // Suggest importing any module with a name similar to the typed namespace
-                        for (m, _xs) in all_exports.iter() {
+                        for m in all_exports.keys() {
                             if *m == me {
                                 continue;
                             }
@@ -4435,7 +4531,7 @@ impl LanguageServer for Backend {
                                                     [(
                                                         uri.clone(),
                                                         vec![TextEdit::new(
-                                                            span_to_range(&at),
+                                                            span_to_range(at),
                                                             usage,
                                                         )],
                                                     )]
@@ -4704,7 +4800,7 @@ impl LanguageServer for Backend {
                                                                 ),
                                                             ),
                                                             TextEdit::new(
-                                                                span_to_range(&at),
+                                                                span_to_range(at),
                                                                 qualified_usage,
                                                             ),
                                                         ],
@@ -5077,6 +5173,20 @@ impl LanguageServer for Backend {
                         if !to_notify.is_empty() {
                             let _ = self.client.workspace_diagnostic_refresh().await;
                         }
+                    }
+                }
+                FileChangeType::DELETED => {
+                    let uri = event.uri;
+                    let Some(fi) = self.uri_to_fi.try_get(&uri).try_unwrap().map(|x| *x) else {
+                        continue;
+                    };
+                    let to_notify = self.on_delete(fi);
+                    let _ = self.client.publish_diagnostics(uri, Vec::new(), None).await;
+                    for (fi, v) in to_notify.iter() {
+                        self.show_errors(*fi, *v).await;
+                    }
+                    if !to_notify.is_empty() {
+                        let _ = self.client.workspace_diagnostic_refresh().await;
                     }
                 }
                 _ => {}
@@ -5784,7 +5894,7 @@ impl Backend {
                     let source = std::fs::read_to_string(path.clone()).ok()?;
                     let uri = Uri::from_str(&format!(
                         "file://{}",
-                        &path.clone().into_os_string().into_string().ok()?
+                        path.clone().into_os_string().into_string().ok()?
                     ))
                     .ok()?;
                     let fi = loop {
@@ -6356,6 +6466,67 @@ impl Backend {
         tracing::info!("!! {:?} DROP LOCK {:?}", version, uri.to_string());
         drop(lock);
         Some((fi, version, to_notify))
+    }
+
+    /// Purge all server state for a file that was deleted from disk, and re-resolve any
+    /// modules that imported it (so they surface an unresolved-import error instead of
+    /// keeping names resolved against a module that no longer exists).
+    ///
+    /// Returns the `(fi, version)` pairs whose diagnostics should be refreshed.
+    #[instrument(skip(self))]
+    fn on_delete(&self, fi: ast::Fi) -> Vec<(ast::Fi, Option<i32>)> {
+        self.open_files.remove(&fi);
+        self.fi_to_source.remove(&fi);
+        self.fi_to_version.remove(&fi);
+        self.syntax_errors.remove(&fi);
+        self.name_resolution_errors.remove(&fi);
+        self.fixables.remove(&fi);
+        self.available_locals.remove(&fi);
+        LINE_INDEX.remove(&fi);
+
+        if let Some((_, old)) = self.previouse_defines.remove(&fi) {
+            for (name, _) in old.iter() {
+                self.defines.remove(name);
+            }
+        }
+        if let Some((_, old)) = self.previouse_global_usages.remove(&fi) {
+            for (name, pos, sort) in old.iter() {
+                if let Some(mut e) = self.references.get_mut(&name.1)
+                    && let Some(e) = e.get_mut(name)
+                {
+                    e.remove(&(*pos, *sort));
+                }
+            }
+        }
+
+        if let Some((_, uri)) = self.fi_to_uri.remove(&fi) {
+            self.uri_to_fi.remove(&uri);
+        }
+
+        let Some((_, me)) = self.fi_to_ud.remove(&fi) else {
+            return Vec::new();
+        };
+        self.ud_to_fi.remove(&me);
+        self.modules.remove(&me);
+        self.exports.remove(&me);
+        self.resolved.remove(&me);
+        self.references.remove(&me);
+
+        if let Some((_, old_imports)) = self.imports.remove(&me) {
+            let old_imports = old_imports
+                .values()
+                .flat_map(|x| x.iter().flat_map(|x| x.to_names().into_iter().map(|x| x.module())))
+                .collect::<BTreeSet<ast::Ud>>();
+            for x in old_imports {
+                self.importers.entry(x).or_default().remove(&me);
+            }
+        }
+
+        // Re-resolve everything that imported the now-missing module - this needs to run
+        // before `importers` loses its `me` entry, since that's what seeds the cascade.
+        let to_notify = self.resolve_cascading(me, fi, None);
+        self.importers.remove(&me);
+        to_notify
     }
 }
 
