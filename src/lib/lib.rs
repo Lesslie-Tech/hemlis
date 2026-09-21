@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self},
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
 };
 
 use dashmap::DashMap;
@@ -524,10 +524,26 @@ pub fn list_warnings(files: Vec<String>) {
 
     warnings.sort_by_key(|(fi, pos, _)| (fi.0, *pos));
 
+    // Bold the location and color the message yellow, but only when stdout
+    // is a terminal and the user hasn't opted out (https://no-color.org) —
+    // piping into another tool (e.g. `grep`) should still see plain text.
+    let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+    let (bold, yellow, reset) = if use_color {
+        ("\x1b[1m", "\x1b[33m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
     let fi_to_arg: BTreeMap<usize, &str> = parsed.iter().map(|f| (f.fi.0, f.arg.as_str())).collect();
     for (fi, (line, col), message) in warnings.iter() {
         let path = fi_to_arg.get(&fi.0).copied().unwrap_or("?");
-        println!("{}:{}:{}: {}", path, line + 1, col + 1, message);
+        println!(
+            "{bold}{}:{}:{}:{reset} {yellow}{}{reset}",
+            path,
+            line + 1,
+            col + 1,
+            message
+        );
     }
 
     if !warnings.is_empty() {
