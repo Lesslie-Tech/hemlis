@@ -1512,6 +1512,62 @@ mod tests {
         .await;
     }
 
+    // --- Disallow whole-module re-exports outside Joe and Prelude ---
+
+    #[tokio::test]
+    async fn style_warn_module_reexport_outside_joe_prelude() {
+        assert_warning(indoc! {"
+            module Test (module Foo) where
+                                ~~~ Only the `Joe` and `Prelude` modules may re-export a whole module (`module X`)
+
+            import Other as Foo
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_module_reexport_in_joe() {
+        assert_no_warning(indoc! {"
+            module Joe (module Foo) where
+                               ~~~
+
+            import Other as Foo
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_module_reexport_in_prelude() {
+        assert_no_warning(indoc! {"
+            module Prelude (module Foo) where
+                                   ~~~
+
+            import Other as Foo
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_module_reexport_multiple() {
+        // Every `module X` entry is checked, not just the first.
+        assert_warning(indoc! {"
+            module Test (module Foo, module Bar) where
+                                ~~~ Only the `Joe` and `Prelude` modules may re-export a whole module (`module X`)
+
+            import Other as Foo
+            import Another as Bar
+        "})
+        .await;
+        assert_warning(indoc! {"
+            module Test (module Foo, module Bar) where
+                                            ~~~ Only the `Joe` and `Prelude` modules may re-export a whole module (`module X`)
+
+            import Other as Foo
+            import Another as Bar
+        "})
+        .await;
+    }
+
     // --- PAY-3692: Ctx module import naming convention ---
 
     #[tokio::test]
