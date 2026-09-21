@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self},
-    io::{self, Read},
+    io::{self, IsTerminal, Read},
 };
 
 use dashmap::DashMap;
@@ -317,6 +317,237 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
                 }
             }
         }
+    }
+}
+
+fn format_name(ns: Option<ast::Ud>, n: ast::Ud, names: &BTreeMap<ast::Ud, String>) -> String {
+    match (ns.and_then(|ns| names.get(&ns).cloned()), names.get(&n).cloned()) {
+        (None, Some(name)) => name,
+        (Some(ns), Some(name)) => format!("{}.{}", ns, name),
+        (_, _) => "?".into(),
+    }
+}
+
+/// Renders the subset of `NRerrors` that are warnings (as opposed to hard
+/// errors) into a human-readable message, mirroring the severity split the
+/// LSP makes in `nrerror_turn_into_diagnostic`. Returns `None` for variants
+/// that are errors, not warnings.
+fn nrerror_as_warning(
+    error: &nr::NRerrors,
+    names: &BTreeMap<ast::Ud, String>,
+) -> Option<(ast::Span, String)> {
+    use nr::NRerrors::*;
+    match error {
+        UnusedImport(scope, ud, s) => Some((
+            *s,
+            format!("Import of {:?} {} is unused", scope, format_name(None, *ud, names)),
+        )),
+        UnusedImportQualified(ud, s) => Some((
+            *s,
+            format!("The qualified import {} is unused", format_name(None, *ud, names)),
+        )),
+        UnusedImportUnqualified(ud, s) => Some((
+            *s,
+            format!("The unqualified import {} is unused", format_name(None, *ud, names)),
+        )),
+        UnusedImportedConstructor(ud, s) => Some((
+            *s,
+            format!("The import constructor {} is unused", format_name(None, *ud, names)),
+        )),
+        UnusedImportTypeAndConstructor(ud, _, s) => Some((
+            *s,
+            format!(
+                "Both type and constructors for {} are unused",
+                format_name(None, *ud, names)
+            ),
+        )),
+        UnusedImportedConstructorsAll(ud, name_s, _) => Some((
+            *name_s,
+            format!(
+                "The constructors of {} are imported but never used",
+                format_name(None, *ud, names)
+            ),
+        )),
+        UnusedLocal(name, s) => Some((
+            *s,
+            format!(
+                "Local {:?} {} is unused",
+                name.scope(),
+                format_name(None, name.name(), names)
+            ),
+        )),
+        UnusedDefinition(name, s) if name.scope() == nr::Scope::Namespace => Some((
+            s.span().entire_line(),
+            format!("Namespace {} is unused", format_name(None, name.name(), names)),
+        )),
+        UnusedConstructor(u, s) => Some((
+            *s,
+            format!("Constructor {} can be safely removed", format_name(None, u.name(), names)),
+        )),
+        UnusedDefinition(name, s) => Some((
+            s.name,
+            format!(
+                "Definition {:?} {} is unused",
+                name.scope(),
+                format_name(None, name.name(), names)
+            ),
+        )),
+        ImportDoesNothing(u, s) => Some((
+            *s,
+            format!("Import {} can be safely removed", format_name(None, *u, names)),
+        )),
+        _ => None,
+    }
+}
+
+fn style_warning_message(action: &style::StyleAction) -> Option<&str> {
+    match action {
+        style::StyleAction::Warn { message } => Some(message),
+        style::StyleAction::Fix { .. } => None,
+        style::StyleAction::WarnAndFix { message, .. } => Some(message),
+        style::StyleAction::WarnAndRename { message, .. } => Some(message),
+    }
+}
+
+/// Lists every warning across `files`: unused imports/locals/definitions
+/// (from name resolution) plus style warnings (e.g. unnecessary parens),
+/// the same two sources the LSP combines into its diagnostics. Prints one
+/// `path:line:col: message` per warning, sorted by file then position, and
+/// exits with status 1 if any warnings were found (0 otherwise).
+pub fn list_warnings(files: Vec<String>) {
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+
+    let (exports, prim, names) = build_builtins();
+
+    struct ParsedFile {
+        arg: String,
+        fi: ast::Fi,
+        src: String,
+        module: ast::Module,
+        me: ast::Ud,
+        deps: BTreeSet<ast::Ud>,
+    }
+
+    enum ParseOutcome {
+        Ok(ParsedFile),
+        ReadError(io::Error),
+        Skipped,
+    }
+
+    // Reading + lexing + parsing each file is independent, so it runs in
+    // parallel (one rayon task per file, same pattern as `check_format` and
+    // `process_one_file`); only the error reporting below stays sequential
+    // so it prints in file order.
+    let outcomes: Vec<ParseOutcome> = files
+        .par_iter()
+        .enumerate()
+        .map(|(i, arg)| match fs::read_to_string(arg) {
+            Err(e) => ParseOutcome::ReadError(e),
+            Ok(src) => {
+                let fi = ast::Fi(i);
+                let (l, _comments) = lexer::lex(&src, fi);
+                let mut p = parser::P::new(&l, &names);
+                let parsed = parser::module(&mut p).and_then(|m| {
+                    let header = m.0.clone()?;
+                    let me = header.0 .0 .0;
+                    let deps = header.2.iter().map(|x| x.from.0 .0).collect::<BTreeSet<_>>();
+                    Some(ParsedFile { arg: arg.clone(), fi, src, module: m, me, deps })
+                });
+                parsed.map_or(ParseOutcome::Skipped, ParseOutcome::Ok)
+            }
+        })
+        .collect();
+
+    let mut parsed = Vec::new();
+    for (arg, outcome) in files.iter().zip(outcomes) {
+        match outcome {
+            ParseOutcome::Ok(f) => parsed.push(f),
+            ParseOutcome::ReadError(e) => eprintln!("ERR: could not read '{}': {:?}", arg, e),
+            ParseOutcome::Skipped => {}
+        }
+    }
+
+    let names_: BTreeMap<_, _> = names
+        .iter()
+        .map(|k| (*k.key(), k.value().clone()))
+        .collect();
+    let mut done: BTreeSet<_> = exports.iter().map(|k| *k.key()).collect();
+    let mut errors = Vec::new();
+    let mut remaining: Vec<&ParsedFile> = parsed.iter().collect();
+    loop {
+        let (todo, rest): (Vec<_>, Vec<_>) = remaining
+            .into_iter()
+            .partition(|f| !done.contains(&f.me) && f.deps.is_subset(&done));
+        if todo.is_empty() {
+            break;
+        }
+        // Every file in `todo` only depends on modules already in `done`,
+        // never on a sibling in this same wave, so the wave resolves in
+        // parallel; only the global `exports`/`errors` merge afterward is
+        // sequential.
+        let wave: Vec<(ast::Ud, Vec<nr::NRerrors>, Vec<nr::Export>)> = todo
+            .par_iter()
+            .map(|f| {
+                let mut n = nr::N::new(f.me, &exports);
+                nr::resolve_names(&mut n, prim, &f.module);
+                (f.me, n.errors, n.exports)
+            })
+            .collect();
+        for (me, mut e, exp) in wave {
+            errors.append(&mut e);
+            exports.insert(me, exp);
+        }
+        done.append(&mut todo.iter().map(|f| f.me).collect());
+        remaining = rest;
+    }
+
+    let mut warnings: Vec<(ast::Fi, ast::Pos, String)> = errors
+        .iter()
+        .filter_map(|e| nrerror_as_warning(e, &names_))
+        .filter_map(|(span, message)| span.fi().map(|fi| (fi, span.lo(), message)))
+        .collect();
+
+    // Style-checking each already-parsed module is independent too.
+    let style_warnings: Vec<(ast::Fi, ast::Pos, String)> = parsed
+        .par_iter()
+        .flat_map(|f| {
+            style::check_module(&f.module, &f.src, f.fi)
+                .into_iter()
+                .filter_map(|sd| {
+                    style_warning_message(&sd.action)
+                        .map(|message| (f.fi, sd.cursor_span.lo(), message.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    warnings.extend(style_warnings);
+
+    warnings.sort_by_key(|(fi, pos, _)| (fi.0, *pos));
+
+    // Bold the location and color the message yellow, but only when stdout
+    // is a terminal and the user hasn't opted out (https://no-color.org) —
+    // piping into another tool (e.g. `grep`) should still see plain text.
+    let use_color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+    let (bold, yellow, reset) = if use_color {
+        ("\x1b[1m", "\x1b[33m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+
+    let fi_to_arg: BTreeMap<usize, &str> = parsed.iter().map(|f| (f.fi.0, f.arg.as_str())).collect();
+    for (fi, (line, col), message) in warnings.iter() {
+        let path = fi_to_arg.get(&fi.0).copied().unwrap_or("?");
+        println!(
+            "{bold}{}:{}:{}:{reset} {yellow}{}{reset}",
+            path,
+            line + 1,
+            col + 1,
+            message
+        );
+    }
+
+    if !warnings.is_empty() {
+        std::process::exit(1);
     }
 }
 

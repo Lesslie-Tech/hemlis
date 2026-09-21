@@ -1,12 +1,13 @@
 use std::{collections::BTreeSet, env};
 
-use hemlis_lib::{parse_and_resolve_names, parse_modules, version, Flag as LibFlag};
+use hemlis_lib::{list_warnings, parse_and_resolve_names, parse_modules, version, Flag as LibFlag};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum Flag {
     Resolve,
     Parse,
     Version,
+    Warnings,
 }
 
 fn main() {
@@ -34,6 +35,7 @@ fn main() {
                 "-r" | "--resolve" => flags.insert(Flag::Resolve),
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),
+                "-W" | "--warnings" => flags.insert(Flag::Warnings),
                 _ => {
                     eprintln!("Not a valid argument {} - aborting", arg);
                     continue;
@@ -47,6 +49,10 @@ fn main() {
 
     if flags.contains(&Flag::Version) {
         println!("version: {}", version());
+        return;
+    }
+    if flags.contains(&Flag::Warnings) {
+        list_warnings(files);
         return;
     }
     if flags.contains(&Flag::Resolve) {

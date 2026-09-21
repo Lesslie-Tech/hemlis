@@ -1460,6 +1460,34 @@ fn check_docstring_comments(
 }
 
 // ---------------------------------------------------------------------------
+// Disallow whole-module re-exports outside Joe and Prelude
+// ---------------------------------------------------------------------------
+
+/// Warn on a `module X` entry in the export list (re-exporting everything
+/// imported under alias `X`) unless the current module is `Joe` or `Prelude`
+/// — the two designated re-export barrels. Everywhere else, an export list
+/// should only name things the module actually defines. Warn-only: there's
+/// no safe rewrite, since dropping the re-export changes the module's public
+/// API.
+fn rule_no_module_reexport(module_name: Ud, header: &ast::Header, out: &mut Vec<StyleDiagnostic>) {
+    if module_name == Ud::new("Joe") || module_name == Ud::new("Prelude") {
+        return;
+    }
+    for export in header.1.iter().flatten() {
+        if let ast::Export::Module(m) = export {
+            let span = m.span();
+            out.push(StyleDiagnostic {
+                cursor_span: span,
+                expr_span: span,
+                action: StyleAction::Warn {
+                    message: "Only the `Joe` and `Prelude` modules may re-export a whole module (`module X`)".into(),
+                },
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1492,6 +1520,7 @@ pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<Styl
                 _ => None,
             })
             .collect();
+        rule_no_module_reexport((header.0 .0).0, header, &mut checker.diagnostics);
         for imp in &header.2 {
             rule_import_exact_name(
                 imp,
