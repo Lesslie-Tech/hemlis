@@ -308,7 +308,7 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
                 continue;
             }
             println!("> {}", name);
-            for (_, v) in v.iter() {
+            for v in v.values() {
                 for (k, v) in v.iter() {
                     println!("   import: {}", names_.get(k).unwrap().clone());
                     for v in v.iter() {

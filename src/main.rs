@@ -4436,7 +4436,7 @@ impl LanguageServer for Backend {
                             .unwrap_or_else(|| namespace_str.clone());
 
                         // Already-imported qualified aliases that are similar to the typed name
-                        for (alias_opt, _) in imported.iter() {
+                        for alias_opt in imported.keys() {
                             let Some(alias) = alias_opt else { continue };
                             let alias_str = self.name_(alias);
                             let sim = similarity_score(
@@ -4455,7 +4455,7 @@ impl LanguageServer for Backend {
                                     edit: Some(WorkspaceEdit::new(
                                         [(
                                             uri.clone(),
-                                            vec![TextEdit::new(span_to_range(&at), alias_str)],
+                                            vec![TextEdit::new(span_to_range(at), alias_str)],
                                         )]
                                         .into(),
                                     )),
@@ -4465,7 +4465,7 @@ impl LanguageServer for Backend {
                         }
 
                         // Suggest importing any module with a name similar to the typed namespace
-                        for (m, _xs) in all_exports.iter() {
+                        for m in all_exports.keys() {
                             if *m == me {
                                 continue;
                             }
@@ -4531,7 +4531,7 @@ impl LanguageServer for Backend {
                                                     [(
                                                         uri.clone(),
                                                         vec![TextEdit::new(
-                                                            span_to_range(&at),
+                                                            span_to_range(at),
                                                             usage,
                                                         )],
                                                     )]
@@ -4800,7 +4800,7 @@ impl LanguageServer for Backend {
                                                                 ),
                                                             ),
                                                             TextEdit::new(
-                                                                span_to_range(&at),
+                                                                span_to_range(at),
                                                                 qualified_usage,
                                                             ),
                                                         ],
@@ -5894,7 +5894,7 @@ impl Backend {
                     let source = std::fs::read_to_string(path.clone()).ok()?;
                     let uri = Uri::from_str(&format!(
                         "file://{}",
-                        &path.clone().into_os_string().into_string().ok()?
+                        path.clone().into_os_string().into_string().ok()?
                     ))
                     .ok()?;
                     let fi = loop {
