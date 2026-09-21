@@ -341,11 +341,16 @@ impl<'s> Printer<'s> {
             self.raw(" ");
             self.raw(&inner_text);
             if has_comment_before_close {
-                let hang_col = inner_text
-                    .rsplit('\n')
-                    .next()
-                    .map(|l| l.len() - l.trim_start().len())
-                    .unwrap_or(open_col);
+                // A single-line `inner_text` has no literal leading spaces on
+                // its only line (the column offset lives virtually in
+                // `out_floor`, never written out) - measuring it would give a
+                // false 0. Only a real line break carries a literal indent
+                // worth measuring; otherwise hang under `( `'s own column.
+                let hang_col = if inner_text.contains('\n') {
+                    inner_text.rsplit('\n').next().map(|l| l.len() - l.trim_start().len()).unwrap_or(open_col)
+                } else {
+                    open_col + 2
+                };
                 self.with_indent_at(hang_col, |p| p.flush_comments_before(close.lo().0));
             }
             self.realign_to(open_col);
@@ -640,6 +645,13 @@ impl<'s> Printer<'s> {
                 if !just_flushed_comment {
                     self.newline();
                 }
+                // A comment on its own line between the previous item and
+                // this one (not caught above, which only claims one trailing
+                // `prev_span`'s own line) must flush here - otherwise it
+                // stays pending and gets misattributed to whatever comment
+                // check `print` runs into first (e.g. a `Typ::Paren` arg's
+                // "comment before its own close" check).
+                self.flush_comments_before(cur_span.lo().0);
             } else {
                 self.raw(" ");
             }
@@ -686,6 +698,11 @@ impl<'s> Printer<'s> {
                 if !just_flushed_comment {
                     self.newline();
                 }
+                // See `print_spine_args`'s identical fix: a comment on its
+                // own line before this arg, not caught above, must flush
+                // here or it stays pending for whatever comment check
+                // `print_typ` runs into first.
+                self.flush_comments_before(cur_span.lo().0);
             } else {
                 self.raw(" ");
             }
@@ -731,6 +748,11 @@ impl<'s> Printer<'s> {
             if !just_flushed_comment {
                 self.newline();
             }
+            // See `print_spine_args`'s identical fix: a comment on its own
+            // line before this arg, not caught above, must flush here or it
+            // stays pending for whatever comment check `print_expr` runs
+            // into first.
+            self.flush_comments_before(cur_span.lo().0);
             self.print_expr(a);
             prev_span = cur_span;
         }
@@ -5586,6 +5608,54 @@ mod tests {
         assert_idempotent(src);
     }
 
+    /// Same as the previous test, but the `Typ::Op` chain itself is short
+    /// enough to print on one line - only the trailing comment forces the
+    /// paren into block style. The comment must still hang under the chain's
+    /// column, not fall back to column 0 (there's no real line break inside
+    /// the chain to measure an indent from).
+    #[test]
+    fn typ_op_chain_comment_before_closing_paren_of_single_line_chain_is_indented() {
+        let src = indoc! {"
+            module Foo where
+
+            tableLinkRow
+              :: Db.Table
+                   ( Db.Index
+                       ( \"row_a\" .. \"row_b\" .. \"row_c\"
+                         -- NOTE: extra note
+                       )
+                   )
+                   LinkRowR
+            tableLinkRow = Db.table @\"row_link_v0\"
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A comment on its own line between an App head (`Db.Index`) and its
+    /// paren argument, still before the paren's contents, must stay right
+    /// there - not get swallowed as pending state and misattributed to the
+    /// argument paren's own "comment before its closing `)`" check.
+    #[test]
+    fn typ_app_comment_before_paren_arg_stays_before_it() {
+        let src = indoc! {"
+            module Foo where
+
+            tableLinkRow
+              :: Db.Table
+                   ( Db.Index
+                       -- NOTE: extra note
+                       (\"row_a\" .. \"row_b\" .. \"row_c\")
+                   )
+                   LinkRowR
+            tableLinkRow = Db.table @\"row_link_v0\"
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
     #[test]
     fn typ_op_chain_comment_between_operands_stays_between_them() {
         let src = indoc! {"
@@ -5724,6 +5794,40 @@ mod tests {
 
             data Memory
               = Memory
+                  (Map CompanyId CompanyMem)
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// A comment on its own line between an App head and a paren arg -
+    /// `print_app_args`'s counterpart to
+    /// `typ_app_comment_before_paren_arg_stays_before_it`.
+    #[test]
+    fn expr_app_comment_before_paren_arg_stays_before_it() {
+        let src = indoc! {"
+            module Foo where
+
+            x =
+              foo
+                -- NOTE: extra
+                (a + b)
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    /// Same, for a data constructor's paren-typed argument.
+    #[test]
+    fn data_ctor_comment_before_paren_arg_stays_before_it() {
+        let src = indoc! {"
+            module Foo where
+
+            data Memory
+              = Memory
+                  -- NOTE: extra
                   (Map CompanyId CompanyMem)
         "};
         let out = fmt(src);
