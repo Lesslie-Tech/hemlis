@@ -2067,12 +2067,6 @@ impl<'s> Printer<'s> {
                 for (op, r) in &rest {
                     let cur_span = r.span();
                     if multiline {
-                        // Without a flush per operand, a comment between two
-                        // chain items falls through to whichever flush point
-                        // comes next - typically deep inside the following
-                        // operand's own paren args, landing unindented right
-                        // before its `)` instead of staying put between the
-                        // items it was written between.
                         let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
                         if !just_flushed_comment {
                             self.newline();
@@ -5592,10 +5586,6 @@ mod tests {
         assert_idempotent(src);
     }
 
-    /// A comment between two operands of a `Typ::Op` chain (not just before
-    /// the closing paren, per the test above) must stay right there too -
-    /// not fall through into the *next* operand's own paren args, landing
-    /// unindented right before its `)`.
     #[test]
     fn typ_op_chain_comment_between_operands_stays_between_them() {
         let src = indoc! {"
