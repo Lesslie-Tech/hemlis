@@ -2063,9 +2063,15 @@ impl<'s> Printer<'s> {
                 if own_hang {
                     self.indent_in();
                 }
+                let mut prev_span = first.span();
                 for (op, r) in &rest {
+                    let cur_span = r.span();
                     if multiline {
-                        self.newline();
+                        let just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
+                        if !just_flushed_comment {
+                            self.newline();
+                        }
+                        self.flush_comments_before(cur_span.lo().0);
                         self.lit(*op);
                         self.raw(" ");
                     } else {
@@ -2074,6 +2080,7 @@ impl<'s> Printer<'s> {
                         self.raw(" ");
                     }
                     self.print_typ(r);
+                    prev_span = cur_span;
                 }
                 if own_hang {
                     self.indent_out();
@@ -5570,6 +5577,28 @@ mod tests {
                        .. Db.Index \"row_b\"
                        .. Db.Name \"row_link_v0\"
                        -- NOTE: extra note
+                   )
+                   LinkRowR
+            tableLinkRow = Db.table @\"row_link_v0\"
+        "};
+        let out = fmt(src);
+        assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    #[test]
+    fn typ_op_chain_comment_between_operands_stays_between_them() {
+        let src = indoc! {"
+            module Foo where
+
+            tableLinkRow
+              :: Db.Table
+                   ( Db.Pk (\"row_a\" .. \"row_b\")
+                       -- NOTE: first index
+                       .. Db.Index (\"row_a\" .. \"row_c\")
+                       -- NOTE: second index
+                       .. Db.Index \"row_b\"
+                       .. Db.Name \"row_link_v0\"
                    )
                    LinkRowR
             tableLinkRow = Db.table @\"row_link_v0\"
