@@ -378,7 +378,7 @@ fn print_hover_doc_comment(target: &mut String, source: &str, before_line: usize
             writeln!(
                 target,
                 "{}",
-                escape_hover_markdown(strip_hover_comment_prefix(x))
+                rewrite_hover_tag_brackets(strip_hover_comment_prefix(x))
             )
             .unwrap();
         })
@@ -427,17 +427,42 @@ fn strip_hover_comment_prefix(line: &str) -> &str {
     }
 }
 
-/// Escapes markdown metacharacters in doc-comment text before it's rendered as hover
-/// markdown. Square brackets are the main offender: a comment like `NOTE[sg]: ...` is
-/// otherwise read as link-reference syntax and can silently vanish from the rendered hover.
-fn escape_hover_markdown(s: &str) -> String {
+/// Rewrites doc-comment tag brackets - `NOTE[sg]`, `INVARIANT[123]`, and so on - into
+/// `NOTE(sg)` / `INVARIANT(123)` before the comment is rendered as hover markdown.
+///
+/// A `[...]` only counts as a tag reference when it's directly preceded by an
+/// all-caps word (no lowercase letters): that's what distinguishes a `TAG[ref]`
+/// annotation from an ordinary markdown/PureScript use of square brackets (a real
+/// link, a list literal, ...), which this leaves untouched. Parens read better than
+/// escaped brackets and can't be misread as link-reference syntax.
+fn rewrite_hover_tag_brackets(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '\\' | '[' | ']') {
-            out.push('\\');
+    let mut rest = s;
+    while let Some(bracket_at) = rest.find('[') {
+        out.push_str(&rest[..bracket_at]);
+        let after_bracket = &rest[bracket_at + 1..];
+
+        let word_start = out
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let word = &out[word_start..];
+        let is_tag = !word.is_empty()
+            && word.chars().any(|c| c.is_ascii_uppercase())
+            && !word.chars().any(|c| c.is_ascii_lowercase());
+
+        if is_tag && let Some(end_rel) = after_bracket.find(']') {
+            out.push('(');
+            out.push_str(&after_bracket[..end_rel]);
+            out.push(')');
+            rest = &after_bracket[end_rel + 1..];
+            continue;
         }
-        out.push(c);
+
+        out.push('[');
+        rest = after_bracket;
     }
+    out.push_str(rest);
     out
 }
 
@@ -471,7 +496,7 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StyleMode, escape_hover_markdown, format_hover_snippet, strip_hover_comment_prefix,
+        StyleMode, format_hover_snippet, rewrite_hover_tag_brackets, strip_hover_comment_prefix,
     };
     use indoc::indoc;
     use std::str::FromStr;
@@ -511,16 +536,40 @@ mod tests {
     }
 
     #[test]
-    fn hover_markdown_escapes_bracket_tags() {
+    fn hover_markdown_rewrites_tag_brackets_to_parens() {
         assert_eq!(
-            escape_hover_markdown("NOTE[sg]: don't swallow this line"),
-            "NOTE\\[sg\\]: don't swallow this line"
+            rewrite_hover_tag_brackets("NOTE[sg]: don't swallow this line"),
+            "NOTE(sg): don't swallow this line"
+        );
+        assert_eq!(
+            rewrite_hover_tag_brackets("INVARIANT[xyz]: stays true"),
+            "INVARIANT(xyz): stays true"
+        );
+    }
+
+    #[test]
+    fn hover_markdown_leaves_non_tag_brackets_alone() {
+        // Only a `[...]` directly preceded by an all-caps word is a tag reference.
+        // Everything else (a real link, a list, a lowercase/mixed-case word) is left
+        // as-is - this function doesn't escape it, so don't claim it's markdown-safe
+        // in general, only that tag annotations render correctly.
+        assert_eq!(
+            rewrite_hover_tag_brackets("see [the docs](https://example.com)"),
+            "see [the docs](https://example.com)"
+        );
+        assert_eq!(
+            rewrite_hover_tag_brackets("a list: [1, 2, 3]"),
+            "a list: [1, 2, 3]"
+        );
+        assert_eq!(
+            rewrite_hover_tag_brackets("Foo[bar]"),
+            "Foo[bar]"
         );
     }
 
     /// A plain top-level function with a real `name :: Type` signature should hover as:
-    /// the signature, then the doc comment (with bracketed tags escaped so they can't be
-    /// read as markdown link-reference syntax), then the full implementation.
+    /// the signature, then the doc comment (with bracketed tags rewritten to parens so
+    /// they can't be read as markdown link-reference syntax), then the full implementation.
     #[tokio::test]
     async fn hover_function_shows_header_then_comment_then_implementation() {
         let hover = run_hover(indoc! {"
@@ -543,7 +592,7 @@ mod tests {
                 ```
 
                 Adds one.
-                NOTE\\[sg\\]: keep this comment intact.
+                NOTE(sg): keep this comment intact.
 
                 ```purescript
                 add1 x =
@@ -577,6 +626,86 @@ mod tests {
         assert!(
             hover.contains("Summary line.\n\n  Example:\n    add1 2 == 3\n"),
             "expected nested indentation to survive, got:\n{hover}"
+        );
+    }
+
+    /// A newtype wrapping a multi-line (e.g. record) type used to render only the
+    /// first line of its body, because the term-level constructor's "entire" span
+    /// covered just the constructor's own name token, not the wrapped type. Hovering
+    /// either the type name or the constructor should show the whole declaration.
+    #[tokio::test]
+    async fn hover_newtype_shows_full_multiline_body() {
+        let ctor_hover = run_hover(indoc! {"
+            module Test where
+
+            newtype Age = Age
+                          ^ x
+              { years :: Int
+              }
+        "})
+        .await;
+        assert_eq!(
+            ctor_hover,
+            indoc! {"
+                ```purescript
+                newtype Age = Age
+                  { years :: Int
+                  }
+                ```
+
+                Term Age, in Test
+            "}
+        );
+
+        let type_hover = run_hover(indoc! {"
+            module Test where
+
+            newtype Age = Age
+                    ^ x
+              { years :: Int
+              }
+        "})
+        .await;
+        assert_eq!(
+            type_hover,
+            indoc! {"
+                ```purescript
+                newtype Age = Age
+                  { years :: Int
+                  }
+                ```
+
+                Type Age, in Test
+            "}
+        );
+    }
+
+    /// Same truncation bug as the newtype case above, but for a `data` constructor
+    /// whose fields spill onto their own lines.
+    #[tokio::test]
+    async fn hover_data_constructor_shows_full_multiline_fields() {
+        let hover = run_hover(concat!(
+            "module Test where\n",
+            "\n",
+            "data Shape\n",
+            "  = Circle\n",
+            "      ^ x\n",
+            "      { radius :: Number\n",
+            "      }\n",
+            "  | Square Number\n",
+        ))
+        .await;
+        assert_eq!(
+            hover,
+            concat!(
+                "```purescript\n",
+                "= Circle\n",
+                "    { radius :: Number\n",
+                "    }\n",
+                "```\n",
+                "\n",
+                "Term Circle, in Test\n",
+            )
         );
     }
 

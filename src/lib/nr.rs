@@ -964,7 +964,17 @@ impl<'s> N<'s> {
                 self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
                 let mut cons = BTreeSet::new();
                 for c in cs {
-                    self.def_global(Term, c.0 .0 .0, c.0 .0 .1, c.0 .0 .1, false);
+                    // The "entire" span must cover the constructor's fields too, not just
+                    // its name - otherwise hover (which renders whole source lines between
+                    // this span's start and end line) truncates a multi-line constructor
+                    // down to just the line its name sits on.
+                    self.def_global(
+                        Term,
+                        c.0 .0 .0,
+                        c.0 .0 .1,
+                        c.0 .0 .1.merge(c.1.span()),
+                        false,
+                    );
                     cons.insert(Name(Term, self.me, c.0 .0 .0, Visibility::Public));
                 }
                 self.constructors
@@ -984,9 +994,12 @@ impl<'s> N<'s> {
             ast::Decl::NewTypeKind(d, _) => {
                 self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
             }
-            ast::Decl::NewType(d, _, c, _) => {
+            ast::Decl::NewType(d, _, c, ty) => {
                 self.def_global(Type, d.0 .0, d.0 .1, dec.span(), is_redecl);
-                self.def_global(Term, c.0 .0, c.0 .1, c.0 .1, false);
+                // See the matching comment in `Decl::Data`: the wrapped type must be
+                // included so hover doesn't truncate a multi-line (e.g. record) newtype
+                // body down to just the line the constructor name sits on.
+                self.def_global(Term, c.0 .0, c.0 .1, c.0 .1.merge(ty.span()), false);
                 let ty = Name(Type, self.me, d.0 .0, Visibility::Public);
                 self.newtypes.insert(ty);
                 self.constructors
