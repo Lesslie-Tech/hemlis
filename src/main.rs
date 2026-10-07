@@ -227,51 +227,79 @@ impl Backend {
             let fi = *self.ud_to_fi.try_get(&name.module()).try_unwrap()?;
             let source = self.fi_to_source.try_get(&fi).try_unwrap()?;
 
-            let whole_thing = def_at
-                .body
-                .span()
-                .merge(def_at.name)
-                .merge(def_at.sig.unwrap_or(def_at.name));
+            // `sig` is only a genuine standalone `name :: Type` signature when there's a
+            // separate equation in `body` - see `N::def`: with no explicit signature the
+            // first equation itself ends up in `sig`, and every later equation in `body`.
+            // Guard against that case with a `::` sniff so we don't print an equation as
+            // if it were a type header.
+            let real_sig = def_at.sig.filter(|s| {
+                !def_at.body.is_empty()
+                    && try_find_lines(&source, s.lo().0, s.hi().0).is_some_and(|x| x.contains("::"))
+            });
 
-            if whole_thing.line_range() < 8
-                || (name.scope() != Scope::Module && name.name().is_proper())
-            {
-                // This is an artifact of the parser not knowing where comments belong - here it
-                // thinks the comments are part of the tail of the def - not the head of the
-                // next def.
+            let is_plain_function = name.scope() == Scope::Term && !name.name().is_proper();
+
+            if let Some(sig_span) = real_sig.filter(|_| is_plain_function) {
+                let body_span = def_at.body.span();
+
+                if let Some(x) = try_find_lines(&source, sig_span.lo().0, sig_span.hi().0) {
+                    print_hover_code_block(&mut target, x, false);
+                }
+
+                print_hover_doc_comment(&mut target, &source, sig_span.lo().0);
+
+                // Same artifact as below: the parser doesn't know where trailing comments
+                // belong, so trim them off the tail of the implementation.
                 if let Some(x) = try_find_lines(
                     &source,
-                    whole_thing.lo().0,
-                    if whole_thing.hi().1 < 2 {
-                        whole_thing.hi().0.saturating_sub(1)
+                    body_span.lo().0,
+                    if body_span.hi().1 < 2 {
+                        body_span.hi().0.saturating_sub(1)
                     } else {
-                        whole_thing.hi().0
+                        body_span.hi().0
                     },
                 ) {
-                    writeln!(target, "```purescript").unwrap();
-                    format_hover_snippet(x, true).split('\n').for_each(|x| {
-                        writeln!(target, "{}", x).unwrap();
-                    });
-                    writeln!(target, "```").unwrap();
+                    if !target.is_empty() {
+                        writeln!(target).unwrap();
+                    }
+                    print_hover_code_block(&mut target, x, true);
                 }
             } else {
-                let the_thing = def_at.name.merge(def_at.sig.unwrap_or(def_at.name));
-                if let Some(x) = try_find_lines(&source, the_thing.lo().0, the_thing.hi().0) {
-                    writeln!(target, "```purescript").unwrap();
-                    format_hover_snippet(x, false).split('\n').for_each(|x| {
-                        writeln!(target, "{}", x).unwrap();
-                    });
-                    writeln!(target, "```").unwrap();
-                }
-            }
+                let whole_thing = def_at
+                    .body
+                    .span()
+                    .merge(def_at.name)
+                    .merge(def_at.sig.unwrap_or(def_at.name));
 
-            if let Some(x) =
-                try_find_comments_before(&source, def_at.sig.unwrap_or(def_at.name).lo().0)
-            {
-                writeln!(target).unwrap();
-                x.split("\n").for_each(|x| {
-                    writeln!(target, "{}", strip_hover_comment_prefix(x)).unwrap();
-                })
+                if whole_thing.line_range() < 8
+                    || (name.scope() != Scope::Module && name.name().is_proper())
+                {
+                    // This is an artifact of the parser not knowing where comments belong - here it
+                    // thinks the comments are part of the tail of the def - not the head of the
+                    // next def.
+                    if let Some(x) = try_find_lines(
+                        &source,
+                        whole_thing.lo().0,
+                        if whole_thing.hi().1 < 2 {
+                            whole_thing.hi().0.saturating_sub(1)
+                        } else {
+                            whole_thing.hi().0
+                        },
+                    ) {
+                        print_hover_code_block(&mut target, x, true);
+                    }
+                } else {
+                    let the_thing = def_at.name.merge(def_at.sig.unwrap_or(def_at.name));
+                    if let Some(x) = try_find_lines(&source, the_thing.lo().0, the_thing.hi().0) {
+                        print_hover_code_block(&mut target, x, false);
+                    }
+                }
+
+                print_hover_doc_comment(
+                    &mut target,
+                    &source,
+                    def_at.sig.unwrap_or(def_at.name).lo().0,
+                );
             }
 
             Some(())
@@ -325,6 +353,38 @@ fn dedent(s: &str) -> String {
         .join("\n")
 }
 
+/// Appends `source` to `target` as a fenced ```purescript code block.
+fn print_hover_code_block(target: &mut String, source: &str, trim_trailing_comments: bool) {
+    use std::fmt::Write;
+    writeln!(target, "```purescript").unwrap();
+    format_hover_snippet(source, trim_trailing_comments)
+        .split('\n')
+        .for_each(|x| {
+            writeln!(target, "{}", x).unwrap();
+        });
+    writeln!(target, "```").unwrap();
+}
+
+/// Appends the doc comment (if any) immediately preceding `before_line`, preserving its
+/// internal indentation and escaping markdown metacharacters that would otherwise get
+/// misinterpreted (e.g. `NOTE[sg]: ...` being read as link-reference syntax).
+fn print_hover_doc_comment(target: &mut String, source: &str, before_line: usize) {
+    use std::fmt::Write;
+    if let Some(x) = try_find_comments_before(source, before_line) {
+        if !target.is_empty() {
+            writeln!(target).unwrap();
+        }
+        x.split('\n').for_each(|x| {
+            writeln!(
+                target,
+                "{}",
+                rewrite_hover_tag_brackets(strip_hover_comment_prefix(x))
+            )
+            .unwrap();
+        })
+    }
+}
+
 fn format_hover_snippet(source: &str, trim_trailing_comments: bool) -> String {
     let source = if trim_trailing_comments {
         source
@@ -351,12 +411,59 @@ fn format_hover_snippet(source: &str, trim_trailing_comments: bool) -> String {
         .join("\n")
 }
 
+/// Strips the `--`/`-- |` comment marker from a doc comment line, removing only the single
+/// delimiting space after each marker. Unlike a full `trim_start()`, this preserves any
+/// further indentation the author wrote (e.g. a nested example block), so hover text doesn't
+/// collapse deliberately indented lines flush left.
 fn strip_hover_comment_prefix(line: &str) -> &str {
-    line.trim_start()
-        .trim_start_matches("--")
-        .trim_start()
-        .trim_start_matches("|")
-        .trim_start()
+    let rest = line.trim_start();
+    let Some(rest) = rest.strip_prefix("--") else {
+        return rest;
+    };
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    match rest.strip_prefix('|') {
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+        None => rest,
+    }
+}
+
+/// Rewrites doc-comment tag brackets - `NOTE[sg]`, `INVARIANT[123]`, and so on - into
+/// `NOTE(sg)` / `INVARIANT(123)` before the comment is rendered as hover markdown.
+///
+/// A `[...]` only counts as a tag reference when it's directly preceded by an
+/// all-caps word (no lowercase letters): that's what distinguishes a `TAG[ref]`
+/// annotation from an ordinary markdown/PureScript use of square brackets (a real
+/// link, a list literal, ...), which this leaves untouched. Parens read better than
+/// escaped brackets and can't be misread as link-reference syntax.
+fn rewrite_hover_tag_brackets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(bracket_at) = rest.find('[') {
+        out.push_str(&rest[..bracket_at]);
+        let after_bracket = &rest[bracket_at + 1..];
+
+        let word_start = out
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let word = &out[word_start..];
+        let is_tag = !word.is_empty()
+            && word.chars().any(|c| c.is_ascii_uppercase())
+            && !word.chars().any(|c| c.is_ascii_lowercase());
+
+        if is_tag && let Some(end_rel) = after_bracket.find(']') {
+            out.push('(');
+            out.push_str(&after_bracket[..end_rel]);
+            out.push(')');
+            rest = &after_bracket[end_rel + 1..];
+            continue;
+        }
+
+        out.push('[');
+        rest = after_bracket;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
@@ -388,10 +495,12 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{StyleMode, format_hover_snippet, strip_hover_comment_prefix};
+    use super::{
+        StyleMode, format_hover_snippet, rewrite_hover_tag_brackets, strip_hover_comment_prefix,
+    };
     use indoc::indoc;
     use std::str::FromStr;
-    use tower_lsp_server::ls_types::{CodeActionOrCommand, TextEdit, Uri};
+    use tower_lsp_server::ls_types::{CodeActionOrCommand, Hover, HoverContents, TextEdit, Uri};
 
     #[test]
     fn hover_snippet_dedents_short_definitions() {
@@ -412,6 +521,191 @@ mod tests {
         assert_eq!(
             strip_hover_comment_prefix("        -- NOTE[sg]: leave non-haddock text alone"),
             "NOTE[sg]: leave non-haddock text alone"
+        );
+    }
+
+    #[test]
+    fn hover_doc_comments_preserve_extra_indentation() {
+        // Only the single delimiting space after `--`/`|` is removed - any further
+        // indentation the author wrote (e.g. a nested example) survives intact.
+        assert_eq!(
+            strip_hover_comment_prefix("        -- |   nested example"),
+            "  nested example"
+        );
+        assert_eq!(strip_hover_comment_prefix("        --"), "");
+    }
+
+    #[test]
+    fn hover_markdown_rewrites_tag_brackets_to_parens() {
+        assert_eq!(
+            rewrite_hover_tag_brackets("NOTE[sg]: don't swallow this line"),
+            "NOTE(sg): don't swallow this line"
+        );
+        assert_eq!(
+            rewrite_hover_tag_brackets("INVARIANT[xyz]: stays true"),
+            "INVARIANT(xyz): stays true"
+        );
+    }
+
+    #[test]
+    fn hover_markdown_leaves_non_tag_brackets_alone() {
+        // Only a `[...]` directly preceded by an all-caps word is a tag reference.
+        // Everything else (a real link, a list, a lowercase/mixed-case word) is left
+        // as-is - this function doesn't escape it, so don't claim it's markdown-safe
+        // in general, only that tag annotations render correctly.
+        assert_eq!(
+            rewrite_hover_tag_brackets("see [the docs](https://example.com)"),
+            "see [the docs](https://example.com)"
+        );
+        assert_eq!(
+            rewrite_hover_tag_brackets("a list: [1, 2, 3]"),
+            "a list: [1, 2, 3]"
+        );
+        assert_eq!(
+            rewrite_hover_tag_brackets("Foo[bar]"),
+            "Foo[bar]"
+        );
+    }
+
+    /// A plain top-level function with a real `name :: Type` signature should hover as:
+    /// the signature, then the doc comment (with bracketed tags rewritten to parens so
+    /// they can't be read as markdown link-reference syntax), then the full implementation.
+    #[tokio::test]
+    async fn hover_function_shows_header_then_comment_then_implementation() {
+        let hover = run_hover(indoc! {"
+            module Test where
+
+            -- | Adds one.
+            -- NOTE[sg]: keep this comment intact.
+            add1 :: Int -> Int
+            ^ x
+            add1 x =
+              x + 1
+        "})
+        .await;
+
+        assert_eq!(
+            hover,
+            indoc! {"
+                ```purescript
+                add1 :: Int -> Int
+                ```
+
+                Adds one.
+                NOTE(sg): keep this comment intact.
+
+                ```purescript
+                add1 x =
+                  x + 1
+                ```
+
+                Term add1, in Test
+            "}
+        );
+    }
+
+    /// Multi-line doc comments may use extra indentation to signal nested structure
+    /// (e.g. an example block). Hover must preserve that, not collapse every line flush
+    /// left. (Mirrors the style-lint carve-out in `style_no_warn_docstring_extra_indentation`.)
+    #[tokio::test]
+    async fn hover_comment_preserves_nested_indentation() {
+        let hover = run_hover(indoc! {"
+            module Test where
+
+            -- | Summary line.
+            -- |
+            -- |   Example:
+            -- |     add1 2 == 3
+            add1 :: Int -> Int
+            ^ x
+            add1 x =
+              x + 1
+        "})
+        .await;
+
+        assert!(
+            hover.contains("Summary line.\n\n  Example:\n    add1 2 == 3\n"),
+            "expected nested indentation to survive, got:\n{hover}"
+        );
+    }
+
+    /// A newtype wrapping a multi-line (e.g. record) type used to render only the
+    /// first line of its body, because the term-level constructor's "entire" span
+    /// covered just the constructor's own name token, not the wrapped type. Hovering
+    /// either the type name or the constructor should show the whole declaration.
+    #[tokio::test]
+    async fn hover_newtype_shows_full_multiline_body() {
+        let ctor_hover = run_hover(indoc! {"
+            module Test where
+
+            newtype Age = Age
+                          ^ x
+              { years :: Int
+              }
+        "})
+        .await;
+        assert_eq!(
+            ctor_hover,
+            indoc! {"
+                ```purescript
+                newtype Age = Age
+                  { years :: Int
+                  }
+                ```
+
+                Term Age, in Test
+            "}
+        );
+
+        let type_hover = run_hover(indoc! {"
+            module Test where
+
+            newtype Age = Age
+                    ^ x
+              { years :: Int
+              }
+        "})
+        .await;
+        assert_eq!(
+            type_hover,
+            indoc! {"
+                ```purescript
+                newtype Age = Age
+                  { years :: Int
+                  }
+                ```
+
+                Type Age, in Test
+            "}
+        );
+    }
+
+    /// Same truncation bug as the newtype case above, but for a `data` constructor
+    /// whose fields spill onto their own lines.
+    #[tokio::test]
+    async fn hover_data_constructor_shows_full_multiline_fields() {
+        let hover = run_hover(concat!(
+            "module Test where\n",
+            "\n",
+            "data Shape\n",
+            "  = Circle\n",
+            "      ^ x\n",
+            "      { radius :: Number\n",
+            "      }\n",
+            "  | Square Number\n",
+        ))
+        .await;
+        assert_eq!(
+            hover,
+            concat!(
+                "```purescript\n",
+                "= Circle\n",
+                "    { radius :: Number\n",
+                "    }\n",
+                "```\n",
+                "\n",
+                "Term Circle, in Test\n",
+            )
         );
     }
 
@@ -829,6 +1123,67 @@ mod tests {
             .expect("Should have edits for target file");
 
         apply_edits(target_source, &mut file_edits.clone())
+    }
+
+    /// Run a `textDocument/hover` request at the `^` marker position in a single-file
+    /// source and return the rendered markdown contents.
+    async fn run_hover(source_with_marker: &str) -> String {
+        // parse_marker expects a title after `^`; hover has no use for it.
+        let (cleaned, line, character, _unused) = parse_marker(source_with_marker);
+
+        let (mut service, _diagnostics) = build_test_service();
+
+        lsp_request(
+            &mut service,
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": null,
+                "capabilities": {},
+                "rootUri": null
+            }),
+        )
+        .await;
+        lsp_notify(&mut service, "initialized", serde_json::json!({})).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let uri = "file:///test.purs";
+        lsp_notify(
+            &mut service,
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "purescript",
+                    "version": 1,
+                    "text": cleaned
+                }
+            }),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let resp = lsp_request(
+            &mut service,
+            2,
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        )
+        .await
+        .expect("Expected a response from hover");
+
+        let (_, body) = resp.into_parts();
+        let result = body.expect("hover should succeed");
+        let hover: Option<Hover> =
+            serde_json::from_value(result).expect("Failed to parse hover response");
+        let hover = hover.unwrap_or_else(|| panic!("Expected hover content at the `^` marker"));
+        match hover.contents {
+            HoverContents::Markup(markup) => markup.value,
+            other => panic!("Expected markdown hover contents, got {:?}", other),
+        }
     }
 
     /// Test a code action using a `^ Action title` marker in the source.
