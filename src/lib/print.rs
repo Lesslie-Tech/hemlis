@@ -2489,6 +2489,7 @@ impl<'s> Printer<'s> {
             }
             Expr::Op(..) => {
                 let (first, rest) = Self::op_spine(e);
+                let first_mark = self.out.len();
                 self.print_expr(first);
                 // Same "glue until the first forced break, then break from
                 // there on at one shared indent" rule as `print_spine_args`.
@@ -2497,6 +2498,18 @@ impl<'s> Printer<'s> {
                 // failure (same reason as `list()`: a scratch-buffer probe is
                 // `O(2^depth)`).
                 let mut prev_span = first.span();
+                // If the operand just printed (whether `first`, or - once
+                // this loop has run - `r` from the previous iteration) broke
+                // across multiple lines - a bracketed literal forced open by
+                // its own contents, a differently-fixitied child chain that
+                // had to break, a nested `case`/`do`, ... - the next operator
+                // must relocate onto its own line rather than glue right
+                // after that operand's close. Otherwise the operator reads
+                // as hanging directly off whatever token the operand happened
+                // to end on, which is especially misleading across a fixity
+                // boundary (a looser operator must never look glued onto a
+                // tighter one's own broken continuation).
+                let mut prev_was_multiline = self.out[first_mark..].contains('\n');
                 let mut broke = false;
                 for (op, r) in &rest {
                     let cur_span = r.span();
@@ -2505,7 +2518,7 @@ impl<'s> Printer<'s> {
                     // is last on its line - otherwise `print_expr(r)`'s own
                     // unconditional flush misattaches it as leading `r`.
                     let mut just_flushed_comment = false;
-                    if !broke && Self::breaks_before(prev_span, cur_span) {
+                    if !broke && (Self::breaks_before(prev_span, cur_span) || prev_was_multiline) {
                         self.indent_in();
                         broke = true;
                         just_flushed_comment = self.flush_trailing_comment(prev_span.hi().0);
@@ -2527,6 +2540,7 @@ impl<'s> Printer<'s> {
                         self.glued_floor = prev_glued_floor;
                         if !self.out[mark..].contains('\n') {
                             prev_span = cur_span;
+                            prev_was_multiline = false;
                             continue;
                         }
                         self.out.truncate(mark);
@@ -5767,14 +5781,21 @@ mod tests {
     /// paren) down near column 0 instead of hanging under their real column.
     #[test]
     fn doubly_nested_glued_literal_keeps_its_real_hang_column() {
+        // `# Storage.Transaction`/`# Veither.pure`/`# Just` now relocate off
+        // their multiline bracketed operands (see
+        // `operator_after_a_multiline_bracketed_operand_relocates_even_when_source_glued_it`)
+        // instead of staying glued the way the source wrote them.
         let src = indoc! {"
             module Foo where
 
             x =
               ( [ { id: TransactionId \"a\"
                   , amount: MoneyString.moneyString SEK \"10.10\" # unreachableEither [ TO ]
-                  } # Storage.Transaction
-                ] # Veither.pure # Just
+                  }
+                    # Storage.Transaction
+                ]
+                  # Veither.pure
+                  # Just
               )
         "};
         let out = fmt(src);
@@ -6531,6 +6552,64 @@ mod tests {
         "};
         let out = fmt(src);
         assert_eq!(out, src);
+        assert_idempotent(src);
+    }
+
+    // An operand that itself printed multiline (here, a paren forced open by
+    // a source break inside it) is a floor an operator can never print
+    // behind - even though the source glued `# hello` right after `)` on the
+    // same line, it must relocate to its own line like every other operator
+    // after a multiline bracketed operand.
+    #[test]
+    fn operator_after_a_multiline_bracketed_operand_relocates_even_when_source_glued_it() {
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              ( a
+              ) # hello
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  ( a
+                  )
+                    # hello
+            "}
+        );
+        assert_idempotent(src);
+    }
+
+    // `&&` binds tighter than `||`, so `a && b || c` parses as `(a && b) ||
+    // c`: a tighter-fixity child chain forced to break (by the source break
+    // before `&& b`) is itself just a multiline operand of the outer `||`
+    // chain, so the same floor rule applies - `|| c` must not stay glued
+    // onto `&& b`'s own broken continuation.
+    #[test]
+    fn looser_operator_relocates_off_a_tighter_operands_broken_continuation() {
+        let src = indoc! {"
+            module Foo where
+
+            foo =
+              a
+                && b || c
+        "};
+        let out = fmt(src);
+        assert_eq!(
+            out,
+            indoc! {"
+                module Foo where
+
+                foo =
+                  a
+                    && b
+                    || c
+            "}
+        );
         assert_idempotent(src);
     }
 }
