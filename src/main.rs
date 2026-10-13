@@ -1873,6 +1873,30 @@ mod tests {
         .await;
     }
 
+    // --- Warn on modules without an explicit export list ---
+
+    #[tokio::test]
+    async fn style_warn_missing_export_list() {
+        assert_warning(indoc! {"
+            module Test where
+                   ~~~~ Module has no explicit export list
+
+            f = 1
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_explicit_export_list() {
+        assert_no_warning(indoc! {"
+            module Test (f) where
+                   ~~~~
+
+            f = 1
+        "})
+        .await;
+    }
+
     // --- Disallow whole-module re-exports outside Joe and Prelude ---
 
     #[tokio::test]
@@ -3756,7 +3780,7 @@ mod tests {
                     "uri": test_uri,
                     "languageId": "purescript",
                     "version": 1,
-                    "text": "module Test where\n\nimport Lib (hello)\n\nfoo :: Int\nfoo = hello\n"
+                    "text": "module Test (foo) where\n\nimport Lib (hello)\n\nfoo :: Int\nfoo = hello\n"
                 }
             }),
         )

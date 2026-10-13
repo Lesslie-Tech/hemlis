@@ -1487,6 +1487,21 @@ fn rule_no_module_reexport(module_name: Ud, header: &ast::Header, out: &mut Vec<
     }
 }
 
+/// Warn on a module header with no export list (`module X where`), which
+/// exports everything. Warn-only: choosing what to export is the author's call.
+fn rule_missing_export_list(header: &ast::Header, out: &mut Vec<StyleDiagnostic>) {
+    if header.1.is_none() {
+        let span = header.0.span();
+        out.push(StyleDiagnostic {
+            cursor_span: span,
+            expr_span: span,
+            action: StyleAction::Warn {
+                message: "Module has no explicit export list".into(),
+            },
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1521,6 +1536,7 @@ pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<Styl
             })
             .collect();
         rule_no_module_reexport((header.0 .0).0, header, &mut checker.diagnostics);
+        rule_missing_export_list(header, &mut checker.diagnostics);
         for imp in &header.2 {
             rule_import_exact_name(
                 imp,
