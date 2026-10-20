@@ -6994,6 +6994,30 @@ fn pos_from_tup(fi: Option<ast::Fi>, (line, col): ast::Pos) -> Position {
     )
 }
 
+/// Delete `hemlis-*.log` files older than a day, leaving logs of other running instances alone.
+fn remove_old_logs(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let max_age = Duration::from_secs(24 * 60 * 60);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("hemlis-") && name.ends_with(".log")) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let stdin = tokio::io::stdin();
@@ -7027,6 +7051,7 @@ async fn main() {
         }
     }
     if logging {
+        remove_old_logs(&std::env::temp_dir());
         let log_file_path =
             std::env::temp_dir().join(format!("hemlis-{}.log", chrono::Local::now().to_rfc3339()));
         let log_file = File::create(&log_file_path).unwrap();
@@ -7038,8 +7063,12 @@ async fn main() {
             .with_thread_ids(true)
             .with_level(true)
             .with_writer(log_file)
-            .with_filter(tracing::level_filters::LevelFilter::TRACE)
-            .with_filter(FilterFn::new(|x| x.target() != "tower_lsp_server::codec"));
+            .with_filter(FilterFn::new(|x| {
+                // Dependencies using the `log` crate (notify, mio, ...) all arrive with
+                // target "log"; only keep their warnings and errors.
+                x.target() != "tower_lsp_server::codec"
+                    && (x.target() != "log" || *x.level() <= tracing::Level::WARN)
+            }));
 
         std::panic::set_hook(Box::new(|panic| {
             if let Some(location) = panic.location() {
