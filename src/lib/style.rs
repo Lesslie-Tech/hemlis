@@ -775,7 +775,7 @@ fn rule_do_leading_let(
     let Some(ast::DoStmt::Let(let_kw, _)) = stmts.first() else {
         return;
     };
-    let message = "`do` block starts with `let`; move it before the `do`".to_string();
+    let message = "Move the leading `let` before the `do` block".to_string();
     let action = build_hoist_let_fix(expr, source, starts)
         .map(|replacement| StyleAction::WarnAndFix {
             message: message.clone(),

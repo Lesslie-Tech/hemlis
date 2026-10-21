@@ -1877,7 +1877,7 @@ mod tests {
 
             f = M.do
               let x = 1
-              ~~~ `do` block starts with `let`; move it before the `do`
+              ~~~ Move the leading `let` before the `do` block
               pure x
         "})
         .await;
