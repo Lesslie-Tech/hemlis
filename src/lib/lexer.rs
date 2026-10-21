@@ -292,8 +292,11 @@ fn lex_comments(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
                 indent = s.end.saturating_sub(*at);
             }
             Ok(Token::LineComment(_) | Token::BlockComment(_)) => {
-                let span =
-                    Span::Known(fi, (line, s.start - start_indent), (line_after, s.end - end_indent));
+                let span = Span::Known(
+                    fi,
+                    (line, s.start - start_indent),
+                    (line_after, s.end - end_indent),
+                );
                 comments.push((t, span));
             }
             _ => {}
@@ -355,7 +358,11 @@ fn lex_tokens(content: &str, fi: Fi) -> Vec<SourceToken<'_>> {
             indent
         };
 
-        let span = Span::Known(fi, (line, s.start - start_indent), (line_after, s.end - end_indent));
+        let span = Span::Known(
+            fi,
+            (line, s.start - start_indent),
+            (line_after, s.end - end_indent),
+        );
         match t {
             Ok(Token::Indent(at)) => {
                 // We need to know the indentation of every token - even if there are tokens before it.

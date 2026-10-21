@@ -473,17 +473,15 @@ impl Decl {
             | Decl::NewTypeKind(proper_name, _)
             | Decl::NewType(proper_name, _, _, _)
             | Decl::ClassKind(proper_name, _)
-            | Decl::Class(_, proper_name, _, _, _) => (None, proper_name.0 .0),
+            | Decl::Class(_, proper_name, _, _, _) => (None, proper_name.0.0),
 
             Decl::Instance(_, inst_head, _) | Decl::Derive(_, inst_head) => {
-                (inst_head.1 .0.map(|x| x.0 .0), inst_head.1 .1 .0 .0)
+                (inst_head.1.0.map(|x| x.0.0), inst_head.1.1.0.0)
             }
 
-            Decl::Foreign(name, _) | Decl::Sig(name, _) | Decl::Def(name, _, _) => {
-                (None, name.0 .0)
-            }
+            Decl::Foreign(name, _) | Decl::Sig(name, _) | Decl::Def(name, _, _) => (None, name.0.0),
 
-            Decl::Fixity(_, _, _, op) | Decl::FixityTyp(_, _, _, op) => (None, op.0 .0),
+            Decl::Fixity(_, _, _, op) | Decl::FixityTyp(_, _, _, op) => (None, op.0.0),
         }
     }
 }
@@ -510,7 +508,7 @@ pub enum InstBinding {
 impl InstBinding {
     pub fn ud(&self) -> Ud {
         match self {
-            InstBinding::Sig(name, _) | InstBinding::Def(name, _, _) => name.0 .0,
+            InstBinding::Sig(name, _) | InstBinding::Def(name, _, _) => name.0.0,
         }
     }
 }
@@ -632,14 +630,18 @@ impl Binder {
         Ok(match (bs.first().cloned(), bs.len()) {
             (None, 0) => return Err("Empty binder is not allowed"),
             (Some(a), 1) => a,
-            (Some(a@Binder::Constructor(_)), _) => {
+            (Some(a @ Binder::Constructor(_)), _) => {
                 let mut out = a;
                 for b in bs.into_iter().skip(1) {
                     out = Binder::App(Box::new(out), Box::new(b));
                 }
                 out
             }
-            (_, _) => return Err("For this to be a constructor application the first binder needs to be a constructor"),
+            (_, _) => {
+                return Err(
+                    "For this to be a constructor application the first binder needs to be a constructor",
+                );
+            }
         })
     }
 }
@@ -665,7 +667,7 @@ pub enum LetBinding {
 impl LetBinding {
     pub fn ud(&self) -> Option<Ud> {
         match self {
-            LetBinding::Sig(name, _) | LetBinding::Name(name, _, _) => Some(name.0 .0),
+            LetBinding::Sig(name, _) | LetBinding::Name(name, _, _) => Some(name.0.0),
             LetBinding::Pattern(_, _) => None,
         }
     }

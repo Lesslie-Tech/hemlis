@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, env};
 
-use hemlis_lib::{list_warnings, parse_and_resolve_names, parse_modules, version, Flag as LibFlag};
+use hemlis_lib::{Flag as LibFlag, list_warnings, parse_and_resolve_names, parse_modules, version};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum Flag {

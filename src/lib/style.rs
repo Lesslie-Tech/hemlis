@@ -68,7 +68,7 @@ const FORBIDDEN_OPS: &[ForbiddenOp] = &[
 fn needs_parens(expr: &ast::Expr, target_prec: usize) -> bool {
     match expr {
         ast::Expr::Op(_, qop, _) => {
-            let inner_prec = op_fixity((qop.1).0 .0).prec();
+            let inner_prec = op_fixity((qop.1).0.0).prec();
             inner_prec <= target_prec
         }
         ast::Expr::Infix(..)
@@ -98,10 +98,10 @@ fn rule_forbidden_operator(
     out: &mut Vec<StyleDiagnostic>,
 ) {
     if let ast::Expr::Op(lhs, qop, rhs) = expr {
-        let op_ud = (qop.1).0 .0;
+        let op_ud = (qop.1).0.0;
         for forbidden in FORBIDDEN_OPS {
             if op_ud == Ud::new(forbidden.from) {
-                let op_span = (qop.1).0 .1;
+                let op_span = (qop.1).0.1;
                 let expr_span = expr.span();
                 let lhs_text = source_text_with_starts(source, starts, &lhs.span()).unwrap_or("_");
                 let rhs_text = source_text_with_starts(source, starts, &rhs.span()).unwrap_or("_");
@@ -209,7 +209,7 @@ fn rule_confusing_map_operator(
     let ast::Expr::Op(lhs, qop, rhs) = expr else {
         return;
     };
-    let op_ud = (qop.1).0 .0;
+    let op_ud = (qop.1).0.0;
     let Some(mo) = CONFUSING_MAP_OPS
         .iter()
         .find(|mo| op_ud == Ud::new(mo.from))
@@ -217,7 +217,7 @@ fn rule_confusing_map_operator(
         return;
     };
 
-    let op_span = (qop.1).0 .1;
+    let op_span = (qop.1).0.1;
     let expr_span = expr.span();
 
     // Byte ranges so we can preserve the exact source layout between tokens.
@@ -305,10 +305,10 @@ fn rule_operator_swap(
     out: &mut Vec<StyleDiagnostic>,
 ) {
     if let ast::Expr::Op(lhs, qop, rhs) = expr {
-        let op_ud = (qop.1).0 .0;
+        let op_ud = (qop.1).0.0;
         for swap in SWAP_OPS {
             if op_ud == Ud::new(swap.from) {
-                let op_span = (qop.1).0 .1;
+                let op_span = (qop.1).0.1;
                 let expr_span = expr.span();
                 let lhs_text = source_text_with_starts(source, starts, &lhs.span()).unwrap_or("_");
                 let rhs_text = source_text_with_starts(source, starts, &rhs.span()).unwrap_or("_");
@@ -345,7 +345,7 @@ fn rule_op_to_parens(
     out: &mut Vec<StyleDiagnostic>,
 ) {
     if let ast::Expr::Op(lhs, qop, rhs) = expr {
-        let op_ud = (qop.1).0 .0;
+        let op_ud = (qop.1).0.0;
         let (func, arg) = if op_ud == Ud::new("$") {
             (lhs, rhs) // f $ x → f is func, x is arg
         } else if op_ud == Ud::new("#") {
@@ -354,7 +354,7 @@ fn rule_op_to_parens(
             return;
         };
         let op_name = if op_ud == Ud::new("$") { "$" } else { "#" };
-        let op_span = (qop.1).0 .1;
+        let op_span = (qop.1).0.1;
 
         let expr_span = expr.span();
         let func_text = source_text_with_starts(source, starts, &func.span()).unwrap_or("_");
@@ -445,7 +445,7 @@ fn paren_is_unnecessary(inner: &ast::Expr, ctx: &ParenContext) -> bool {
             }
             if let ast::Expr::Op(_, inner_qop, _) = inner {
                 let outer_fix = op_fixity(*outer_ud);
-                let inner_fix = op_fixity((inner_qop.1).0 .0);
+                let inner_fix = op_fixity((inner_qop.1).0.0);
                 if inner_fix.prec() > outer_fix.prec() {
                     return true;
                 }
@@ -508,7 +508,7 @@ fn rule_unnecessary_parens(
     if let ast::Expr::Paren(_, inner, _) = expr {
         let same_op_removable = match (outer_op, inner.as_ref()) {
             (Some((outer, on_left)), ast::Expr::Op(_, inner_qop, _)) => {
-                let inner_ud = (inner_qop.1).0 .0;
+                let inner_ud = (inner_qop.1).0.0;
                 // Same operator: the parens are only redundant on the associativity side. A
                 // non-associative operator (`==`, `/=`) has no associativity side, so its parens
                 // are never redundant — `(x == y) == z` must keep them.
@@ -597,7 +597,7 @@ fn rule_unnecessary_typ_parens(
     if let ast::Typ::Paren(_, inner, _) = typ {
         let same_op =
             if let (Some(outer), ast::Typ::Op(_, inner_qop, _)) = (outer_op, inner.as_ref()) {
-                (inner_qop.1).0 .0 == outer
+                (inner_qop.1).0.0 == outer
             } else {
                 false
             };
@@ -711,6 +711,82 @@ fn rule_unqualified_do(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
                 kw = keyword
             ),
         },
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Leading `let` in a `do` block
+// ---------------------------------------------------------------------------
+
+/// Build the `let … in M.do …` replacement for a `do` whose first statement is
+/// a `let`. Returns `None` when there is nothing after the `let`, when the rest
+/// of the block starts on the `let`'s line, or when a comment sits between the
+/// `do` keyword, the `let` and the next statement (it would be lost).
+fn build_hoist_let_fix(do_expr: &ast::Expr, source: &str, starts: &[usize]) -> Option<String> {
+    let ast::Expr::Do(_, kw, stmts) = do_expr else {
+        return None;
+    };
+    let [first @ ast::DoStmt::Let(_, binds), rest @ ..] = stmts.as_slice() else {
+        return None;
+    };
+    let rest_first = rest.first()?;
+    let (do_span, let_span, rest_span) = (do_expr.span(), first.span(), rest_first.span());
+    let fi = do_span.fi()?;
+
+    let blank = |lo: ast::Pos, hi: ast::Pos| {
+        source_text_with_starts(source, starts, &Span::Known(fi, lo, hi))
+            .is_some_and(|t| t.trim().is_empty())
+    };
+    if !blank(kw.hi(), let_span.lo()) || !blank(let_span.hi(), rest_span.lo()) {
+        return None;
+    }
+    if rest_span.lo().0 == let_span.hi().0 {
+        return None;
+    }
+
+    let do_col = do_span.lo().1;
+    let header = source_text_with_starts(source, starts, &Span::Known(fi, do_span.lo(), kw.hi()))?;
+    let binds_span = binds.span();
+    let binds_text = source_text_with_starts(source, starts, &binds_span)?;
+    let binds_re = reindent_block(binds_text, binds_span.lo().1, do_col + 2);
+    let rest_text = source_text_with_starts(
+        source,
+        starts,
+        &Span::Known(fi, rest_span.lo(), do_span.hi()),
+    )?;
+    let indent = " ".repeat(do_col);
+    let rest_indent = " ".repeat(rest_span.lo().1);
+    Some(format!(
+        "let\n{binds_re}\n{indent}in {header}\n{rest_indent}{rest_text}"
+    ))
+}
+
+/// Warn when a `do` block starts with a `let`; the binding belongs before the
+/// block. Offers a hoisting fix when it can be done without losing comments.
+fn rule_do_leading_let(
+    expr: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    let ast::Expr::Do(_, _, stmts) = expr else {
+        return;
+    };
+    let Some(ast::DoStmt::Let(let_kw, _)) = stmts.first() else {
+        return;
+    };
+    let message = "`do` block starts with `let`; move it before the `do`".to_string();
+    let action = build_hoist_let_fix(expr, source, starts)
+        .map(|replacement| StyleAction::WarnAndFix {
+            message: message.clone(),
+            title: "Move leading `let` before `do`".into(),
+            replacement,
+        })
+        .unwrap_or(StyleAction::Warn { message });
+    out.push(StyleDiagnostic {
+        cursor_span: *let_kw,
+        expr_span: expr.span(),
+        action,
     });
 }
 
@@ -1075,6 +1151,7 @@ impl<'a> StyleChecker<'a> {
         );
         rule_if_to_case(expr, self.source, &self.line_starts, &mut self.diagnostics);
         rule_unqualified_do(expr, &mut self.diagnostics);
+        rule_do_leading_let(expr, self.source, &self.line_starts, &mut self.diagnostics);
         if !self.module_defines_pure {
             rule_unqualified_pure(expr, &mut self.diagnostics);
         }
@@ -1091,7 +1168,7 @@ impl<'a> StyleChecker<'a> {
                 self.check_typ(t);
             }
             ast::Expr::Op(a, qop, b) => {
-                let op_ud = (qop.1).0 .0;
+                let op_ud = (qop.1).0.0;
                 self.check_expr_ctx(a, true, Some((op_ud, true)), true);
                 self.check_expr_ctx(b, true, Some((op_ud, false)), true);
             }
@@ -1227,7 +1304,13 @@ impl<'a> StyleChecker<'a> {
     /// `where` can be safely rewritten to `let … in`.
     fn check_where_body(&mut self, e: &ast::Expr, fixable: bool) {
         if let ast::Expr::Where(_, body, binds) = e {
-            rule_prefer_let(e, fixable, self.source, &self.line_starts, &mut self.diagnostics);
+            rule_prefer_let(
+                e,
+                fixable,
+                self.source,
+                &self.line_starts,
+                &mut self.diagnostics,
+            );
             // `where` follows the body, so the body is non-tail.
             self.check_expr_nontail(body);
             self.check_let_bindings(binds);
@@ -1270,7 +1353,7 @@ impl<'a> StyleChecker<'a> {
                 self.check_typ_ctx(b, true, None);
             }
             ast::Typ::Op(a, qop, b) => {
-                let op_ud = (qop.1).0 .0;
+                let op_ud = (qop.1).0.0;
                 self.check_typ_ctx(a, true, Some(op_ud));
                 self.check_typ_ctx(b, true, Some(op_ud));
             }
@@ -1535,7 +1618,7 @@ pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<Styl
                 _ => None,
             })
             .collect();
-        rule_no_module_reexport((header.0 .0).0, header, &mut checker.diagnostics);
+        rule_no_module_reexport((header.0.0).0, header, &mut checker.diagnostics);
         rule_missing_export_list(header, &mut checker.diagnostics);
         for imp in &header.2 {
             rule_import_exact_name(

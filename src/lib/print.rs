@@ -256,8 +256,10 @@ impl<'s> Printer<'s> {
     /// `let`/`ado` can still print flat when trivial enough, which
     /// `expr_would_break` already accounts for.
     fn keyword_block_would_break(&mut self, e: &Expr) -> bool {
-        matches!(e, Expr::Case(..) | Expr::Do(..) | Expr::Ado(..) | Expr::Let(..))
-            && self.expr_would_break(e)
+        matches!(
+            e,
+            Expr::Case(..) | Expr::Do(..) | Expr::Ado(..) | Expr::Let(..)
+        ) && self.expr_would_break(e)
     }
 
     /// True if `e` is an `Expr::Op` chain that would print multi-line -
@@ -284,7 +286,9 @@ impl<'s> Printer<'s> {
     /// onto their own lines.
     fn binder_would_break(&mut self, b: &Binder) -> bool {
         let comment_idx_before = self.comment_idx;
-        let would_break = self.render_indented(0, |p| p.print_binder(b)).contains('\n');
+        let would_break = self
+            .render_indented(0, |p| p.print_binder(b))
+            .contains('\n');
         self.comment_idx = comment_idx_before;
         would_break
     }
@@ -324,7 +328,12 @@ impl<'s> Printer<'s> {
     ///   hangs under the exact column after `( ` (a type-level arrow/`::`
     ///   never relocates, so this must account for the glued prefix's real
     ///   width); an expr just hangs one level deeper as usual.
-    fn print_paren_block(&mut self, force_block: bool, close: Span, print_inner: impl FnOnce(&mut Self)) {
+    fn print_paren_block(
+        &mut self,
+        force_block: bool,
+        close: Span,
+        print_inner: impl FnOnce(&mut Self),
+    ) {
         // A paren is its own bracketed context - reset so it doesn't inherit
         // an enclosing broken-signature's forced expansion (see `print_row`).
         let outer_in_broken_sig = self.in_broken_sig;
@@ -334,8 +343,10 @@ impl<'s> Printer<'s> {
         let open_col = self.current_column();
         let inner_text = self.render_at_column(open_col + 2, print_inner);
         self.in_broken_sig = outer_in_broken_sig;
-        let has_comment_before_close =
-            self.comments.get(self.comment_idx).is_some_and(|(_, s)| s.lo().0 < close.lo().0);
+        let has_comment_before_close = self
+            .comments
+            .get(self.comment_idx)
+            .is_some_and(|(_, s)| s.lo().0 < close.lo().0);
         self.raw("(");
         if inner_text.contains('\n') || force_block || has_comment_before_close {
             self.raw(" ");
@@ -347,7 +358,11 @@ impl<'s> Printer<'s> {
                 // false 0. Only a real line break carries a literal indent
                 // worth measuring; otherwise hang under `( `'s own column.
                 let hang_col = if inner_text.contains('\n') {
-                    inner_text.rsplit('\n').next().map(|l| l.len() - l.trim_start().len()).unwrap_or(open_col)
+                    inner_text
+                        .rsplit('\n')
+                        .next()
+                        .map(|l| l.len() - l.trim_start().len())
+                        .unwrap_or(open_col)
                 } else {
                     open_col + 2
                 };
@@ -456,7 +471,11 @@ impl<'s> Printer<'s> {
                 Some(s) => *s,
                 None => break,
             };
-            let end = self.line_starts.get(line + 1).copied().unwrap_or(self.source.len());
+            let end = self
+                .line_starts
+                .get(line + 1)
+                .copied()
+                .unwrap_or(self.source.len());
             if !self.source[start..end].trim().is_empty() {
                 return line;
             }
@@ -552,7 +571,7 @@ impl<'s> Printer<'s> {
     /// `N(n)`, stripped of its associativity direction) - what `op_spine`
     /// uses to decide whether two adjacent operators bind at the same level.
     fn op_prec(op: &QOp) -> usize {
-        crate::parser::op_fixity((op.1).0 .0).prec()
+        crate::parser::op_fixity((op.1).0.0).prec()
     }
 
     /// Flattens a same-precedence run of an `Op` tree (whatever nesting
@@ -565,7 +584,12 @@ impl<'s> Printer<'s> {
     /// "wrong" way for its associativity (e.g. right-associative `<>`),
     /// drifting one level deeper per operator instead of lining up flush.
     fn op_spine(e: &Expr) -> (&Expr, Vec<(&QOp, &Expr)>) {
-        fn go<'e>(e: &'e Expr, target: usize, operands: &mut Vec<&'e Expr>, ops: &mut Vec<&'e QOp>) {
+        fn go<'e>(
+            e: &'e Expr,
+            target: usize,
+            operands: &mut Vec<&'e Expr>,
+            ops: &mut Vec<&'e QOp>,
+        ) {
             match e {
                 Expr::Op(l, op, r) if Printer::op_prec(op) == target => {
                     go(l, target, operands, ops);
@@ -952,8 +976,7 @@ impl<'s> Printer<'s> {
             // an outer list() already committed to (`glued_floor`), e.g. a
             // sole/first item like `[ { c: 1\n, d: 2\n} ]`, where relocating
             // would double up on the outer list's own settled layout.
-            let own_indent =
-                !self.at_fresh_line() && self.glued_floor != Some(self.out.len());
+            let own_indent = !self.at_fresh_line() && self.glued_floor != Some(self.out.len());
             if own_indent {
                 self.indent_in();
                 self.newline();
@@ -977,7 +1000,9 @@ impl<'s> Printer<'s> {
             // `open` shares with the first item's own content (a flat-glued
             // attempt) belongs to that item instead.
             let open_alone_on_its_line = open_span != Span::zero()
-                && items.first().is_some_and(|it| span_of(it).lo().0 > open_span.hi().0);
+                && items
+                    .first()
+                    .is_some_and(|it| span_of(it).lo().0 > open_span.hi().0);
             let comment_after_open =
                 open_alone_on_its_line && self.flush_trailing_comment(open_span.hi().0);
             if !comment_after_open {
@@ -1145,8 +1170,11 @@ impl<'s> Printer<'s> {
         }
 
         merged.sort_by(|a, b| {
-            (!a.is_open, self.text(a.from.span()), a.to.is_some())
-                .cmp(&(!b.is_open, self.text(b.from.span()), b.to.is_some()))
+            (!a.is_open, self.text(a.from.span()), a.to.is_some()).cmp(&(
+                !b.is_open,
+                self.text(b.from.span()),
+                b.to.is_some(),
+            ))
         });
 
         for (idx, m) in merged.iter().enumerate() {
@@ -1186,15 +1214,20 @@ impl<'s> Printer<'s> {
             (Import::Typ(_, _), Import::TypDat(..)) => Some(b.clone()),
             (Import::TypDat(..), Import::Typ(_, _)) => Some(a.clone()),
             (Import::TypDat(span, name, DataMember::All(_)), Import::TypDat(..))
-            | (Import::TypDat(span, name, DataMember::Some(_)), Import::TypDat(_, _, DataMember::All(_))) =>
-            {
-                Some(Import::TypDat(*span, *name, DataMember::All(*span)))
-            }
-            (Import::TypDat(span, name, DataMember::Some(a_names)), Import::TypDat(_, _, DataMember::Some(b_names))) => {
+            | (
+                Import::TypDat(span, name, DataMember::Some(_)),
+                Import::TypDat(_, _, DataMember::All(_)),
+            ) => Some(Import::TypDat(*span, *name, DataMember::All(*span))),
+            (
+                Import::TypDat(span, name, DataMember::Some(a_names)),
+                Import::TypDat(_, _, DataMember::Some(b_names)),
+            ) => {
                 let same_set = a_names.len() == b_names.len()
-                    && a_names
-                        .iter()
-                        .all(|x| b_names.iter().any(|y| self.text(x.span()) == self.text(y.span())));
+                    && a_names.iter().all(|x| {
+                        b_names
+                            .iter()
+                            .any(|y| self.text(x.span()) == self.text(y.span()))
+                    });
                 same_set.then(|| Import::TypDat(*span, *name, DataMember::Some(a_names.clone())))
             }
             _ if self.text(a.span()) == self.text(b.span()) => Some(a.clone()),
@@ -1216,7 +1249,6 @@ impl<'s> Printer<'s> {
             Import::Symbol(_, s) => (4, self.text(s.span())),
         }
     }
-
 
     fn print_merged_import(&mut self, m: &MergedImport) {
         self.raw("import ");
@@ -1365,7 +1397,8 @@ impl<'s> Printer<'s> {
                 // pair to compare), so also check its own args directly -
                 // otherwise `= Ctor` stays flat while its args relocate away.
                 let multiline = Self::any_breaks(&ctor_spans)
-                    || (ctors.len() == 1 && self.ctor_args_would_break(ctors[0].0.span(), &ctors[0].1));
+                    || (ctors.len() == 1
+                        && self.ctor_args_would_break(ctors[0].0.span(), &ctors[0].1));
                 self.indent_in();
                 for (i, (cname, cargs)) in ctors.iter().enumerate() {
                     if multiline {
@@ -1880,7 +1913,9 @@ impl<'s> Printer<'s> {
     /// to decide if a single binding can stay glued to `let`.
     fn let_binding_would_break(&mut self, b: &LetBinding) -> bool {
         let comment_idx_before = self.comment_idx;
-        let would_break = self.render_indented(0, |p| p.print_let_binding(b)).contains('\n');
+        let would_break = self
+            .render_indented(0, |p| p.print_let_binding(b))
+            .contains('\n');
         self.comment_idx = comment_idx_before;
         would_break
     }
@@ -1888,7 +1923,9 @@ impl<'s> Printer<'s> {
     /// `let_binding_would_break` for `DoStmt`, used by `Expr::Ado`.
     fn do_stmt_would_break(&mut self, s: &DoStmt) -> bool {
         let comment_idx_before = self.comment_idx;
-        let would_break = self.render_indented(0, |p| p.print_do_stmt(s)).contains('\n');
+        let would_break = self
+            .render_indented(0, |p| p.print_do_stmt(s))
+            .contains('\n');
         self.comment_idx = comment_idx_before;
         would_break
     }
@@ -1981,8 +2018,8 @@ impl<'s> Printer<'s> {
                 self.print_binder(a);
             }
             Binder::Paren(open, inner, close) => {
-                let force_block =
-                    Self::breaks_before(*open, inner.span()) || Self::breaks_before(inner.span(), *close);
+                let force_block = Self::breaks_before(*open, inner.span())
+                    || Self::breaks_before(inner.span(), *close);
                 self.print_paren_block(force_block, *close, |p| p.print_binder(inner));
             }
             Binder::Array(open, items, close) => {
@@ -2047,7 +2084,7 @@ impl<'s> Printer<'s> {
                 if *neg {
                     self.raw("-");
                 }
-                self.raw(&i.0 .0.to_string());
+                self.raw(&i.0.0.to_string());
             }
             Typ::Hole(h) => self.lit(h),
             Typ::Paren(_, inner, close) => {
@@ -2127,8 +2164,9 @@ impl<'s> Printer<'s> {
                     self.raw(" . ");
                     self.print_typ(t);
                 } else {
-                    let multiline =
-                        vars.last().is_some_and(|v0| Self::breaks_before(v0.span(), t.span()));
+                    let multiline = vars
+                        .last()
+                        .is_some_and(|v0| Self::breaks_before(v0.span(), t.span()));
                     if multiline {
                         self.indent_in();
                         self.newline();
@@ -2289,7 +2327,15 @@ impl<'s> Printer<'s> {
     /// architecture but not reusing it - a row's optional `| tail` doesn't
     /// fit `list()`'s comma-only shape. `close_line` is the closing
     /// bracket's own line.
-    fn print_row(&mut self, open: &str, close: &str, open_line: usize, close_line: usize, pad: bool, row: &Row) {
+    fn print_row(
+        &mut self,
+        open: &str,
+        close: &str,
+        open_line: usize,
+        close_line: usize,
+        pad: bool,
+        row: &Row,
+    ) {
         let Row(fields, tail) = row;
         if fields.is_empty() && tail.is_none() {
             self.raw(open);
@@ -2302,7 +2348,10 @@ impl<'s> Printer<'s> {
         let outer_in_broken_sig = self.in_broken_sig;
         self.in_broken_sig = false;
 
-        let mut spans: Vec<Span> = fields.iter().map(|(l, t)| l.span().merge(t.span())).collect();
+        let mut spans: Vec<Span> = fields
+            .iter()
+            .map(|(l, t)| l.span().merge(t.span()))
+            .collect();
         if let Some(t) = tail {
             spans.push(t.span());
         }
@@ -2355,8 +2404,9 @@ impl<'s> Printer<'s> {
             self.raw(open);
             // A comment can trail `open` itself, with nothing else sharing
             // that line - see `list()`'s identical `comment_after_open`.
-            let open_alone_on_its_line =
-                fields.first().is_some_and(|(l, _)| l.span().lo().0 > open_line);
+            let open_alone_on_its_line = fields
+                .first()
+                .is_some_and(|(l, _)| l.span().lo().0 > open_line);
             let comment_after_open =
                 open_alone_on_its_line && self.flush_trailing_comment(open_line);
             if !comment_after_open {
@@ -2420,8 +2470,8 @@ impl<'s> Printer<'s> {
             Expr::Hole(x) => self.lit(x),
             Expr::Section(_) => self.raw("_"),
             Expr::Paren(open, inner, close) => {
-                let force_block =
-                    Self::breaks_before(*open, inner.span()) || Self::breaks_before(inner.span(), *close);
+                let force_block = Self::breaks_before(*open, inner.span())
+                    || Self::breaks_before(inner.span(), *close);
                 self.print_paren_block(force_block, *close, |p| p.print_expr(inner));
             }
             Expr::Negate(inner) => {
@@ -2739,7 +2789,9 @@ impl<'s> Printer<'s> {
                 } else {
                     let after = bindings.last().map_or(kw.hi().0, |b| b.span().hi().0);
                     let in_line = self.keyword_line(after, body.span().lo().0);
-                    self.with_indent_at(base_indent + INDENT, |p| p.flush_comments_before_keyword(in_line));
+                    self.with_indent_at(base_indent + INDENT, |p| {
+                        p.flush_comments_before_keyword(in_line)
+                    });
                     self.realign_to(base_indent);
                 }
                 self.raw("in");
@@ -2751,7 +2803,9 @@ impl<'s> Printer<'s> {
                 let multiline = !glued
                     || self.paren_would_break(body)
                     || self.keyword_block_would_break(body)
-                    || bindings.last().is_some_and(|b| body.span().lo().0 > b.span().hi().0 + 1);
+                    || bindings
+                        .last()
+                        .is_some_and(|b| body.span().lo().0 > b.span().hi().0 + 1);
                 if multiline {
                     self.newline();
                 } else {
@@ -3872,7 +3926,8 @@ mod tests {
     }
 
     #[test]
-    fn op_chain_leading_comment_before_an_operator_stays_above_it_instead_of_forcing_the_operand_down() {
+    fn op_chain_leading_comment_before_an_operator_stays_above_it_instead_of_forcing_the_operand_down()
+     {
         // The comment belongs to the `op y` unit, not to `y` alone -
         // print_expr(y)'s own flush_comments_before would otherwise claim it.
         let src = indoc! {"
@@ -5088,7 +5143,11 @@ mod tests {
         "};
         let out = fmt(src);
         assert!(out.contains("A.do"), "qualifier dot lost: {:?}", out);
-        assert!(!out.contains("Ado") && !out.contains("Adodo"), "garbled qualifier: {:?}", out);
+        assert!(
+            !out.contains("Ado") && !out.contains("Adodo"),
+            "garbled qualifier: {:?}",
+            out
+        );
         assert_idempotent(src);
     }
 

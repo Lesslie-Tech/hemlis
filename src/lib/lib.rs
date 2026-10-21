@@ -154,15 +154,11 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
                 let mut p = parser::P::new(&l, &names);
                 if let Some(m) = parser::module(&mut p) {
                     let header = m.0.clone()?;
-                    let me = header.0 .0 .0;
+                    let me = header.0.0.0;
                     Some((
                         m,
                         me,
-                        header
-                            .2
-                            .iter()
-                            .map(|x| x.from.0 .0)
-                            .collect::<BTreeSet<_>>(),
+                        header.2.iter().map(|x| x.from.0.0).collect::<BTreeSet<_>>(),
                     ))
                 } else {
                     None
@@ -321,7 +317,10 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
 }
 
 fn format_name(ns: Option<ast::Ud>, n: ast::Ud, names: &BTreeMap<ast::Ud, String>) -> String {
-    match (ns.and_then(|ns| names.get(&ns).cloned()), names.get(&n).cloned()) {
+    match (
+        ns.and_then(|ns| names.get(&ns).cloned()),
+        names.get(&n).cloned(),
+    ) {
         (None, Some(name)) => name,
         (Some(ns), Some(name)) => format!("{}.{}", ns, name),
         (_, _) => "?".into(),
@@ -340,19 +339,32 @@ fn nrerror_as_warning(
     match error {
         UnusedImport(scope, ud, s) => Some((
             *s,
-            format!("Import of {:?} {} is unused", scope, format_name(None, *ud, names)),
+            format!(
+                "Import of {:?} {} is unused",
+                scope,
+                format_name(None, *ud, names)
+            ),
         )),
         UnusedImportQualified(ud, s) => Some((
             *s,
-            format!("The qualified import {} is unused", format_name(None, *ud, names)),
+            format!(
+                "The qualified import {} is unused",
+                format_name(None, *ud, names)
+            ),
         )),
         UnusedImportUnqualified(ud, s) => Some((
             *s,
-            format!("The unqualified import {} is unused", format_name(None, *ud, names)),
+            format!(
+                "The unqualified import {} is unused",
+                format_name(None, *ud, names)
+            ),
         )),
         UnusedImportedConstructor(ud, s) => Some((
             *s,
-            format!("The import constructor {} is unused", format_name(None, *ud, names)),
+            format!(
+                "The import constructor {} is unused",
+                format_name(None, *ud, names)
+            ),
         )),
         UnusedImportTypeAndConstructor(ud, _, s) => Some((
             *s,
@@ -378,11 +390,17 @@ fn nrerror_as_warning(
         )),
         UnusedDefinition(name, s) if name.scope() == nr::Scope::Namespace => Some((
             s.span().entire_line(),
-            format!("Namespace {} is unused", format_name(None, name.name(), names)),
+            format!(
+                "Namespace {} is unused",
+                format_name(None, name.name(), names)
+            ),
         )),
         UnusedConstructor(u, s) => Some((
             *s,
-            format!("Constructor {} can be safely removed", format_name(None, u.name(), names)),
+            format!(
+                "Constructor {} can be safely removed",
+                format_name(None, u.name(), names)
+            ),
         )),
         UnusedDefinition(name, s) => Some((
             s.name,
@@ -394,7 +412,10 @@ fn nrerror_as_warning(
         )),
         ImportDoesNothing(u, s) => Some((
             *s,
-            format!("Import {} can be safely removed", format_name(None, *u, names)),
+            format!(
+                "Import {} can be safely removed",
+                format_name(None, *u, names)
+            ),
         )),
         _ => None,
     }
@@ -449,9 +470,16 @@ pub fn list_warnings(files: Vec<String>) {
                 let mut p = parser::P::new(&l, &names);
                 let parsed = parser::module(&mut p).and_then(|m| {
                     let header = m.0.clone()?;
-                    let me = header.0 .0 .0;
-                    let deps = header.2.iter().map(|x| x.from.0 .0).collect::<BTreeSet<_>>();
-                    Some(ParsedFile { arg: arg.clone(), fi, src, module: m, me, deps })
+                    let me = header.0.0.0;
+                    let deps = header.2.iter().map(|x| x.from.0.0).collect::<BTreeSet<_>>();
+                    Some(ParsedFile {
+                        arg: arg.clone(),
+                        fi,
+                        src,
+                        module: m,
+                        me,
+                        deps,
+                    })
                 });
                 parsed.map_or(ParseOutcome::Skipped, ParseOutcome::Ok)
             }
@@ -534,7 +562,8 @@ pub fn list_warnings(files: Vec<String>) {
         ("", "", "")
     };
 
-    let fi_to_arg: BTreeMap<usize, &str> = parsed.iter().map(|f| (f.fi.0, f.arg.as_str())).collect();
+    let fi_to_arg: BTreeMap<usize, &str> =
+        parsed.iter().map(|f| (f.fi.0, f.arg.as_str())).collect();
     for (fi, (line, col), message) in warnings.iter() {
         let path = fi_to_arg.get(&fi.0).copied().unwrap_or("?");
         println!(
@@ -621,7 +650,8 @@ fn check_format(files: Vec<String>, ignore_missing: bool) {
                 eprintln!("ERR: {} did not parse cleanly, cannot format", arg);
                 any_bad = true;
             }
-            CheckOutcome::ReadError(e) if ignore_missing && e.kind() == io::ErrorKind::NotFound => {}
+            CheckOutcome::ReadError(e) if ignore_missing && e.kind() == io::ErrorKind::NotFound => {
+            }
             CheckOutcome::ReadError(e) => {
                 let abs = env::current_dir()
                     .map(|cwd| cwd.join(arg).display().to_string())
@@ -679,48 +709,57 @@ fn process_one_file(flags: &BTreeSet<Flag>, i: usize, arg: &str) -> FileResult {
         p.errors.push(parser::Serror::NotAtEOF(p.span(), p.peekt()))
     }
 
-    let format_result = flags.contains(&Flag::Format).then(|| {
-        match (&out, p.errors.is_empty()) {
+    let format_result = flags
+        .contains(&Flag::Format)
+        .then(|| match (&out, p.errors.is_empty()) {
             (Some(m), true) => {
                 let formatted = print::print_module(&src, m, &comments);
                 let changed = formatted != src;
                 FormatResult::Ok { formatted, changed }
             }
             _ => FormatResult::ParseError,
-        }
-    });
-
-    let debug_dump = (flags.contains(&Flag::Tokens) || flags.contains(&Flag::Tree) || !p.errors.is_empty())
-        .then(|| {
-            let mut buf = BufWriter::new(Vec::new());
-            out.show(0, &mut buf).unwrap();
-            let inner =
-                String::from_utf8(buf.into_inner().map_err(|x| format!("{:?}", x)).unwrap())
-                    .map_err(|x| format!("{:?}", x))
-                    .unwrap();
-            format!(
-                "{} of {}\n===\n{}\n===\n{}\n===\n{}",
-                p.i,
-                p.tokens.len(),
-                p.errors
-                    .iter()
-                    .map(|x| { format!("{:?}\n", x) })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                if flags.contains(&Flag::Tokens) {
-                    p.tokens
-                        .iter()
-                        .map(|(a, s)| format!("{:?} {:?}", a, s))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    "".to_string()
-                },
-                if flags.contains(&Flag::Tree) { inner } else { "".to_string() }
-            )
         });
 
-    FileResult { read_err: None, format_result, debug_dump }
+    let debug_dump = (flags.contains(&Flag::Tokens)
+        || flags.contains(&Flag::Tree)
+        || !p.errors.is_empty())
+    .then(|| {
+        let mut buf = BufWriter::new(Vec::new());
+        out.show(0, &mut buf).unwrap();
+        let inner = String::from_utf8(buf.into_inner().map_err(|x| format!("{:?}", x)).unwrap())
+            .map_err(|x| format!("{:?}", x))
+            .unwrap();
+        format!(
+            "{} of {}\n===\n{}\n===\n{}\n===\n{}",
+            p.i,
+            p.tokens.len(),
+            p.errors
+                .iter()
+                .map(|x| { format!("{:?}\n", x) })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            if flags.contains(&Flag::Tokens) {
+                p.tokens
+                    .iter()
+                    .map(|(a, s)| format!("{:?} {:?}", a, s))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                "".to_string()
+            },
+            if flags.contains(&Flag::Tree) {
+                inner
+            } else {
+                "".to_string()
+            }
+        )
+    });
+
+    FileResult {
+        read_err: None,
+        format_result,
+        debug_dump,
+    }
 }
 
 pub fn parse_modules(flags: BTreeSet<Flag>, files: Vec<String>) {
