@@ -10,7 +10,34 @@ enum Flag {
     Warnings,
 }
 
+const USAGE: &str = "\
+Usage: hemlis [OPTIONS] <FILES>...
+
+Options:
+  -f, --format          Format files and print the result
+  -w, --write           With -f: write formatted output back to the files
+  -c, --check           With -f: check formatting without changing files
+      --ignore-missing  With -f -c: ignore files that don't exist
+  -r, --resolve         Parse and resolve names across modules
+  -p, --parse           Parse only (default)
+  -W, --warnings        List style warnings for the files
+  -t, --tokens          Dump tokens
+  -a, --tree            Dump the syntax tree
+  -n, --names           Dump name usages
+  -e, --exports         Dump exports
+  -i, --imports         Dump imports
+  -x, --xx              Dump resolved names
+  -v, --version         Print version
+  -h, --help            Print this help
+
+Use `-` as a file to read from stdin, and `--` to end option parsing.
+";
+
 fn main() {
+    if env::args().len() == 1 {
+        print!("{USAGE}");
+        return;
+    }
     let mut flags = BTreeSet::new();
     let mut lib_flags = BTreeSet::new();
     let mut files = Vec::new();
@@ -35,6 +62,10 @@ fn main() {
                 "-r" | "--resolve" => flags.insert(Flag::Resolve),
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    return;
+                }
                 "-W" | "--warnings" => flags.insert(Flag::Warnings),
                 _ => {
                     eprintln!("Not a valid argument {} - aborting", arg);
