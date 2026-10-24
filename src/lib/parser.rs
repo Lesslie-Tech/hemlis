@@ -2053,10 +2053,23 @@ impl<'s> P<'s> {
 
     fn intern(&self, s: &'_ str) -> Ud {
         let ud = Ud::new(s);
-        // NOTE: This is faster than a normal insert and avoids all possibilities of deadlocks
-        // while maintaining data-correctness.
-        if let Some(dashmap::Entry::Vacant(e)) = self.names.try_entry(ud) {
-            e.insert(s.into());
+        // `try_entry` never blocks, so interning cannot deadlock when the caller already holds a
+        // guard on this shard (the LSP relies on that). It also fails under plain contention
+        // between parser threads, which would silently drop the name, so retry a bounded number
+        // of times before giving up.
+        for _ in 0..1000 {
+            match self.names.try_entry(ud) {
+                Some(dashmap::Entry::Vacant(e)) => {
+                    e.insert(s.into());
+                    return ud;
+                }
+                Some(dashmap::Entry::Occupied(e)) => {
+                    // A collision would silently merge two names; make it loud instead.
+                    assert_eq!(e.get(), s, "Ud hash collision between {:?} and {:?}", e.get(), s);
+                    return ud;
+                }
+                None => std::thread::yield_now(),
+            }
         }
         ud
     }
