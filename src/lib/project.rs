@@ -8,6 +8,9 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIter
 
 use crate::{ast, build_builtins, lexer, nr, parser};
 
+/// Imports of one module: alias (or `None` for unqualified) -> source module -> what it brings in.
+pub type Imports = BTreeMap<Option<ast::Ud>, BTreeMap<ast::Ud, Vec<nr::Export>>>;
+
 /// One successfully read and parsed module.
 pub struct ParsedModule {
     /// The path exactly as given on the command line.
@@ -29,13 +32,15 @@ pub struct ProjectData {
     pub prim: ast::Ud,
     /// Exports per module, including the compiler builtins.
     pub exports: BTreeMap<ast::Ud, Vec<nr::Export>>,
-    pub imports: BTreeMap<ast::Ud, BTreeMap<Option<ast::Ud>, BTreeMap<ast::Ud, Vec<nr::Export>>>>,
+    pub imports: BTreeMap<ast::Ud, Imports>,
     /// Per module: every name the module mentions, plus every reference from other modules to
     /// names defined in it.
     pub usages: BTreeMap<ast::Ud, BTreeMap<nr::Name, BTreeSet<(ast::Span, nr::Sort)>>>,
     pub resolved: BTreeMap<ast::Ud, BTreeMap<(ast::Pos, ast::Pos), nr::Name>>,
     /// Top-level definitions per module, with name, signature and body spans.
     pub defines: BTreeMap<ast::Ud, BTreeMap<nr::Name, nr::DefineSpans>>,
+    /// Operator -> the name it aliases, across all modules.
+    pub operator_aliases: BTreeMap<nr::Name, nr::Name>,
     /// Resolver errors and warnings, in resolution order.
     pub errors: Vec<nr::NRerrors>,
     /// Modules that never resolved because a dependency never became available, with the
@@ -56,7 +61,7 @@ impl ProjectData {
 }
 
 enum ParseOutcome {
-    Ok(ParsedModule),
+    Ok(Box<ParsedModule>),
     ReadError(io::Error),
     Skipped,
 }
@@ -80,7 +85,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
                     let header = module.0.clone()?;
                     let me = header.0 .0 .0;
                     let deps = header.2.iter().map(|x| x.from.0 .0).collect();
-                    Some(ParsedModule { path: path.clone(), fi, src, module, me, deps })
+                    Some(Box::new(ParsedModule { path: path.clone(), fi, src, module, me, deps }))
                 });
                 parsed.map_or(ParseOutcome::Skipped, ParseOutcome::Ok)
             }
@@ -91,7 +96,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
     let mut read_errors = Vec::new();
     for (path, outcome) in files.iter().zip(outcomes) {
         match outcome {
-            ParseOutcome::Ok(m) => modules.push(m),
+            ParseOutcome::Ok(m) => modules.push(*m),
             ParseOutcome::ReadError(e) => read_errors.push((path.clone(), e)),
             ParseOutcome::Skipped => {}
         }
@@ -103,6 +108,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
         BTreeMap::new();
     let mut resolved = BTreeMap::new();
     let mut defines = BTreeMap::new();
+    let mut operator_aliases = BTreeMap::new();
     let mut errors = Vec::new();
 
     let mut remaining: Vec<&ParsedModule> = modules.iter().collect();
@@ -139,6 +145,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
             usages.insert(m.me, n.references);
             resolved.insert(m.me, n.resolved);
             defines.insert(m.me, n.defines);
+            operator_aliases.append(&mut n.operator_aliases);
             done.insert(m.me);
         }
     }
@@ -158,6 +165,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
         usages,
         resolved,
         defines,
+        operator_aliases,
         errors,
         deadlocked,
         read_errors,

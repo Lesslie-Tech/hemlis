@@ -2,11 +2,15 @@
 //! rules on and off, a per-file baseline keeps pre-existing findings from failing the run, and
 //! output is text or JSON.
 
+pub mod beam;
 pub mod config;
+pub mod roots;
 pub mod suppress;
+pub mod unused_exports;
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 use std::{env, io};
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
@@ -140,6 +144,11 @@ pub const RULES: &[RuleInfo] = &[
         kind: RuleKind::Module,
         description: "Data constructors of an unused type",
     },
+    RuleInfo {
+        name: unused_exports::NAME,
+        kind: RuleKind::Project,
+        description: "Exports no other module references (source, BEAM call graph or roots)",
+    },
 ];
 
 pub fn find_rule(name: &str) -> Option<&'static RuleInfo> {
@@ -156,6 +165,8 @@ pub struct ReviewOptions {
     pub json: bool,
     pub update_baseline: bool,
     pub list_rules: bool,
+    /// Path to an xref edge file; overrides the rule's `beam-edges` option.
+    pub beam_edges: Option<String>,
 }
 
 pub struct Finding {
@@ -295,6 +306,28 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
         cfg.enabled(rule) && (opts.rules.is_empty() || opts.rules.iter().any(|r| r == rule))
     };
     let mut findings = module_findings(&project);
+    if !opts.module_rules_only && selected(unused_exports::NAME) {
+        let options: unused_exports::Options = match cfg.options(unused_exports::NAME) {
+            Some(map) => match serde_json::from_value(serde_json::Value::Object(map.clone())) {
+                Ok(options) => options,
+                Err(e) => {
+                    eprintln!("ERR: invalid options for {}: {}", unused_exports::NAME, e);
+                    return EXIT_ERROR;
+                }
+            },
+            None => unused_exports::Options::default(),
+        };
+        let edges_path: Option<PathBuf> = opts
+            .beam_edges
+            .as_ref()
+            .map(PathBuf::from)
+            .or_else(|| options.beam_edges.as_ref().map(|p| cfg_dir.join(p)));
+        let outcome = unused_exports::check(&project, &options, &cfg_dir, edges_path.as_deref());
+        for warning in outcome.warnings {
+            eprintln!("WARN: {}", warning);
+        }
+        findings.extend(outcome.findings);
+    }
     findings.retain(|f| selected(f.rule));
 
     let mut located: Vec<Located> = findings

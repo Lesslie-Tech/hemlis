@@ -17,6 +17,7 @@ enum Flag {
 enum Pending {
     Config,
     Rule,
+    BeamEdges,
 }
 
 fn main() {
@@ -31,6 +32,7 @@ fn main() {
             match p {
                 Pending::Config => review.config = Some(arg),
                 Pending::Rule => review.rules.push(arg),
+                Pending::BeamEdges => review.beam_edges = Some(arg),
             }
             continue;
         }
@@ -55,7 +57,7 @@ fn main() {
                 "-v" | "--version" => flags.insert(Flag::Version),
                 "-W" | "--warnings" => flags.insert(Flag::Warnings),
                 // `hemlis --review [--config F] [--rule R]... [--module-rules-only] [--json]
-                //                 [--update-baseline] [--list-rules] [files...]`
+                //                 [--beam-edges F] [--update-baseline] [--list-rules] [files...]`
                 "--review" => flags.insert(Flag::Review),
                 "--config" => {
                     pending = Some(Pending::Config);
@@ -63,6 +65,10 @@ fn main() {
                 }
                 "--rule" => {
                     pending = Some(Pending::Rule);
+                    true
+                }
+                "--beam-edges" => {
+                    pending = Some(Pending::BeamEdges);
                     true
                 }
                 "--module-rules-only" => {
