@@ -132,7 +132,7 @@ pub const RULES: &[RuleInfo] = &[
     RuleInfo {
         name: NO_UNUSED_IMPORTS,
         kind: RuleKind::Module,
-        description: "Imports, import aliases and imported constructors that are never used",
+        description: "Imports, import aliases and imported constructors that are never used (fix: delete)",
     },
     RuleInfo {
         name: NO_UNUSED_LOCALS,
@@ -263,6 +263,101 @@ fn delete_definition(spans: &nr::DefineSpans) -> Option<Vec<Edit>> {
     Some(vec![Edit::DeleteLines { fi, from: whole.lo().0, to: whole.hi().0 }])
 }
 
+fn import_entry_span(i: &ast::Import) -> ast::Span {
+    match i {
+        ast::Import::Value(s, _)
+        | ast::Import::Symbol(s, _)
+        | ast::Import::Typ(s, _)
+        | ast::Import::TypDat(s, _, _)
+        | ast::Import::TypSymbol(s, _)
+        | ast::Import::Class(s, _) => *s,
+    }
+}
+
+/// Every line an import declaration occupies.
+fn import_decl_lines(decl: &ast::ImportDecl) -> (usize, usize) {
+    let mut whole = decl.from.0 .1;
+    for i in decl.names.iter().flatten() {
+        whole = whole.merge(import_entry_span(i));
+    }
+    if let Some(to) = &decl.to {
+        whole = whole.merge(to.0 .1);
+    }
+    (whole.lo().0, whole.hi().0)
+}
+
+/// Fixes for the resolver's unused-import findings: delete the declaration, drop one entry of
+/// an explicit list, or drop a `(..)`. An import that also binds a qualified name is left alone
+/// when the finding is about its list, since the alias may still be in use.
+fn import_fix(project: &ProjectData, e: &nr::NRerrors) -> Option<Vec<Edit>> {
+    use nr::NRerrors::*;
+    let span = match e {
+        UnusedImportQualified(_, s)
+        | UnusedImportUnqualified(_, s)
+        | ImportDoesNothing(_, s)
+        | UnusedImport(_, _, s)
+        | UnusedImportTypeAndConstructor(_, _, s) => *s,
+        UnusedDefinition(name, spans) if name.scope() == nr::Scope::Namespace => spans.name,
+        UnusedImportedConstructorsAll(_, _, region) => {
+            return Some(vec![Edit::Replace(*region, String::new())]);
+        }
+        _ => return None,
+    };
+    let fi = span.fi()?;
+    let m = project.modules.iter().find(|m| m.fi == fi)?;
+    let decls = &m.module.0.as_ref()?.2;
+    match e {
+        // An unused alias: drop every `import X as Alias` declaration, unless one of them also
+        // brings names in unqualified.
+        UnusedDefinition(name, _) => {
+            let aliased: Vec<&ast::ImportDecl> = decls
+                .iter()
+                .filter(|d| d.to.as_ref().is_some_and(|to| to.0 .0 == name.name()))
+                .collect();
+            if aliased.is_empty() || aliased.iter().any(|d| d.names.as_ref().is_some_and(|n| !n.is_empty())) {
+                return None;
+            }
+            Some(
+                aliased
+                    .iter()
+                    .map(|d| {
+                        let (from, to) = import_decl_lines(d);
+                        Edit::DeleteLines { fi, from, to }
+                    })
+                    .collect(),
+            )
+        }
+        UnusedImportQualified(..) | UnusedImportUnqualified(..) | ImportDoesNothing(..) => {
+            let decl = decls.iter().find(|d| span.contains(d.from.0 .1.lo()))?;
+            if matches!(e, UnusedImportUnqualified(..)) && decl.to.is_some() {
+                return None;
+            }
+            let (from, to) = import_decl_lines(decl);
+            Some(vec![Edit::DeleteLines { fi, from, to }])
+        }
+        _ => {
+            for decl in decls.iter() {
+                let Some(names) = decl.names.as_ref() else { continue };
+                let spans: Vec<ast::Span> = names.iter().map(import_entry_span).collect();
+                let Some(i) = spans.iter().position(|s| *s == span) else { continue };
+                if spans.len() == 1 {
+                    if decl.to.is_some() {
+                        return None;
+                    }
+                    let (from, to) = import_decl_lines(decl);
+                    return Some(vec![Edit::DeleteLines { fi, from, to }]);
+                }
+                let (lo, hi) = match spans.get(i + 1) {
+                    Some(next) => (span.lo(), next.lo()),
+                    None => (spans[i - 1].hi(), span.hi()),
+                };
+                return Some(vec![Edit::Replace(ast::Span::Known(fi, lo, hi), String::new())]);
+            }
+            None
+        }
+    }
+}
+
 /// Findings from the single-module rules: the resolver's unused-code warnings and the style rules.
 /// Same two sources as `-W`, now tagged with a rule name.
 pub fn module_findings(project: &ProjectData) -> Vec<Finding> {
@@ -276,6 +371,7 @@ pub fn module_findings(project: &ProjectData) -> Vec<Finding> {
                 nr::NRerrors::UnusedDefinition(_, spans) if rule == NO_UNUSED_DEFINITIONS => {
                     delete_definition(spans)
                 }
+                _ if rule == NO_UNUSED_IMPORTS => import_fix(project, e),
                 _ => None,
             };
             Some(Finding { rule, span, message, fix })
@@ -653,7 +749,14 @@ fn apply_fixes(project: &ProjectData, by_file: BTreeMap<&str, Vec<&Edit>>) -> Re
                 Edit::DeleteLines { from, to, .. } => delete_lines_range(&m.src, *from, *to).map(|(lo, hi)| (lo, hi, "")),
             })
             .collect();
+        // An edit inside another edit's range is redundant (an unused entry of an import that
+        // is deleted whole); keep the containing one.
+        let all = ranges.clone();
+        ranges.retain(|(lo, hi, _)| {
+            !all.iter().any(|(lo2, hi2, _)| (lo2, hi2) != (lo, hi) && lo2 <= lo && hi <= hi2)
+        });
         ranges.sort_by(|a, b| b.0.cmp(&a.0));
+        ranges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
         let mut out = m.src.clone();
         let mut last_lo = usize::MAX;
         for (lo, hi, text) in ranges {
@@ -725,6 +828,29 @@ mod tests {
 
         let a = fs::read_to_string(dir.join("A.purs")).unwrap();
         assert!(a.starts_with("module A\n  ( Shape(..)\n  ) where\n"), "{}", a);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_trims_unused_imports() {
+        let dir = temp_project("imports");
+        fs::write(
+            dir.join("A.purs"),
+            "module A (foo, bar, Shape(..), baz) where\n\nfoo :: Int\nfoo = 1\n\nbar :: Int\nbar = 2\n\ndata Shape = Circle\n\nbaz :: Int\nbaz = 3\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("B.purs"),
+            "module B (main) where\n\nimport A (foo, bar, Shape(..), baz)\nimport A as A\nimport A (bar) as Only\n\nmain :: Int\nmain = foo + Only.bar\n",
+        )
+        .unwrap();
+        fs::write(dir.join("C.purs"), "module C (c) where\n\nimport A as A\n\nc :: Int\nc = A.bar + A.baz\n").unwrap();
+
+        run_cli(fix_opts(&dir, &[NO_UNUSED_IMPORTS]), Vec::new());
+
+        let b = fs::read_to_string(dir.join("B.purs")).unwrap();
+        // `bar` stays in the first list: the resolver tracks use per name, not per declaration.
+        assert_eq!(b, "module B (main) where\n\nimport A (foo, bar)\nimport A (bar) as Only\n\nmain :: Int\nmain = foo + Only.bar\n");
         let _ = fs::remove_dir_all(&dir);
     }
 
