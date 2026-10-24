@@ -147,16 +147,16 @@ pub fn check(project: &ProjectData, ctx: &Context) -> Vec<Finding> {
                 .map(|(_, e)| e.span)
                 .or_else(|| project.defines.get(&m.me)?.get(&name).map(|d| d.name))
                 .unwrap_or(ast::Span::Known(m.fi, (0, 0), (0, 0)));
-            // Drop the entry together with the separator that joins it to its neighbour. A sole
-            // entry stays: an empty export list is a different decision.
+            // Drop the entry together with the separator that joins it to its neighbour: up to
+            // the next entry's start, or, for the last entry, from the end of the previous one.
+            // A sole entry stays: an empty export list is a different decision.
             let fix = entry.and_then(|(i, e)| {
                 if !e.fixable || entries.len() < 2 {
                     return None;
                 }
-                let (lo, hi) = if i > 0 {
-                    (entries[i - 1].span.hi(), e.span.hi())
-                } else {
-                    (e.span.lo(), entries[i + 1].span.lo())
+                let (lo, hi) = match entries.get(i + 1) {
+                    Some(next) => (e.span.lo(), next.span.lo()),
+                    None => (entries[i - 1].full.hi(), e.span.hi()),
                 };
                 Some(vec![Edit::Replace(ast::Span::Known(m.fi, lo, hi), String::new())])
             });
@@ -187,9 +187,12 @@ pub fn referenced_elsewhere(project: &ProjectData, m: &ParsedModule, name: nr::N
 struct Entry {
     scope: nr::Scope,
     ud: ast::Ud,
+    /// The name only.
     span: ast::Span,
-    /// The span covers the whole entry, so deleting it is safe. Not the case for `T(..)`, whose
-    /// constructor list has no span of its own, nor for `module X`.
+    /// The whole entry, `T(..)` and `T(A, B)` included.
+    full: ast::Span,
+    /// `span` is the whole entry, so deleting it is safe. Not the case for `T(..)`, whose
+    /// constructor list the parser does not span exactly, nor for `module X`.
     fixable: bool,
 }
 
@@ -197,16 +200,26 @@ struct Entry {
 fn export_entries(list: &[ast::Export]) -> Vec<Entry> {
     list.iter()
         .map(|e| {
-            let (scope, s, fixable) = match e {
-                ast::Export::Value(n) => (nr::Scope::Term, n.0, true),
-                ast::Export::Symbol(s) => (nr::Scope::Term, s.0, true),
-                ast::Export::Typ(p) => (nr::Scope::Type, p.0, true),
-                ast::Export::TypDat(p, _) => (nr::Scope::Type, p.0, false),
-                ast::Export::TypSymbol(s) => (nr::Scope::Type, s.0, true),
-                ast::Export::Class(p) => (nr::Scope::Class, p.0, true),
-                ast::Export::Module(m) => (nr::Scope::Module, m.0, false),
+            let (scope, s, full, fixable) = match e {
+                ast::Export::Value(n) => (nr::Scope::Term, n.0, n.0 .1, true),
+                ast::Export::Symbol(s) => (nr::Scope::Term, s.0, s.0 .1, true),
+                ast::Export::Typ(p) => (nr::Scope::Type, p.0, p.0 .1, true),
+                ast::Export::TypDat(p, members) => {
+                    let full = match members {
+                        ast::DataMember::All(parens) => p.0 .1.merge(*parens),
+                        // `T(A, B)`: the last constructor plus the closing paren.
+                        ast::DataMember::Some(names) => names
+                            .last()
+                            .map(|n| p.0 .1.merge(n.0 .1.and_one_more_char()))
+                            .unwrap_or(p.0 .1),
+                    };
+                    (nr::Scope::Type, p.0, full, false)
+                }
+                ast::Export::TypSymbol(s) => (nr::Scope::Type, s.0, s.0 .1, true),
+                ast::Export::Class(p) => (nr::Scope::Class, p.0, p.0 .1, true),
+                ast::Export::Module(m) => (nr::Scope::Module, m.0, m.0 .1, false),
             };
-            Entry { scope, ud: s.0, span: s.1, fixable }
+            Entry { scope, ud: s.0, span: s.1, full, fixable }
         })
         .collect()
 }

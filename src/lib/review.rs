@@ -712,6 +712,23 @@ mod tests {
     }
 
     #[test]
+    fn fix_keeps_constructor_exports_next_to_a_removed_entry() {
+        let dir = temp_project("typdat");
+        fs::write(
+            dir.join("A.purs"),
+            "module A\n  ( foo\n  , Shape(..)\n  , bar\n  ) where\n\nfoo :: Int\nfoo = 1\n\ndata Shape = Circle | Square\n\nbar :: Int\nbar = 2\n",
+        )
+        .unwrap();
+        fs::write(dir.join("B.purs"), "module B (main) where\n\nimport A as A\n\nmain :: A.Shape\nmain = A.Circle\n").unwrap();
+
+        run_cli(fix_opts(&dir, &[unused_exports::NAME]), Vec::new());
+
+        let a = fs::read_to_string(dir.join("A.purs")).unwrap();
+        assert!(a.starts_with("module A\n  ( Shape(..)\n  ) where\n"), "{}", a);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn delete_lines_takes_comment_and_one_blank() {
         let src = "a = 1\n\n-- | doc\n-- more\nb :: Int\nb = 2\n\nc = 3\n";
         let (lo, hi) = delete_lines_range(src, 4, 5).unwrap();
