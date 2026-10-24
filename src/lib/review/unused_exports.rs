@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use super::{beam, roots, Finding};
+use super::{beam, roots, Edit, Finding};
 use crate::project::{ParsedModule, ProjectData};
 use crate::{ast, nr};
 
@@ -158,7 +158,7 @@ pub fn check(project: &ProjectData, ctx: &Context) -> Vec<Finding> {
                 } else {
                     (e.span.lo(), entries[i + 1].span.lo())
                 };
-                Some(vec![(ast::Span::Known(m.fi, lo, hi), String::new())])
+                Some(vec![Edit::Replace(ast::Span::Known(m.fi, lo, hi), String::new())])
             });
             findings.push(Finding {
                 rule: NAME,

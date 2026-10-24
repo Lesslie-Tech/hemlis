@@ -52,7 +52,7 @@ bar z = z
 -- +       "end_line": 9,
 -- +       "end_col": 4,
 -- +       "message": "Definition Term bar is unused",
--- +       "fixable": false
+-- +       "fixable": true
 -- +     }
 -- +   ],
 -- +   "suppressed": 0,

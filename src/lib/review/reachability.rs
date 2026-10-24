@@ -153,6 +153,15 @@ pub fn check_unreachable(project: &ProjectData, ctx: &Context, liveness: &Livene
             if name.3 != nr::Visibility::Public || name.module() != m.me || liveness.live.contains(name) {
                 continue;
             }
+            // Nothing references it at all: `no-unused-definitions` already reports that.
+            let referenced = project
+                .usages
+                .get(&m.me)
+                .and_then(|u| u.get(name))
+                .is_some_and(|uses| uses.iter().any(|(_, sort)| sort.is_ref()));
+            if !referenced {
+                continue;
+            }
             let text = project.name(name.name());
             let Some(kind) = reportable_kind(ctx.opts, name.scope(), text) else { continue };
             let note = if exported.contains(name) { ", nor is anything that uses it" } else { "" };
