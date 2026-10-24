@@ -1,0 +1,1 @@
+{ "rules": { "unqualified-do": { "enabled": false }, "unqualified-pure": { "enabled": false } } }

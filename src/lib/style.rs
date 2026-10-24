@@ -6,6 +6,26 @@ use crate::source::{line_starts, source_text_with_starts, span_to_byte_range_wit
 // Types
 // ---------------------------------------------------------------------------
 
+/// Stable names for the style rules, used by `hemlis --review` for config, baseline and output.
+pub mod rule_names {
+    pub const FORBIDDEN_OPERATOR: &str = "forbidden-operator";
+    pub const CONFUSING_MAP_OPERATOR: &str = "confusing-map-operator";
+    pub const OPERATOR_SWAP: &str = "operator-swap";
+    pub const OP_TO_PARENS: &str = "op-to-parens";
+    pub const UNNECESSARY_PARENS: &str = "unnecessary-parens";
+    pub const UNNECESSARY_TYPE_PARENS: &str = "unnecessary-type-parens";
+    pub const IF_TO_CASE: &str = "if-to-case";
+    pub const UNQUALIFIED_DO: &str = "unqualified-do";
+    pub const UNQUALIFIED_PURE: &str = "unqualified-pure";
+    pub const QUALIFIED_CONSTRUCTOR: &str = "qualified-constructor";
+    pub const IMPORT_EXACT_NAME: &str = "import-exact-name";
+    pub const IMPORT_CTX_NAMING: &str = "import-ctx-naming";
+    pub const PREFER_LET: &str = "prefer-let";
+    pub const DOCSTRING_FORMAT: &str = "docstring-format";
+    pub const NO_MODULE_REEXPORT: &str = "no-module-reexport";
+    pub const MISSING_EXPORT_LIST: &str = "missing-export-list";
+}
+
 /// What a style diagnostic does: warn, offer a fix, or both.
 pub enum StyleAction {
     /// Emit a warning only; no code action (e.g. no safe auto-fix exists).
@@ -30,6 +50,8 @@ pub enum StyleAction {
 /// A style diagnostic produced by the checker.
 /// The LSP layer converts this into a Fixable + optional warning diagnostic.
 pub struct StyleDiagnostic {
+    /// Which rule produced this diagnostic (see `rule_names`).
+    pub rule: &'static str,
     /// Span used for cursor matching (e.g. the operator itself).
     pub cursor_span: Span,
     /// Span of the expression to replace / anchor the warning on.
@@ -111,6 +133,7 @@ fn rule_forbidden_operator(
                 let new_rhs = maybe_paren(lhs_text, lhs, target_prec);
 
                 out.push(StyleDiagnostic {
+                    rule: rule_names::FORBIDDEN_OPERATOR,
                     // Warn on just the operator, but replace the whole expression.
                     cursor_span: op_span,
                     expr_span,
@@ -253,6 +276,7 @@ fn rule_confusing_map_operator(
     let replacement = format!("{new_lhs}{gap_before}{new_op}{gap_after}{new_rhs}");
 
     out.push(StyleDiagnostic {
+        rule: rule_names::CONFUSING_MAP_OPERATOR,
         // Warn on just the operator, but replace the whole expression.
         cursor_span: op_span,
         expr_span,
@@ -324,6 +348,7 @@ fn rule_operator_swap(
                 };
 
                 out.push(StyleDiagnostic {
+                    rule: rule_names::OPERATOR_SWAP,
                     cursor_span: op_span,
                     expr_span,
                     action: StyleAction::Fix {
@@ -375,6 +400,7 @@ fn rule_op_to_parens(
         };
 
         out.push(StyleDiagnostic {
+            rule: rule_names::OP_TO_PARENS,
             cursor_span: op_span,
             expr_span,
             action: StyleAction::Fix {
@@ -473,6 +499,7 @@ fn emit_remove_parens(
         if let Some(text) = inner_text {
             let paren_span = child.span();
             out.push(StyleDiagnostic {
+                rule: rule_names::UNNECESSARY_PARENS,
                 cursor_span: paren_span,
                 expr_span: paren_span,
                 action: StyleAction::WarnAndFix {
@@ -574,6 +601,7 @@ fn emit_remove_typ_parens(
         if let Some(text) = inner_text {
             let paren_span = typ.span();
             out.push(StyleDiagnostic {
+                rule: rule_names::UNNECESSARY_TYPE_PARENS,
                 cursor_span: paren_span,
                 expr_span: paren_span,
                 action: StyleAction::WarnAndFix {
@@ -680,6 +708,7 @@ fn rule_if_to_case(
     };
 
     out.push(StyleDiagnostic {
+        rule: rule_names::IF_TO_CASE,
         cursor_span,
         expr_span: expr.span(),
         action,
@@ -703,6 +732,7 @@ fn rule_unqualified_do(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
         return;
     }
     out.push(StyleDiagnostic {
+        rule: rule_names::UNQUALIFIED_DO,
         cursor_span: *kw,
         expr_span: *kw,
         action: StyleAction::Warn {
@@ -730,6 +760,7 @@ fn rule_unqualified_pure(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
     {
         let span = expr.span();
         out.push(StyleDiagnostic {
+            rule: rule_names::UNQUALIFIED_PURE,
             cursor_span: span,
             expr_span: span,
             action: StyleAction::Warn {
@@ -766,6 +797,7 @@ fn rule_qualified_constructor(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) 
             if qual_ud == Ud::new(q) && name_ud == Ud::new(n) {
                 let span = expr.span();
                 out.push(StyleDiagnostic {
+                    rule: rule_names::QUALIFIED_CONSTRUCTOR,
                     cursor_span: span,
                     expr_span: span,
                     action: StyleAction::WarnAndFix {
@@ -827,6 +859,7 @@ fn rule_import_exact_name(
 
     let first = from_text.chars().next().unwrap_or('?');
     out.push(StyleDiagnostic {
+        rule: rule_names::IMPORT_EXACT_NAME,
         cursor_span: alias_span,
         expr_span: alias_span,
         action: StyleAction::Warn {
@@ -897,6 +930,7 @@ fn rule_import_ctx_naming(
     };
 
     out.push(StyleDiagnostic {
+        rule: rule_names::IMPORT_CTX_NAMING,
         cursor_span: alias_span,
         expr_span: alias_span,
         action,
@@ -1010,6 +1044,7 @@ fn rule_prefer_let(
         .unwrap_or(StyleAction::Warn { message });
 
     out.push(StyleDiagnostic {
+        rule: rule_names::PREFER_LET,
         // Warn on the `where` keyword; the fix replaces the whole expression.
         cursor_span: *where_span,
         expr_span: where_expr.span(),
@@ -1448,6 +1483,7 @@ fn check_docstring_comments(
         let (line, col) = byte_to_pos(starts, byte_span.start);
         let span = Span::Known(fi, (line, col), (line, col + prefix_len));
         out.push(StyleDiagnostic {
+            rule: rule_names::DOCSTRING_FORMAT,
             cursor_span: span,
             expr_span: span,
             action: StyleAction::WarnAndFix {
@@ -1477,6 +1513,7 @@ fn rule_no_module_reexport(module_name: Ud, header: &ast::Header, out: &mut Vec<
         if let ast::Export::Module(m) = export {
             let span = m.span();
             out.push(StyleDiagnostic {
+                rule: rule_names::NO_MODULE_REEXPORT,
                 cursor_span: span,
                 expr_span: span,
                 action: StyleAction::Warn {
@@ -1493,6 +1530,7 @@ fn rule_missing_export_list(header: &ast::Header, out: &mut Vec<StyleDiagnostic>
     if header.1.is_none() {
         let span = header.0.span();
         out.push(StyleDiagnostic {
+            rule: rule_names::MISSING_EXPORT_LIST,
             cursor_span: span,
             expr_span: span,
             action: StyleAction::Warn {

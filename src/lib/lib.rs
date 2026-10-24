@@ -13,6 +13,7 @@ pub mod nr;
 pub mod parser;
 pub mod print;
 pub mod project;
+pub mod review;
 pub mod source;
 pub mod style;
 

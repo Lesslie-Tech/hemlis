@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, env};
 
+use hemlis_lib::review::{self, ReviewOptions};
 use hemlis_lib::{list_warnings, parse_and_resolve_names, parse_modules, version, Flag as LibFlag};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -8,14 +9,31 @@ enum Flag {
     Parse,
     Version,
     Warnings,
+    Review,
+}
+
+/// Options that take a value in the following argument.
+#[derive(Debug, Clone, Copy)]
+enum Pending {
+    Config,
+    Rule,
 }
 
 fn main() {
     let mut flags = BTreeSet::new();
     let mut lib_flags = BTreeSet::new();
+    let mut review = ReviewOptions::default();
     let mut files = Vec::new();
     let mut parsing_options = true;
+    let mut pending: Option<Pending> = None;
     for arg in env::args().skip(1) {
+        if let Some(p) = pending.take() {
+            match p {
+                Pending::Config => review.config = Some(arg),
+                Pending::Rule => review.rules.push(arg),
+            }
+            continue;
+        }
         if arg == "--" {
             parsing_options = true;
             continue;
@@ -36,6 +54,33 @@ fn main() {
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),
                 "-W" | "--warnings" => flags.insert(Flag::Warnings),
+                // `hemlis --review [--config F] [--rule R]... [--module-rules-only] [--json]
+                //                 [--update-baseline] [--list-rules] [files...]`
+                "--review" => flags.insert(Flag::Review),
+                "--config" => {
+                    pending = Some(Pending::Config);
+                    true
+                }
+                "--rule" => {
+                    pending = Some(Pending::Rule);
+                    true
+                }
+                "--module-rules-only" => {
+                    review.module_rules_only = true;
+                    true
+                }
+                "--json" => {
+                    review.json = true;
+                    true
+                }
+                "--update-baseline" => {
+                    review.update_baseline = true;
+                    true
+                }
+                "--list-rules" => {
+                    review.list_rules = true;
+                    true
+                }
                 _ => {
                     eprintln!("Not a valid argument {} - aborting", arg);
                     continue;
@@ -46,10 +91,17 @@ fn main() {
             files.push(arg);
         }
     }
+    if let Some(p) = pending {
+        eprintln!("Missing value for {:?} - aborting", p);
+        std::process::exit(review::EXIT_ERROR);
+    }
 
     if flags.contains(&Flag::Version) {
         println!("version: {}", version());
         return;
+    }
+    if flags.contains(&Flag::Review) {
+        std::process::exit(review::run_cli(review, files));
     }
     if flags.contains(&Flag::Warnings) {
         list_warnings(files);
