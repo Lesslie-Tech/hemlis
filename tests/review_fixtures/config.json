@@ -1,1 +1,1 @@
-{ "rules": { "missing-export-list": { "enabled": false } } }
+{ "rules": { "missing-export-list": { "enabled": false }, "no-unused-exports": { "enabled": false }, "no-unreachable-definitions": { "enabled": false }, "no-unused-modules": { "enabled": false } } }

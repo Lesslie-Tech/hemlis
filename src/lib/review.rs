@@ -4,6 +4,7 @@
 
 pub mod beam;
 pub mod config;
+pub mod reachability;
 pub mod roots;
 pub mod suppress;
 pub mod unused_exports;
@@ -148,6 +149,16 @@ pub const RULES: &[RuleInfo] = &[
         name: unused_exports::NAME,
         kind: RuleKind::Project,
         description: "Exports no other module references (source, BEAM call graph or roots)",
+    },
+    RuleInfo {
+        name: reachability::UNREACHABLE,
+        kind: RuleKind::Project,
+        description: "Definitions no entry point reaches, even through other dead code",
+    },
+    RuleInfo {
+        name: reachability::UNUSED_MODULES,
+        kind: RuleKind::Project,
+        description: "Modules none of whose definitions any entry point reaches",
     },
 ];
 
@@ -294,7 +305,10 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
     let selected = |rule: &str| {
         cfg.enabled(rule) && (opts.rules.is_empty() || opts.rules.iter().any(|r| r == rule))
     };
-    let project_rules = !opts.module_rules_only && selected(unused_exports::NAME);
+    let want_exports = !opts.module_rules_only && selected(unused_exports::NAME);
+    let want_reach = !opts.module_rules_only
+        && (selected(reachability::UNREACHABLE) || selected(reachability::UNUSED_MODULES));
+    let project_rules = want_exports || want_reach;
 
     // Project rules need the whole configured project even when the command line names a few
     // files; those files then only filter the report.
@@ -333,26 +347,54 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
 
     let mut findings = module_findings(&project);
     if project_rules {
-        let options: unused_exports::Options = match cfg.options(unused_exports::NAME) {
-            Some(map) => match serde_json::from_value(serde_json::Value::Object(map.clone())) {
-                Ok(options) => options,
-                Err(e) => {
-                    eprintln!("ERR: invalid options for {}: {}", unused_exports::NAME, e);
-                    return EXIT_ERROR;
-                }
-            },
-            None => unused_exports::Options::default(),
+        // The reachability rules take their own options when given, else `no-unused-exports`'s.
+        let options_of = |rule: &str| -> Result<Option<unused_exports::Options>, String> {
+            match cfg.options(rule) {
+                Some(map) => serde_json::from_value(serde_json::Value::Object(map.clone()))
+                    .map(Some)
+                    .map_err(|e| format!("invalid options for {}: {}", rule, e)),
+                None => Ok(None),
+            }
         };
-        let edges_path: Option<PathBuf> = opts
-            .beam_edges
-            .as_ref()
-            .map(PathBuf::from)
-            .or_else(|| options.beam_edges.as_ref().map(|p| cfg_dir.join(p)));
-        let outcome = unused_exports::check(&project, &options, &cfg_dir, edges_path.as_deref());
-        for warning in outcome.warnings {
-            eprintln!("WARN: {}", warning);
+        let (export_opts, reach_opts) = match (options_of(unused_exports::NAME), options_of(reachability::UNREACHABLE)) {
+            (Ok(e), Ok(r)) => {
+                let e = e.unwrap_or_default();
+                let r = r.unwrap_or_else(|| e.clone());
+                (e, r)
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("ERR: {}", e);
+                return EXIT_ERROR;
+            }
+        };
+        let edges_path = |options: &unused_exports::Options| -> Option<PathBuf> {
+            opts.beam_edges
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(|| options.beam_edges.as_ref().map(|p| cfg_dir.join(p)))
+        };
+        if want_exports {
+            let ctx = unused_exports::Context::load(&export_opts, &cfg_dir, edges_path(&export_opts).as_deref());
+            for warning in ctx.warnings.iter() {
+                eprintln!("WARN: {}", warning);
+            }
+            findings.extend(unused_exports::check(&project, &ctx));
         }
-        findings.extend(outcome.findings);
+        if want_reach {
+            let ctx = unused_exports::Context::load(&reach_opts, &cfg_dir, edges_path(&reach_opts).as_deref());
+            if !want_exports {
+                for warning in ctx.warnings.iter() {
+                    eprintln!("WARN: {}", warning);
+                }
+            }
+            let liveness = reachability::compute(&project, &ctx);
+            if selected(reachability::UNREACHABLE) {
+                findings.extend(reachability::check_unreachable(&project, &ctx, &liveness));
+            }
+            if selected(reachability::UNUSED_MODULES) {
+                findings.extend(reachability::check_unused_modules(&project, &ctx, &liveness));
+            }
+        }
     }
     findings.retain(|f| selected(f.rule));
     if let Some(report_only) = &report_only {

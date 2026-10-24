@@ -18,7 +18,7 @@ use crate::{ast, nr};
 
 pub const NAME: &str = "no-unused-exports";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Options {
     /// Exports ending in one of these are entry points, e.g. `_Elixir`.
@@ -36,47 +36,84 @@ pub struct Options {
     pub report_types: bool,
 }
 
-pub struct Outcome {
-    pub findings: Vec<Finding>,
+/// Roots and evidence shared by the project rules: the config roots, the Elixir/Erlang scan and
+/// the BEAM call graph.
+pub struct Context<'a> {
+    pub opts: &'a Options,
+    scanned: roots::Roots,
+    edges: Option<beam::BeamEdges>,
+    extra_roots: BTreeSet<&'a str>,
     pub warnings: Vec<String>,
 }
 
-pub fn check(
-    project: &ProjectData,
-    opts: &Options,
-    config_dir: &Path,
-    beam_edges: Option<&Path>,
-) -> Outcome {
-    let mut warnings = Vec::new();
-    let edges = beam_edges.and_then(|path| match beam::BeamEdges::load(path) {
-        Ok(edges) => Some(edges),
-        Err(e) => {
-            warnings.push(format!("{}; continuing without BEAM edges", e));
-            None
+impl<'a> Context<'a> {
+    pub fn load(opts: &'a Options, config_dir: &Path, beam_edges: Option<&Path>) -> Self {
+        let mut warnings = Vec::new();
+        let edges = beam_edges.and_then(|path| match beam::BeamEdges::load(path) {
+            Ok(edges) => Some(edges),
+            Err(e) => {
+                warnings.push(format!("{}; continuing without BEAM edges", e));
+                None
+            }
+        });
+        let scanned = match roots::scan(&opts.scan_beam_roots, config_dir) {
+            Ok(roots) => roots,
+            Err(e) => {
+                warnings.push(format!("{}; continuing without scanned roots", e));
+                roots::Roots::default()
+            }
+        };
+        Self {
+            opts,
+            scanned,
+            edges,
+            extra_roots: opts.extra_roots.iter().map(String::as_str).collect(),
+            warnings,
         }
-    });
-    let scanned = match roots::scan(&opts.scan_beam_roots, config_dir) {
-        Ok(roots) => roots,
-        Err(e) => {
-            warnings.push(format!("{}; continuing without scanned roots", e));
-            roots::Roots::default()
-        }
-    };
+    }
 
+    /// Library modules and modules the Elixir scan names as a whole are never reported.
+    pub fn skip_module(&self, module_name: &str) -> bool {
+        self.opts.library_modules.iter().any(|g| glob_match(g, module_name))
+            || self.scanned.modules.contains(module_name)
+    }
+
+    /// Entry points: by name, suffix, explicit list, scanned call, or a BEAM call from another
+    /// module.
+    pub fn is_root(&self, module_name: &str, text: &str) -> bool {
+        self.opts.roots_named.iter().any(|n| n == text)
+            || self.opts.roots_suffixed_by.iter().any(|s| text.ends_with(s.as_str()))
+            || self.extra_roots.contains(format!("{}.{}", module_name, text).as_str())
+            || self.scanned.functions.contains(&(module_name.to_string(), text.to_string()))
+            || self.edges.as_ref().is_some_and(|e| e.is_used(module_name, text))
+    }
+}
+
+/// What kind of thing a name is for the report, or `None` when the rules leave it alone:
+/// constructors always, types and classes unless `report-types`.
+pub fn reportable_kind(opts: &Options, scope: nr::Scope, text: &str) -> Option<&'static str> {
+    match scope {
+        nr::Scope::Term if text.starts_with(|c: char| c.is_uppercase()) => None,
+        nr::Scope::Term if text.starts_with(|c: char| c.is_alphabetic() || c == '_') => Some("value"),
+        nr::Scope::Term => Some("operator"),
+        nr::Scope::Type if opts.report_types => Some("type"),
+        nr::Scope::Class if opts.report_types => Some("class"),
+        _ => None,
+    }
+}
+
+pub fn check(project: &ProjectData, ctx: &Context) -> Vec<Finding> {
     let mut alias_ops: BTreeMap<nr::Name, Vec<nr::Name>> = BTreeMap::new();
     for (op, target) in project.operator_aliases.iter() {
         alias_ops.entry(*target).or_default().push(*op);
     }
-    let extra_roots: BTreeSet<&str> = opts.extra_roots.iter().map(String::as_str).collect();
 
     let mut findings = Vec::new();
     for m in project.modules.iter() {
         let Some(header) = m.module.0.as_ref() else { continue };
         let Some(export_list) = header.1.as_ref() else { continue };
         let module_name = project.name(m.me);
-        if opts.library_modules.iter().any(|g| glob_match(g, module_name))
-            || scanned.modules.contains(module_name)
-        {
+        if ctx.skip_module(module_name) {
             continue;
         }
         let Some(exports) = project.exports.get(&m.me) else { continue };
@@ -94,25 +131,13 @@ pub fn check(
                 continue;
             }
             let text = project.name(name.name());
-            let kind = match name.scope() {
-                nr::Scope::Term if text.starts_with(|c: char| c.is_uppercase()) => continue,
-                nr::Scope::Term if text.starts_with(|c: char| c.is_alphabetic() || c == '_') => "value",
-                nr::Scope::Term => "operator",
-                nr::Scope::Type if opts.report_types => "type",
-                nr::Scope::Class if opts.report_types => "class",
-                _ => continue,
-            };
+            let Some(kind) = reportable_kind(ctx.opts, name.scope(), text) else { continue };
 
-            let is_root = opts.roots_named.iter().any(|n| n == text)
-                || opts.roots_suffixed_by.iter().any(|s| text.ends_with(s.as_str()))
-                || extra_roots.contains(format!("{}.{}", module_name, text).as_str())
-                || scanned.functions.contains(&(module_name.to_string(), text.to_string()));
-            if is_root
+            if ctx.is_root(module_name, text)
                 || referenced_elsewhere(project, m, name)
                 || alias_ops
                     .get(&name)
                     .is_some_and(|ops| ops.iter().any(|op| referenced_elsewhere(project, m, *op)))
-                || edges.as_ref().is_some_and(|e| e.is_used(module_name, text))
             {
                 continue;
             }
@@ -143,11 +168,11 @@ pub fn check(
             });
         }
     }
-    Outcome { findings, warnings }
+    findings
 }
 
 /// Any `Ref` to `name` from a file other than `m`'s.
-fn referenced_elsewhere(project: &ProjectData, m: &ParsedModule, name: nr::Name) -> bool {
+pub fn referenced_elsewhere(project: &ProjectData, m: &ParsedModule, name: nr::Name) -> bool {
     project
         .usages
         .get(&name.module())
