@@ -22,7 +22,8 @@ compare = 1 A.< 2
 -- +       "col": 24,
 -- +       "end_line": 1,
 -- +       "end_col": 31,
--- +       "message": "Exported value `compare` is not used by any other module"
+-- +       "message": "Exported value `compare` is not used by any other module",
+-- +       "fixable": true
 -- +     },
 -- +     {
 -- +       "rule": "no-unused-exports",
@@ -31,10 +32,12 @@ compare = 1 A.< 2
 -- +       "col": 81,
 -- +       "end_line": 1,
 -- +       "end_col": 91,
--- +       "message": "Exported value `usedByBeam` is not used by any other module"
+-- +       "message": "Exported value `usedByBeam` is not used by any other module",
+-- +       "fixable": true
 -- +     }
 -- +   ],
 -- +   "suppressed": 0,
--- +   "stale_baseline_entries": 0
+-- +   "stale_baseline_entries": 0,
+-- +   "fixed": 0
 -- + }
 

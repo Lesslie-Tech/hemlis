@@ -21,7 +21,8 @@ bar z = z
 -- +       "col": 22,
 -- +       "end_line": 1,
 -- +       "end_col": 25,
--- +       "message": "Exported value `foo` is not used by any other module"
+-- +       "message": "Exported value `foo` is not used by any other module",
+-- +       "fixable": false
 -- +     },
 -- +     {
 -- +       "rule": "unqualified-do",
@@ -30,7 +31,8 @@ bar z = z
 -- +       "col": 9,
 -- +       "end_line": 4,
 -- +       "end_col": 11,
--- +       "message": "Unqualified `do` block; use a qualified `Module.do`"
+-- +       "message": "Unqualified `do` block; use a qualified `Module.do`",
+-- +       "fixable": false
 -- +     },
 -- +     {
 -- +       "rule": "no-unused-locals",
@@ -39,7 +41,8 @@ bar z = z
 -- +       "col": 7,
 -- +       "end_line": 6,
 -- +       "end_col": 13,
--- +       "message": "Local Term unused is unused"
+-- +       "message": "Local Term unused is unused",
+-- +       "fixable": false
 -- +     },
 -- +     {
 -- +       "rule": "unqualified-pure",
@@ -48,7 +51,8 @@ bar z = z
 -- +       "col": 3,
 -- +       "end_line": 7,
 -- +       "end_col": 7,
--- +       "message": "Unqualified `pure`; use a qualified `Applicative.pure`"
+-- +       "message": "Unqualified `pure`; use a qualified `Applicative.pure`",
+-- +       "fixable": false
 -- +     },
 -- +     {
 -- +       "rule": "no-unused-definitions",
@@ -57,10 +61,12 @@ bar z = z
 -- +       "col": 1,
 -- +       "end_line": 9,
 -- +       "end_col": 4,
--- +       "message": "Definition Term bar is unused"
+-- +       "message": "Definition Term bar is unused",
+-- +       "fixable": false
 -- +     }
 -- +   ],
 -- +   "suppressed": 0,
--- +   "stale_baseline_entries": 0
+-- +   "stale_baseline_entries": 0,
+-- +   "fixed": 0
 -- + }
 

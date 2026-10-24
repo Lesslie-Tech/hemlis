@@ -80,7 +80,9 @@ pub fn check(
             continue;
         }
         let Some(exports) = project.exports.get(&m.me) else { continue };
-        let export_spans = export_spans(export_list);
+        let entries = export_entries(export_list);
+        let entry_index: BTreeMap<(nr::Scope, ast::Ud), usize> =
+            entries.iter().enumerate().map(|(i, e)| ((e.scope, e.ud), i)).collect();
 
         let mut seen = BTreeSet::new();
         for export in exports.iter() {
@@ -115,15 +117,29 @@ pub fn check(
                 continue;
             }
 
-            let span = export_spans
-                .get(&(name.scope(), name.name()))
-                .copied()
+            let entry = entry_index.get(&(name.scope(), name.name())).map(|&i| (i, &entries[i]));
+            let span = entry
+                .map(|(_, e)| e.span)
                 .or_else(|| project.defines.get(&m.me)?.get(&name).map(|d| d.name))
                 .unwrap_or(ast::Span::Known(m.fi, (0, 0), (0, 0)));
+            // Drop the entry together with the separator that joins it to its neighbour. A sole
+            // entry stays: an empty export list is a different decision.
+            let fix = entry.and_then(|(i, e)| {
+                if !e.fixable || entries.len() < 2 {
+                    return None;
+                }
+                let (lo, hi) = if i > 0 {
+                    (entries[i - 1].span.hi(), e.span.hi())
+                } else {
+                    (e.span.lo(), entries[i + 1].span.lo())
+                };
+                Some(vec![(ast::Span::Known(m.fi, lo, hi), String::new())])
+            });
             findings.push(Finding {
                 rule: NAME,
                 span,
                 message: format!("Exported {} `{}` is not used by any other module", kind, text),
+                fix,
             });
         }
     }
@@ -143,20 +159,31 @@ fn referenced_elsewhere(project: &ProjectData, m: &ParsedModule, name: nr::Name)
         })
 }
 
-fn export_spans(list: &[ast::Export]) -> BTreeMap<(nr::Scope, ast::Ud), ast::Span> {
-    let mut out = BTreeMap::new();
-    for e in list {
-        let (scope, s) = match e {
-            ast::Export::Value(n) => (nr::Scope::Term, n.0),
-            ast::Export::Symbol(s) => (nr::Scope::Term, s.0),
-            ast::Export::Typ(p) | ast::Export::TypDat(p, _) => (nr::Scope::Type, p.0),
-            ast::Export::TypSymbol(s) => (nr::Scope::Type, s.0),
-            ast::Export::Class(p) => (nr::Scope::Class, p.0),
-            ast::Export::Module(_) => continue,
-        };
-        out.insert((scope, s.0), s.1);
-    }
-    out
+struct Entry {
+    scope: nr::Scope,
+    ud: ast::Ud,
+    span: ast::Span,
+    /// The span covers the whole entry, so deleting it is safe. Not the case for `T(..)`, whose
+    /// constructor list has no span of its own, nor for `module X`.
+    fixable: bool,
+}
+
+/// The export list in source order.
+fn export_entries(list: &[ast::Export]) -> Vec<Entry> {
+    list.iter()
+        .map(|e| {
+            let (scope, s, fixable) = match e {
+                ast::Export::Value(n) => (nr::Scope::Term, n.0, true),
+                ast::Export::Symbol(s) => (nr::Scope::Term, s.0, true),
+                ast::Export::Typ(p) => (nr::Scope::Type, p.0, true),
+                ast::Export::TypDat(p, _) => (nr::Scope::Type, p.0, false),
+                ast::Export::TypSymbol(s) => (nr::Scope::Type, s.0, true),
+                ast::Export::Class(p) => (nr::Scope::Class, p.0, true),
+                ast::Export::Module(m) => (nr::Scope::Module, m.0, false),
+            };
+            Entry { scope, ud: s.0, span: s.1, fixable }
+        })
+        .collect()
 }
 
 /// `*` matches any run of characters; everything else is literal.

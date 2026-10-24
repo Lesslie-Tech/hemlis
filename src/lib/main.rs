@@ -57,7 +57,8 @@ fn main() {
                 "-v" | "--version" => flags.insert(Flag::Version),
                 "-W" | "--warnings" => flags.insert(Flag::Warnings),
                 // `hemlis --review [--config F] [--rule R]... [--module-rules-only] [--json]
-                //                 [--beam-edges F] [--update-baseline] [--list-rules] [files...]`
+                //                 [--beam-edges F] [--update-baseline] [--no-baseline] [--fix]
+                //                 [--list-rules] [files...]`
                 "--review" => flags.insert(Flag::Review),
                 "--config" => {
                     pending = Some(Pending::Config);
@@ -81,6 +82,14 @@ fn main() {
                 }
                 "--update-baseline" => {
                     review.update_baseline = true;
+                    true
+                }
+                "--no-baseline" => {
+                    review.no_baseline = true;
+                    true
+                }
+                "--fix" => {
+                    review.fix = true;
                     true
                 }
                 "--list-rules" => {

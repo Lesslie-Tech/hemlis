@@ -8,17 +8,17 @@ pub mod roots;
 pub mod suppress;
 pub mod unused_exports;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::{env, io};
+use std::{env, fs, io};
 
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 
 use crate::project::{self, ProjectData};
 use crate::style::rule_names as style_rules;
-use crate::{ast, nr, style};
+use crate::{ast, nr, source, style};
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FINDINGS: i32 = 1;
@@ -164,15 +164,24 @@ pub struct ReviewOptions {
     pub module_rules_only: bool,
     pub json: bool,
     pub update_baseline: bool,
+    /// Report everything, ignoring `review/suppressed/`.
+    pub no_baseline: bool,
+    /// Apply the fixes of reported findings and report only what could not be fixed.
+    pub fix: bool,
     pub list_rules: bool,
     /// Path to an xref edge file; overrides the rule's `beam-edges` option.
     pub beam_edges: Option<String>,
 }
 
+/// A source edit: replace `span` with the text (empty text deletes).
+pub type Edit = (ast::Span, String);
+
 pub struct Finding {
     pub rule: &'static str,
     pub span: ast::Span,
     pub message: String,
+    /// Edits that resolve the finding, when the rule has a safe one.
+    pub fix: Option<Vec<Edit>>,
 }
 
 /// A finding with the file it belongs to: `path` as given on the command line, `rel` relative to
@@ -192,6 +201,7 @@ struct JsonFinding<'a> {
     end_line: usize,
     end_col: usize,
     message: &'a str,
+    fixable: bool,
 }
 
 #[derive(Serialize)]
@@ -199,6 +209,7 @@ struct JsonReport<'a> {
     findings: Vec<JsonFinding<'a>>,
     suppressed: usize,
     stale_baseline_entries: usize,
+    fixed: usize,
 }
 
 fn nr_rule(e: &nr::NRerrors) -> Option<&'static str> {
@@ -231,7 +242,7 @@ pub fn module_findings(project: &ProjectData) -> Vec<Finding> {
         .filter_map(|e| {
             let rule = nr_rule(e)?;
             let (span, message) = crate::nrerror_as_warning(e, &project.names)?;
-            Some(Finding { rule, span, message })
+            Some(Finding { rule, span, message, fix: None })
         })
         .collect();
 
@@ -246,6 +257,7 @@ pub fn module_findings(project: &ProjectData) -> Vec<Finding> {
                         rule: sd.rule,
                         span: sd.cursor_span,
                         message: message.to_string(),
+                        fix: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -279,34 +291,48 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
         }
     }
 
-    let files = if files.is_empty() {
+    let selected = |rule: &str| {
+        cfg.enabled(rule) && (opts.rules.is_empty() || opts.rules.iter().any(|r| r == rule))
+    };
+    let project_rules = !opts.module_rules_only && selected(unused_exports::NAME);
+
+    // Project rules need the whole configured project even when the command line names a few
+    // files; those files then only filter the report.
+    let report_only: Option<BTreeSet<PathBuf>> =
+        (!files.is_empty()).then(|| files.iter().map(|f| canonical(f)).collect());
+    if report_only.is_some() && opts.update_baseline {
+        eprintln!("ERR: --update-baseline covers the whole project; do not pass files");
+        return EXIT_ERROR;
+    }
+    let analysis_files = if files.is_empty() || project_rules {
         match config::expand_files(&cfg, &cfg_dir) {
-            Ok(files) => files,
+            Ok(mut configured) => {
+                let known: BTreeSet<PathBuf> = configured.iter().map(|f| canonical(f)).collect();
+                configured.extend(files.iter().filter(|f| !known.contains(&canonical(f))).cloned());
+                configured
+            }
             Err(e) => {
                 eprintln!("ERR: {}", e);
                 return EXIT_ERROR;
             }
         }
     } else {
-        files
+        files.clone()
     };
-    if files.is_empty() {
+    if analysis_files.is_empty() {
         eprintln!("ERR: no files to review");
         return EXIT_ERROR;
     }
 
-    let project = project::resolve_project(&files);
+    let project = project::resolve_project(&analysis_files);
     let mut failed = false;
     for (path, e) in project.read_errors.iter() {
         eprintln!("ERR: could not read '{}': {:?}", path, e);
         failed = true;
     }
 
-    let selected = |rule: &str| {
-        cfg.enabled(rule) && (opts.rules.is_empty() || opts.rules.iter().any(|r| r == rule))
-    };
     let mut findings = module_findings(&project);
-    if !opts.module_rules_only && selected(unused_exports::NAME) {
+    if project_rules {
         let options: unused_exports::Options = match cfg.options(unused_exports::NAME) {
             Some(map) => match serde_json::from_value(serde_json::Value::Object(map.clone())) {
                 Ok(options) => options,
@@ -329,6 +355,15 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
         findings.extend(outcome.findings);
     }
     findings.retain(|f| selected(f.rule));
+    if let Some(report_only) = &report_only {
+        let reported_fis: BTreeSet<ast::Fi> = project
+            .modules
+            .iter()
+            .filter(|m| report_only.contains(&canonical(&m.path)))
+            .map(|m| m.fi)
+            .collect();
+        findings.retain(|f| f.span.fi().is_some_and(|fi| reported_fis.contains(&fi)));
+    }
 
     let mut located: Vec<Located> = findings
         .into_iter()
@@ -364,19 +399,46 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
         };
     }
 
-    let baseline = match suppress::Baseline::load(&baseline_dir) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("ERR: {}", e);
-            return EXIT_ERROR;
+    let baseline = if opts.no_baseline {
+        suppress::Baseline::default()
+    } else {
+        match suppress::Baseline::load(&baseline_dir) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("ERR: {}", e);
+                return EXIT_ERROR;
+            }
         }
     };
     let applied = baseline.apply(&keys);
-    let reported: Vec<&Located> = located
+    let mut reported: Vec<&Located> = located
         .iter()
         .zip(applied.reported.iter())
         .filter_map(|(l, &r)| r.then_some(l))
         .collect();
+
+    let mut fixed = 0;
+    if opts.fix {
+        let mut by_file: BTreeMap<&str, Vec<&Edit>> = BTreeMap::new();
+        let mut unfixed = Vec::new();
+        for l in reported {
+            match &l.finding.fix {
+                Some(edits) => {
+                    by_file.entry(l.path.as_str()).or_default().extend(edits.iter());
+                    fixed += 1;
+                }
+                None => unfixed.push(l),
+            }
+        }
+        reported = unfixed;
+        match apply_fixes(&project, by_file) {
+            Ok(files_written) => eprintln!("applied {} fixes in {} files", fixed, files_written),
+            Err(e) => {
+                eprintln!("ERR: {}", e);
+                return EXIT_ERROR;
+            }
+        }
+    }
 
     if opts.json {
         let report = JsonReport {
@@ -390,10 +452,12 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
                     end_line: l.finding.span.hi().0 + 1,
                     end_col: l.finding.span.hi().1 + 1,
                     message: &l.finding.message,
+                    fixable: l.finding.fix.is_some(),
                 })
                 .collect(),
             suppressed: applied.suppressed,
             stale_baseline_entries: applied.stale,
+            fixed,
         };
         println!("{}", serde_json::to_string_pretty(&report).expect("report is serialisable"));
     } else {
@@ -438,11 +502,74 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
     }
 }
 
-/// Findings grouped by rule, for callers that want to report per rule.
-pub fn by_rule(findings: &[Located]) -> BTreeMap<&'static str, Vec<&Located>> {
-    let mut out: BTreeMap<&'static str, Vec<&Located>> = BTreeMap::new();
-    for f in findings {
-        out.entry(f.finding.rule).or_default().push(f);
+fn canonical(path: &str) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// Applies edits per file, last-to-first so earlier offsets stay valid. An edit overlapping one
+/// already applied is skipped; the next run picks it up.
+fn apply_fixes(project: &ProjectData, by_file: BTreeMap<&str, Vec<&Edit>>) -> Result<usize, String> {
+    let mut written = 0;
+    for (path, edits) in by_file {
+        let m = project
+            .modules
+            .iter()
+            .find(|m| m.path == path)
+            .ok_or_else(|| format!("no parsed source for '{}'", path))?;
+        let mut ranges: Vec<(usize, usize, &str)> = edits
+            .iter()
+            .filter_map(|(span, text)| {
+                source::span_to_byte_range(&m.src, span).map(|(lo, hi)| (lo, hi, text.as_str()))
+            })
+            .collect();
+        ranges.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut out = m.src.clone();
+        let mut last_lo = usize::MAX;
+        for (lo, hi, text) in ranges {
+            if hi > last_lo {
+                continue;
+            }
+            out.replace_range(lo..hi, text);
+            last_lo = lo;
+        }
+        fs::write(path, out).map_err(|e| format!("could not write '{}': {}", path, e))?;
+        written += 1;
     }
-    out
+    Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fix_removes_unused_export_entries() {
+        let dir = env::temp_dir().join(format!("hemlis-review-fix-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("hemlis-review.json"), r#"{ "files": ["*.purs"] }"#).unwrap();
+        fs::write(
+            dir.join("A.purs"),
+            "module A (foo, bar, baz) where\n\nfoo :: Int\nfoo = 1\n\nbar :: Int\nbar = 2\n\nbaz :: Int\nbaz = 3\n",
+        )
+        .unwrap();
+        fs::write(dir.join("B.purs"), "module B (main) where\n\nimport A as A\n\nmain :: Int\nmain = A.foo\n").unwrap();
+
+        let code = run_cli(
+            ReviewOptions {
+                config: Some(dir.join("hemlis-review.json").to_string_lossy().into_owned()),
+                rules: vec![unused_exports::NAME.to_string()],
+                fix: true,
+                no_baseline: true,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let a = fs::read_to_string(dir.join("A.purs")).unwrap();
+        assert!(a.starts_with("module A (foo) where\n"), "{}", a);
+        // B's only export is `main`; a sole entry has no fix, so it is still reported.
+        assert_eq!(code, EXIT_FINDINGS);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
