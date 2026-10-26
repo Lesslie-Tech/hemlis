@@ -12,6 +12,8 @@ pub mod lexer;
 pub mod nr;
 pub mod parser;
 pub mod print;
+pub mod project;
+pub mod review;
 pub mod source;
 pub mod style;
 
@@ -140,118 +142,46 @@ pub enum Flag {
 }
 
 pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
-    let (exports, prim, names) = build_builtins();
-
-    let deps: Vec<_> = files
-        .iter()
-        .enumerate()
-        .filter_map(|(i, arg)| match fs::read_to_string(arg.clone()) {
-            Err(e) => {
-                panic!("ERR: {} {:?}", arg, e);
-            }
-            Ok(src) => {
-                let (l, _comments) = lexer::lex(&src, ast::Fi(i));
-                let mut p = parser::P::new(&l, &names);
-                if let Some(m) = parser::module(&mut p) {
-                    let header = m.0.clone()?;
-                    let me = header.0 .0 .0;
-                    Some((
-                        m,
-                        me,
-                        header
-                            .2
-                            .iter()
-                            .map(|x| x.from.0 .0)
-                            .collect::<BTreeSet<_>>(),
-                    ))
-                } else {
-                    None
-                }
-            }
-        })
-        .collect();
-
-    let names_: BTreeMap<_, _> = names
-        .iter()
-        .map(|k| (*k.key(), k.value().clone()))
-        .collect();
-    let mut done: BTreeSet<_> = exports.iter().map(|k| *k.key()).collect();
-    let mut imports = BTreeMap::new();
-    let mut usages = BTreeMap::new();
-    let mut resolved = BTreeMap::new();
-
-    let mut errors = Vec::new();
-    loop {
-        let todo: Vec<_> = deps
-            .iter()
-            .filter(|(_, me, deps)| (!done.contains(me)) && deps.is_subset(&done))
-            .collect();
-        // println!("DOING: {:?}", todo.iter().map(|(_, me, _)| names_.get(me).unwrap()).collect::<Vec<_>>());
-        if todo.is_empty() {
-            if let Some((m, x)) = deps
-                .iter()
-                .map(|(_, me, deps)| (me, deps.difference(&done).cloned().collect::<Vec<_>>()))
-                .find(|(_, aa)| !aa.is_empty())
-            {
-                println!(
-                    "DEADLOCKED! {:?} {:?}",
-                    names_.get(m).unwrap(),
-                    x.iter().map(|x| names_.get(x).unwrap()).collect::<Vec<_>>()
-                );
-            }
-            break;
-        }
-        for (m, me, _) in todo.iter() {
-            let mut n = nr::N::new(*me, &exports);
-            nr::resolve_names(&mut n, prim, m);
-            errors.append(&mut n.errors);
-            exports.insert(*me, n.exports);
-            imports.insert(*me, n.imports);
-            for (name, x) in n.global_usages.iter() {
-                for (span, sort) in x.iter() {
-                    usages
-                        .entry(name.module())
-                        .or_insert(BTreeMap::new())
-                        .entry(*name)
-                        .or_insert(BTreeSet::new())
-                        .insert((*span, *sort));
-                }
-            }
-            usages.insert(*me, n.references);
-            resolved.insert(*me, n.resolved);
-        }
-        done.append(&mut todo.into_iter().map(|(_, me, _)| *me).collect());
+    let project = project::resolve_project(&files);
+    if let Some((path, e)) = project.read_errors.first() {
+        panic!("ERR: {} {:?}", path, e);
     }
-    for e in errors.iter() {
+    if let Some((m, missing)) = project.deadlocked.first() {
+        println!(
+            "DEADLOCKED! {:?} {:?}",
+            project.name(*m),
+            missing.iter().map(|x| project.name(*x)).collect::<Vec<_>>()
+        );
+    }
+    for e in project.errors.iter() {
         println!("{:?}", e);
     }
 
-    for (m, name, _) in deps.iter() {
-        if flags.contains(&Flag::Tree) {
-            let name = names_.get(name).unwrap();
+    if flags.contains(&Flag::Tree) {
+        for m in project.modules.iter() {
             use std::io::BufWriter;
             let mut buf = BufWriter::new(Vec::new());
-            m.show(0, &mut buf).unwrap();
+            m.module.show(0, &mut buf).unwrap();
             let inner =
                 String::from_utf8(buf.into_inner().map_err(|x| format!("{:?}", x)).unwrap());
-            println!("TREE: {}\n{}", name, inner.unwrap());
+            println!("TREE: {}\n{}", project.name(m.me), inner.unwrap());
         }
     }
 
     if flags.contains(&Flag::Usages) {
         println!("NAMES");
-        for (name, uses) in usages.iter() {
-            let name = names_.get(name).unwrap();
-            if name.starts_with("Prim") {
+        for (module, uses) in project.usages.iter() {
+            let module_name = project.name(*module);
+            if module_name.starts_with("Prim") {
                 continue;
             }
-            println!("> {}", name);
+            println!("> {}", module_name);
             for (nr::Name(s, m, n, v), spans) in uses.iter() {
                 println!(
                     "   {:?} {} {} {:?}: {:?}",
                     s,
-                    names_.get(m).unwrap(),
-                    names_.get(n).unwrap(),
+                    project.name(*m),
+                    project.name(*n),
                     v,
                     spans.iter().map(|s| format!("{:?}", s)).collect::<Vec<_>>()
                 );
@@ -261,20 +191,20 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
 
     if flags.contains(&Flag::Resolved) {
         println!("RESOLVED");
-        for (name, resolved) in resolved.iter() {
-            let name = names_.get(name).unwrap();
-            if name.starts_with("Prim") {
+        for (module, resolved) in project.resolved.iter() {
+            let module_name = project.name(*module);
+            if module_name.starts_with("Prim") {
                 continue;
             }
-            println!("> {}", name);
+            println!("> {}", module_name);
             for ((lo, hi), nr::Name(s, m, n, v)) in resolved.iter() {
                 println!(
                     "   {:?}->{:?}: {:?} {} {} {:?}",
                     lo,
                     hi,
                     s,
-                    names_.get(m).unwrap(),
-                    names_.get(n).unwrap(),
+                    project.name(*m),
+                    project.name(*n),
                     v
                 );
             }
@@ -283,36 +213,31 @@ pub fn parse_and_resolve_names(flags: BTreeSet<Flag>, files: Vec<String>) {
 
     if flags.contains(&Flag::Exports) {
         println!("EXPORTS");
-        let mut ee = exports
-            .iter()
-            .map(|a| (*a.key(), a.value().clone()))
-            .collect::<Vec<_>>();
-        ee.sort();
-        for (k, v) in ee.iter() {
-            let name = names_.get(k).unwrap();
+        for (k, v) in project.exports.iter() {
+            let name = project.name(*k);
             if name.starts_with("Prim") {
                 continue;
             }
             println!("> {}", name);
             for v in v.iter() {
-                println!("   {}", v.show(&|u| names_.get(u).unwrap().clone()));
+                println!("   {}", v.show(&|u| project.name(*u).to_string()));
             }
         }
     }
 
     if flags.contains(&Flag::Imports) {
         println!("IMPORTS");
-        for (k, v) in imports.iter() {
-            let name = names_.get(k).unwrap();
+        for (k, v) in project.imports.iter() {
+            let name = project.name(*k);
             if name.starts_with("Prim") {
                 continue;
             }
             println!("> {}", name);
-            for v in v.values() {
+            for (_, v) in v.iter() {
                 for (k, v) in v.iter() {
-                    println!("   import: {}", names_.get(k).unwrap().clone());
+                    println!("   import: {}", project.name(*k));
                     for v in v.iter() {
-                        println!("     * {}", v.show(&|u| names_.get(u).unwrap().clone()));
+                        println!("     * {}", v.show(&|u| project.name(*u).to_string()));
                     }
                 }
             }
@@ -415,100 +340,23 @@ fn style_warning_message(action: &style::StyleAction) -> Option<&str> {
 /// `path:line:col: message` per warning, sorted by file then position, and
 /// exits with status 1 if any warnings were found (0 otherwise).
 pub fn list_warnings(files: Vec<String>) {
-    use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-    let (exports, prim, names) = build_builtins();
-
-    struct ParsedFile {
-        arg: String,
-        fi: ast::Fi,
-        src: String,
-        module: ast::Module,
-        me: ast::Ud,
-        deps: BTreeSet<ast::Ud>,
+    let project = project::resolve_project(&files);
+    for (path, e) in project.read_errors.iter() {
+        eprintln!("ERR: could not read '{}': {:?}", path, e);
     }
 
-    enum ParseOutcome {
-        Ok(ParsedFile),
-        ReadError(io::Error),
-        Skipped,
-    }
-
-    // Reading + lexing + parsing each file is independent, so it runs in
-    // parallel (one rayon task per file, same pattern as `check_format` and
-    // `process_one_file`); only the error reporting below stays sequential
-    // so it prints in file order.
-    let outcomes: Vec<ParseOutcome> = files
-        .par_iter()
-        .enumerate()
-        .map(|(i, arg)| match fs::read_to_string(arg) {
-            Err(e) => ParseOutcome::ReadError(e),
-            Ok(src) => {
-                let fi = ast::Fi(i);
-                let (l, _comments) = lexer::lex(&src, fi);
-                let mut p = parser::P::new(&l, &names);
-                let parsed = parser::module(&mut p).and_then(|m| {
-                    let header = m.0.clone()?;
-                    let me = header.0 .0 .0;
-                    let deps = header.2.iter().map(|x| x.from.0 .0).collect::<BTreeSet<_>>();
-                    Some(ParsedFile { arg: arg.clone(), fi, src, module: m, me, deps })
-                });
-                parsed.map_or(ParseOutcome::Skipped, ParseOutcome::Ok)
-            }
-        })
-        .collect();
-
-    let mut parsed = Vec::new();
-    for (arg, outcome) in files.iter().zip(outcomes) {
-        match outcome {
-            ParseOutcome::Ok(f) => parsed.push(f),
-            ParseOutcome::ReadError(e) => eprintln!("ERR: could not read '{}': {:?}", arg, e),
-            ParseOutcome::Skipped => {}
-        }
-    }
-
-    let names_: BTreeMap<_, _> = names
+    let mut warnings: Vec<(ast::Fi, ast::Pos, String)> = project
+        .errors
         .iter()
-        .map(|k| (*k.key(), k.value().clone()))
-        .collect();
-    let mut done: BTreeSet<_> = exports.iter().map(|k| *k.key()).collect();
-    let mut errors = Vec::new();
-    let mut remaining: Vec<&ParsedFile> = parsed.iter().collect();
-    loop {
-        let (todo, rest): (Vec<_>, Vec<_>) = remaining
-            .into_iter()
-            .partition(|f| !done.contains(&f.me) && f.deps.is_subset(&done));
-        if todo.is_empty() {
-            break;
-        }
-        // Every file in `todo` only depends on modules already in `done`,
-        // never on a sibling in this same wave, so the wave resolves in
-        // parallel; only the global `exports`/`errors` merge afterward is
-        // sequential.
-        let wave: Vec<(ast::Ud, Vec<nr::NRerrors>, Vec<nr::Export>)> = todo
-            .par_iter()
-            .map(|f| {
-                let mut n = nr::N::new(f.me, &exports);
-                nr::resolve_names(&mut n, prim, &f.module);
-                (f.me, n.errors, n.exports)
-            })
-            .collect();
-        for (me, mut e, exp) in wave {
-            errors.append(&mut e);
-            exports.insert(me, exp);
-        }
-        done.append(&mut todo.iter().map(|f| f.me).collect());
-        remaining = rest;
-    }
-
-    let mut warnings: Vec<(ast::Fi, ast::Pos, String)> = errors
-        .iter()
-        .filter_map(|e| nrerror_as_warning(e, &names_))
+        .filter_map(|e| nrerror_as_warning(e, &project.names))
         .filter_map(|(span, message)| span.fi().map(|fi| (fi, span.lo(), message)))
         .collect();
 
-    // Style-checking each already-parsed module is independent too.
-    let style_warnings: Vec<(ast::Fi, ast::Pos, String)> = parsed
+    // Style-checking each already-parsed module is independent, so it runs in parallel.
+    let style_warnings: Vec<(ast::Fi, ast::Pos, String)> = project
+        .modules
         .par_iter()
         .flat_map(|f| {
             style::check_module(&f.module, &f.src, f.fi)
@@ -534,9 +382,8 @@ pub fn list_warnings(files: Vec<String>) {
         ("", "", "")
     };
 
-    let fi_to_arg: BTreeMap<usize, &str> = parsed.iter().map(|f| (f.fi.0, f.arg.as_str())).collect();
     for (fi, (line, col), message) in warnings.iter() {
-        let path = fi_to_arg.get(&fi.0).copied().unwrap_or("?");
+        let path = project.path_of(*fi).unwrap_or("?");
         println!(
             "{bold}{}:{}:{}:{reset} {yellow}{}{reset}",
             path,

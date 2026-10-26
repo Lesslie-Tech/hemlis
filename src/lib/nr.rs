@@ -203,6 +203,10 @@ pub struct N<'s> {
 
     // NOTE[et]: Do not like this flag - at all!
     pub self_is_exported: bool,
+
+    // Operator -> the name it aliases (`infix 4 lessThan as <` gives `<` -> `lessThan`), so a use
+    // of the operator can count as a use of the target.
+    pub operator_aliases: BTreeMap<Name, Name>,
 }
 
 impl<'s> N<'s> {
@@ -225,6 +229,7 @@ impl<'s> N<'s> {
             locals: Vec::new(),
 
             self_is_exported: false,
+            operator_aliases: BTreeMap::new(),
         }
     }
 
@@ -499,6 +504,14 @@ impl<'s> N<'s> {
     #[instrument(skip(self))]
     fn add_usage(&mut self, name: Name, word: ast::Span, sort: Sort) {
         self.resolved.insert((word.lo(), word.hi()), name);
+        self.record_usage(name, word, sort);
+    }
+
+    fn resolved_at(&self, word: ast::Span) -> Option<Name> {
+        self.resolved.get(&(word.lo(), word.hi())).copied()
+    }
+
+    fn record_usage(&mut self, name: Name, word: ast::Span, sort: Sort) {
         if name.1 == self.me {
             self.references
                 .entry(name)
@@ -509,6 +522,17 @@ impl<'s> N<'s> {
                 .entry(name)
                 .or_default()
                 .insert((word, sort));
+        }
+    }
+
+    // `do`/`ado` desugar to `bind`/`discard` and `apply`/`map`/`pure` from the qualifying module
+    // (or whatever is in scope when unqualified). Count those as used, at the keyword, without
+    // reporting anything when they do not resolve; the compiler already does that.
+    fn use_desugared(&mut self, m: Option<ast::Ud>, name: &str, at: ast::Span) {
+        let matches = self.resolve_inner(Term, m, ast::Ud::new(name));
+        if matches.len() == 1 {
+            let found = *matches.iter().next().unwrap();
+            self.record_usage(found, at, Sort::Ref);
         }
     }
 
@@ -1126,13 +1150,30 @@ impl<'s> N<'s> {
             ast::Decl::Role(d, _) => {
                 self.resolve(Type, None, d.0);
             }
-            ast::Decl::Fixity(_, _, e, _) => {
+            ast::Decl::Fixity(_, _, e, o) => {
                 self.expr(e);
+                let target = match e {
+                    ast::Expr::Ident(q) => self.resolved_at(q.1 .0 .1),
+                    ast::Expr::Constructor(q) => self.resolved_at(q.1 .0 .1),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    let op = Name(Term, self.me, o.0 .0, Visibility::Public);
+                    self.operator_aliases.insert(op, target);
+                }
             }
-            ast::Decl::FixityTyp(_, _, t, _) => {
+            ast::Decl::FixityTyp(_, _, t, o) => {
                 let sf = self.push();
                 self.typ(t);
                 self.pop(sf, t.span());
+                let target = match t {
+                    ast::Typ::Constructor(q) => self.resolved_at(q.1 .0 .1),
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    let op = Name(Type, self.me, o.0 .0, Visibility::Public);
+                    self.operator_aliases.insert(op, target);
+                }
             }
             ast::Decl::Sig(_, t) => {
                 // This is handled accross definitions since signatures need to have their
@@ -1260,9 +1301,12 @@ impl<'s> N<'s> {
                 self.expr(tru);
                 self.expr(fal);
             }
-            ast::Expr::Do(qual, _, stmts) => {
+            ast::Expr::Do(qual, kw, stmts) => {
                 if let Some(qual) = qual {
                     self.resolve(Namespace, None, qual.0);
+                }
+                for name in ["bind", "discard"] {
+                    self.use_desugared(qual.map(|q| q.0 .0), name, *kw);
                 }
                 let sf = self.push();
                 for s in stmts.iter() {
@@ -1283,9 +1327,12 @@ impl<'s> N<'s> {
                 }
                 self.pop(sf, stmts.span());
             }
-            ast::Expr::Ado(qual, _, stmts, ret) => {
+            ast::Expr::Ado(qual, kw, stmts, ret) => {
                 if let Some(qual) = qual {
                     self.resolve(Namespace, None, qual.0);
+                }
+                for name in ["apply", "map", "pure"] {
+                    self.use_desugared(qual.map(|q| q.0 .0), name, *kw);
                 }
                 let sf = self.push();
                 // NOTE[et]: We define things from the expression, so the flow of
