@@ -20,7 +20,46 @@ enum Pending {
     BeamEdges,
 }
 
+const USAGE: &str = "\
+Usage: hemlis [OPTIONS] <FILES>...
+
+Options:
+  -f, --format          Format files and print the result
+  -w, --write           With -f: write formatted output back to the files
+  -c, --check           With -f: check formatting without changing files
+      --ignore-missing  With -f -c: ignore files that don't exist
+  -r, --resolve         Parse and resolve names across modules
+  -p, --parse           Parse only (default)
+  -W, --warnings        List style warnings for the files
+  -t, --tokens          Dump tokens
+  -a, --tree            Dump the syntax tree
+  -n, --names           Dump name usages
+  -e, --exports         Dump exports
+  -i, --imports         Dump imports
+  -x, --xx              Dump resolved names
+  -v, --version         Print version
+  -h, --help            Print this help
+
+Review (--review):
+      --review              Run the review rules on the files
+      --config <FILE>       Config file (default: hemlis-review.json in the current directory)
+      --rule <RULE>         Only run this rule (repeatable)
+      --module-rules-only   Only run the per-module rules
+      --json                Output findings as JSON
+      --beam-edges <FILE>   Xref edge file, overrides the rule's `beam-edges` option
+      --update-baseline     Update the baseline of suppressed findings
+      --no-baseline         Report everything, ignoring the baseline
+      --fix                 Apply fixes for reported findings and report the rest
+      --list-rules          List the available rules
+
+Use `-` as a file to read from stdin, and `--` to end option parsing.
+";
+
 fn main() {
+    if env::args().len() == 1 {
+        print!("{USAGE}");
+        return;
+    }
     let mut flags = BTreeSet::new();
     let mut lib_flags = BTreeSet::new();
     let mut review = ReviewOptions::default();
@@ -55,6 +94,10 @@ fn main() {
                 "-r" | "--resolve" => flags.insert(Flag::Resolve),
                 "-p" | "--parse" => flags.insert(Flag::Parse),
                 "-v" | "--version" => flags.insert(Flag::Version),
+                "-h" | "--help" => {
+                    print!("{USAGE}");
+                    return;
+                }
                 "-W" | "--warnings" => flags.insert(Flag::Warnings),
                 // `hemlis --review [--config F] [--rule R]... [--module-rules-only] [--json]
                 //                 [--beam-edges F] [--update-baseline] [--no-baseline] [--fix]

@@ -16,6 +16,7 @@ pub mod rule_names {
     pub const UNNECESSARY_TYPE_PARENS: &str = "unnecessary-type-parens";
     pub const IF_TO_CASE: &str = "if-to-case";
     pub const UNQUALIFIED_DO: &str = "unqualified-do";
+    pub const DO_LEADING_LET: &str = "do-leading-let";
     pub const UNQUALIFIED_PURE: &str = "unqualified-pure";
     pub const QUALIFIED_CONSTRUCTOR: &str = "qualified-constructor";
     pub const IMPORT_EXACT_NAME: &str = "import-exact-name";
@@ -745,6 +746,83 @@ fn rule_unqualified_do(expr: &ast::Expr, out: &mut Vec<StyleDiagnostic>) {
 }
 
 // ---------------------------------------------------------------------------
+// Leading `let` in a `do` block
+// ---------------------------------------------------------------------------
+
+/// Build the `let … in M.do …` replacement for a `do` whose first statement is
+/// a `let`. Returns `None` when there is nothing after the `let`, when the rest
+/// of the block starts on the `let`'s line, or when a comment sits between the
+/// `do` keyword, the `let` and the next statement (it would be lost).
+fn build_hoist_let_fix(do_expr: &ast::Expr, source: &str, starts: &[usize]) -> Option<String> {
+    let ast::Expr::Do(_, kw, stmts) = do_expr else {
+        return None;
+    };
+    let [first @ ast::DoStmt::Let(_, binds), rest @ ..] = stmts.as_slice() else {
+        return None;
+    };
+    let rest_first = rest.first()?;
+    let (do_span, let_span, rest_span) = (do_expr.span(), first.span(), rest_first.span());
+    let fi = do_span.fi()?;
+
+    let blank = |lo: ast::Pos, hi: ast::Pos| {
+        source_text_with_starts(source, starts, &Span::Known(fi, lo, hi))
+            .is_some_and(|t| t.trim().is_empty())
+    };
+    if !blank(kw.hi(), let_span.lo()) || !blank(let_span.hi(), rest_span.lo()) {
+        return None;
+    }
+    if rest_span.lo().0 == let_span.hi().0 {
+        return None;
+    }
+
+    let do_col = do_span.lo().1;
+    let header = source_text_with_starts(source, starts, &Span::Known(fi, do_span.lo(), kw.hi()))?;
+    let binds_span = binds.span();
+    let binds_text = source_text_with_starts(source, starts, &binds_span)?;
+    let binds_re = reindent_block(binds_text, binds_span.lo().1, do_col + 2);
+    let rest_text = source_text_with_starts(
+        source,
+        starts,
+        &Span::Known(fi, rest_span.lo(), do_span.hi()),
+    )?;
+    let indent = " ".repeat(do_col);
+    let rest_indent = " ".repeat(rest_span.lo().1);
+    Some(format!(
+        "let\n{binds_re}\n{indent}in {header}\n{rest_indent}{rest_text}"
+    ))
+}
+
+/// Warn when a `do` block starts with a `let`; the binding belongs before the
+/// block. Offers a hoisting fix when it can be done without losing comments.
+fn rule_do_leading_let(
+    expr: &ast::Expr,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    let ast::Expr::Do(_, _, stmts) = expr else {
+        return;
+    };
+    let Some(ast::DoStmt::Let(let_kw, _)) = stmts.first() else {
+        return;
+    };
+    let message = "Move the leading `let` before the `do` block".to_string();
+    let action = build_hoist_let_fix(expr, source, starts)
+        .map(|replacement| StyleAction::WarnAndFix {
+            message: message.clone(),
+            title: "Move leading `let` before `do`".into(),
+            replacement,
+        })
+        .unwrap_or(StyleAction::Warn { message });
+    out.push(StyleDiagnostic {
+        rule: rule_names::DO_LEADING_LET,
+        cursor_span: *let_kw,
+        expr_span: expr.span(),
+        action,
+    });
+}
+
+// ---------------------------------------------------------------------------
 // PAY-3688: warn on unqualified `pure`
 // ---------------------------------------------------------------------------
 
@@ -1110,6 +1188,7 @@ impl<'a> StyleChecker<'a> {
         );
         rule_if_to_case(expr, self.source, &self.line_starts, &mut self.diagnostics);
         rule_unqualified_do(expr, &mut self.diagnostics);
+        rule_do_leading_let(expr, self.source, &self.line_starts, &mut self.diagnostics);
         if !self.module_defines_pure {
             rule_unqualified_pure(expr, &mut self.diagnostics);
         }

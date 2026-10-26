@@ -90,6 +90,11 @@ pub const RULES: &[RuleInfo] = &[
         description: "`do`/`ado` without a monad qualifier",
     },
     RuleInfo {
+        name: style_rules::DO_LEADING_LET,
+        kind: RuleKind::Module,
+        description: "`do` block that starts with a `let` (fix: move it before the `do`)",
+    },
+    RuleInfo {
         name: style_rules::UNQUALIFIED_PURE,
         kind: RuleKind::Module,
         description: "Bare `pure`",

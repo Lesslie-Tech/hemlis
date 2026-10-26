@@ -25,6 +25,16 @@ bar z = z
 -- +       "fixable": false
 -- +     },
 -- +     {
+-- +       "rule": "do-leading-let",
+-- +       "path": "tests/golden/review/review_json.purs",
+-- +       "line": 5,
+-- +       "col": 3,
+-- +       "end_line": 5,
+-- +       "end_col": 6,
+-- +       "message": "Move the leading `let` before the `do` block",
+-- +       "fixable": false
+-- +     },
+-- +     {
 -- +       "rule": "no-unused-locals",
 -- +       "path": "tests/golden/review/review_json.purs",
 -- +       "line": 6,

@@ -1873,6 +1873,58 @@ mod tests {
         .await;
     }
 
+    // --- Leading `let` in a `do` block ---
+
+    #[tokio::test]
+    async fn style_warn_do_leading_let() {
+        assert_warning(indoc! {"
+            module Test where
+
+            f = M.do
+              let x = 1
+              ~~~ Move the leading `let` before the `do` block
+              pure x
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_do_let_after_bind() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            f = M.do
+              y <- g
+              let x = 1
+              ~~~
+              pure x
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_fix_do_leading_let() {
+        assert_code_action(
+            indoc! {"
+                module Test where
+
+                f = M.do
+                  let x = 1
+                  ^ Move leading `let` before `do`
+                  pure x
+            "},
+            indoc! {"
+                module Test where
+
+                f = let
+                      x = 1
+                    in M.do
+                  pure x
+            "},
+        )
+        .await;
+    }
+
     // --- Warn on modules without an explicit export list ---
 
     #[tokio::test]
