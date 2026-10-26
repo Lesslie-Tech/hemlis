@@ -1,0 +1,2 @@
+Elixir.Foo unused_a@ps usedByBeam
+unused_a@ps unused_a@ps bar

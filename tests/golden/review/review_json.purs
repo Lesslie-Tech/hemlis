@@ -1,0 +1,72 @@
+module Review.Basic (foo) where
+
+foo :: Int -> Int
+foo x = do
+  let y = x
+  let unused = 1
+  pure y
+
+bar :: Int -> Int
+bar z = z
+
+-- + args: --review --json --config tests/review_fixtures/config.json
+-- + expected exit status: 1
+-- + expected stdout:
+-- + {
+-- +   "findings": [
+-- +     {
+-- +       "rule": "unqualified-do",
+-- +       "path": "tests/golden/review/review_json.purs",
+-- +       "line": 4,
+-- +       "col": 9,
+-- +       "end_line": 4,
+-- +       "end_col": 11,
+-- +       "message": "Unqualified `do` block; use a qualified `Module.do`",
+-- +       "fixable": false
+-- +     },
+-- +     {
+-- +       "rule": "do-leading-let",
+-- +       "path": "tests/golden/review/review_json.purs",
+-- +       "line": 5,
+-- +       "col": 3,
+-- +       "end_line": 5,
+-- +       "end_col": 6,
+-- +       "message": "Move the leading `let` before the `do` block",
+-- +       "fixable": false
+-- +     },
+-- +     {
+-- +       "rule": "no-unused-locals",
+-- +       "path": "tests/golden/review/review_json.purs",
+-- +       "line": 6,
+-- +       "col": 7,
+-- +       "end_line": 6,
+-- +       "end_col": 13,
+-- +       "message": "Local Term unused is unused",
+-- +       "fixable": false
+-- +     },
+-- +     {
+-- +       "rule": "unqualified-pure",
+-- +       "path": "tests/golden/review/review_json.purs",
+-- +       "line": 7,
+-- +       "col": 3,
+-- +       "end_line": 7,
+-- +       "end_col": 7,
+-- +       "message": "Unqualified `pure`; use a qualified `Applicative.pure`",
+-- +       "fixable": false
+-- +     },
+-- +     {
+-- +       "rule": "no-unused-definitions",
+-- +       "path": "tests/golden/review/review_json.purs",
+-- +       "line": 9,
+-- +       "col": 1,
+-- +       "end_line": 9,
+-- +       "end_col": 4,
+-- +       "message": "Definition Term bar is unused",
+-- +       "fixable": true
+-- +     }
+-- +   ],
+-- +   "suppressed": 0,
+-- +   "stale_baseline_entries": 0,
+-- +   "fixed": 0
+-- + }
+

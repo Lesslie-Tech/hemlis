@@ -174,7 +174,9 @@ impl Backend {
         let col = pos.character as usize;
         let col = match encoding_is_utf16() {
             // Blocking read - see the note in `pos_from_tup`.
-            true => LINE_INDEX.get(&fi).map_or(col, |ix| ix.byte_col(line, col)),
+            true => LINE_INDEX
+                .get(&fi)
+                .map_or(col, |ix| ix.byte_col(line, col)),
             false => col,
         };
         (line, col)
@@ -559,7 +561,10 @@ mod tests {
             rewrite_hover_tag_brackets("a list: [1, 2, 3]"),
             "a list: [1, 2, 3]"
         );
-        assert_eq!(rewrite_hover_tag_brackets("Foo[bar]"), "Foo[bar]");
+        assert_eq!(
+            rewrite_hover_tag_brackets("Foo[bar]"),
+            "Foo[bar]"
+        );
     }
 
     /// A plain top-level function with a real `name :: Type` signature should hover as:
@@ -4220,7 +4225,10 @@ impl LanguageServer for Backend {
     async fn did_save(&self, _: DidSaveTextDocumentParams) {}
 
     #[instrument(skip(self))]
-    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
         let fi = or_!(self.find_fi(params.text_document.uri), { return Ok(None) });
         // Clone the source so we can re-lex without holding the DashMap guard across
         // an await point. Re-lexing is cheap; a future optimisation could store the
@@ -4249,14 +4257,8 @@ impl LanguageServer for Backend {
         let end_line = source.lines().count() as u32;
         Ok(Some(vec![TextEdit {
             range: Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: end_line,
-                    character: 0,
-                },
+                start: Position { line: 0, character: 0 },
+                end: Position { line: end_line, character: 0 },
             },
             new_text: formatted,
         }]))
@@ -5193,11 +5195,7 @@ impl LanguageServer for Backend {
                                                 [(
                                                     uri.clone(),
                                                     vec![TextEdit::new(
-                                                        range(
-                                                            Some(fi),
-                                                            end_of_imports,
-                                                            end_of_imports,
-                                                        ),
+                                                        range(Some(fi), end_of_imports, end_of_imports),
                                                         format!(
                                                             "import {} ({})\n",
                                                             module_str, import_item
@@ -5232,11 +5230,7 @@ impl LanguageServer for Backend {
                                                     [(
                                                         uri.clone(),
                                                         vec![TextEdit::new(
-                                                            range(
-                                                                Some(fi),
-                                                                end_of_imports,
-                                                                end_of_imports,
-                                                            ),
+                                                            range(Some(fi), end_of_imports, end_of_imports),
                                                             format!(
                                                                 "import {} as {}\n",
                                                                 module_str, ns_str
@@ -6624,7 +6618,9 @@ impl Backend {
 
             for (name, pos, sort) in new.difference(&old) {
                 let mut e = self.references.entry(name.1).or_default();
-                e.entry(*name).or_default().insert((*pos, *sort));
+                e.entry(*name)
+                    .or_default()
+                    .insert((*pos, *sort));
             }
         }
 
@@ -6669,10 +6665,16 @@ impl Backend {
                 })
                 .collect::<BTreeSet<ast::Ud>>();
             for x in old_imports.difference(&new_imports) {
-                self.importers.entry(*x).or_default().remove(&me);
+                self.importers
+                    .entry(*x)
+                    .or_default()
+                    .remove(&me);
             }
             for x in new_imports.difference(&old_imports) {
-                self.importers.entry(*x).or_default().insert(me);
+                self.importers
+                    .entry(*x)
+                    .or_default()
+                    .insert(me);
             }
         }
         Some((exports_changed, n.me))
@@ -7000,10 +7002,7 @@ impl Backend {
         if let Some((_, old_imports)) = self.imports.remove(&me) {
             let old_imports = old_imports
                 .values()
-                .flat_map(|x| {
-                    x.iter()
-                        .flat_map(|x| x.to_names().into_iter().map(|x| x.module()))
-                })
+                .flat_map(|x| x.iter().flat_map(|x| x.to_names().into_iter().map(|x| x.module())))
                 .collect::<BTreeSet<ast::Ud>>();
             for x in old_imports {
                 self.importers.entry(x).or_default().remove(&me);

@@ -835,7 +835,7 @@ fn simple_typ_var_bindings<'t>(p: &mut P<'t>) -> Vec<TypVarBinding> {
     let vars = typ_var_bindings(p);
     for v in vars.iter() {
         if v.2 {
-            p.raise(Serror::NotSimpleTypeVarBinding(v.0.0.1))
+            p.raise(Serror::NotSimpleTypeVarBinding(v.0 .0 .1))
         }
     }
     vars
@@ -905,7 +905,7 @@ fn expr_op<'t>(p: &mut P<'t>) -> Option<ExprOp> {
 fn expr_fop(t: &ExprOp) -> Prec {
     use Prec::*;
     match t {
-        ExprOp::Op(qop) => op_fixity((qop.1).0.0),
+        ExprOp::Op(qop) => op_fixity((qop.1).0 .0),
         // Backtick infix and application both bind tighter than any
         // declared operator fixity - `op_fixity` tops out at real
         // PureScript precedence 10 (encoded as 11, see its own doc comment),
@@ -1906,12 +1906,7 @@ fn data_cnstr<'t>(p: &mut P<'t>) -> Option<(ProperName, Vec<Typ>)> {
     // Fields are atomic types (`typ_atom`, not the full `typ` parser), matching
     // PureScript's `dataCtor ::= properName atype*` - `C Foo Bar` is two fields,
     // an application as one field needs explicit parens (`C (Foo Bar)`).
-    let ts = many_until(
-        p,
-        "data cnstr",
-        |p| typ_atom(p, None),
-        next_is!(T::Pipe | T::LayTop),
-    );
+    let ts = many_until(p, "data cnstr", |p| typ_atom(p, None), next_is!(T::Pipe | T::LayTop));
     Some((n, ts))
 }
 
@@ -2058,10 +2053,23 @@ impl<'s> P<'s> {
 
     fn intern(&self, s: &'_ str) -> Ud {
         let ud = Ud::new(s);
-        // NOTE: This is faster than a normal insert and avoids all possibilities of deadlocks
-        // while maintaining data-correctness.
-        if let Some(dashmap::Entry::Vacant(e)) = self.names.try_entry(ud) {
-            e.insert(s.into());
+        // `try_entry` never blocks, so interning cannot deadlock when the caller already holds a
+        // guard on this shard (the LSP relies on that). It also fails under plain contention
+        // between parser threads, which would silently drop the name, so retry a bounded number
+        // of times before giving up.
+        for _ in 0..1000 {
+            match self.names.try_entry(ud) {
+                Some(dashmap::Entry::Vacant(e)) => {
+                    e.insert(s.into());
+                    return ud;
+                }
+                Some(dashmap::Entry::Occupied(e)) => {
+                    // A collision would silently merge two names; make it loud instead.
+                    assert_eq!(e.get(), s, "Ud hash collision between {:?} and {:?}", e.get(), s);
+                    return ud;
+                }
+                None => std::thread::yield_now(),
+            }
         }
         ud
     }
@@ -2076,10 +2084,7 @@ impl<'s> P<'s> {
     fn prev(&self) -> (Option<Token<'s>>, Span) {
         (
             self.tokens.get(self.i - 1).and_then(|x| x.0.ok()),
-            self.tokens
-                .get(self.i - 1)
-                .map(|x| x.1)
-                .unwrap_or(Span::Zero),
+            self.tokens.get(self.i - 1).map(|x| x.1).unwrap_or(Span::Zero),
         )
     }
 
@@ -2122,7 +2127,11 @@ impl<'s> P<'s> {
     }
 
     pub fn peekt(&self) -> Option<Token<'s>> {
-        if self.panic { None } else { self.peek_().0 }
+        if self.panic {
+            None
+        } else {
+            self.peek_().0
+        }
     }
 
     fn next(&mut self) -> (Option<Token<'s>>, Span) {
