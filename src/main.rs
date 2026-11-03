@@ -1949,6 +1949,52 @@ mod tests {
         .await;
     }
 
+    // --- Disallow partial constructor imports/exports ---
+
+    #[tokio::test]
+    async fn style_warn_partial_constructor_export() {
+        assert_warning(indoc! {"
+            module Test (T(A)) where
+                         ~~~~ Partial constructor export: use `T(..)` or `T`
+
+            data T = A | B
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_warn_partial_constructor_import() {
+        assert_warning(indoc! {"
+            module Test where
+
+            import Other (T(A, B))
+                          ~~~~~~~ Partial constructor import: use `T(..)` or `T`
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_full_or_no_constructors() {
+        assert_no_warning(indoc! {"
+            module Test (T(..), U) where
+                         ~~~~~
+
+            import Other (V(..), W, X(), Y)
+        "})
+        .await;
+    }
+
+    #[tokio::test]
+    async fn style_no_warn_partial_constructor_hiding() {
+        assert_no_warning(indoc! {"
+            module Test where
+
+            import Other hiding (T(A))
+                   ~~~~~
+        "})
+        .await;
+    }
+
     // --- Disallow whole-module re-exports outside Joe and Prelude ---
 
     #[tokio::test]

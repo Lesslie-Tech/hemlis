@@ -25,6 +25,7 @@ pub mod rule_names {
     pub const DOCSTRING_FORMAT: &str = "docstring-format";
     pub const NO_MODULE_REEXPORT: &str = "no-module-reexport";
     pub const MISSING_EXPORT_LIST: &str = "missing-export-list";
+    pub const PARTIAL_CONSTRUCTORS: &str = "partial-constructors";
 }
 
 /// What a style diagnostic does: warn, offer a fix, or both.
@@ -1619,6 +1620,44 @@ fn rule_missing_export_list(header: &ast::Header, out: &mut Vec<StyleDiagnostic>
     }
 }
 
+/// Warn on `T(A, B)` in the export list or an import list: a type's
+/// constructors are all-or-nothing, so write `T(..)` or `T`. `T()` and
+/// `hiding` lists are left alone. Warn-only: widening to `T(..)` changes what
+/// is exported or brought into scope.
+fn rule_partial_constructors(
+    header: &ast::Header,
+    source: &str,
+    starts: &[usize],
+    out: &mut Vec<StyleDiagnostic>,
+) {
+    let exports = header.1.iter().flatten().filter_map(|e| match e {
+        ast::Export::TypDat(t, ast::DataMember::Some(cs)) => Some((t, cs, "export")),
+        _ => None,
+    });
+    let imports = header
+        .2
+        .iter()
+        .flat_map(|imp| imp.names.iter().flatten())
+        .filter_map(|i| match i {
+            ast::Import::TypDat(_, t, ast::DataMember::Some(cs)) => Some((t, cs, "import")),
+            _ => None,
+        });
+    for (t, cs, what) in exports.chain(imports) {
+        // `T(A, B)`: the type name through the closing paren.
+        let Some(last) = cs.last() else { continue };
+        let span = t.0 .1.merge(last.0 .1.and_one_more_char());
+        let name = source_text_with_starts(source, starts, &t.0 .1).unwrap_or("T");
+        out.push(StyleDiagnostic {
+            rule: rule_names::PARTIAL_CONSTRUCTORS,
+            cursor_span: span,
+            expr_span: span,
+            action: StyleAction::Warn {
+                message: format!("Partial constructor {what}: use `{name}(..)` or `{name}`"),
+            },
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -1654,6 +1693,7 @@ pub fn check_module(module: &ast::Module, source: &str, fi: ast::Fi) -> Vec<Styl
             .collect();
         rule_no_module_reexport((header.0 .0).0, header, &mut checker.diagnostics);
         rule_missing_export_list(header, &mut checker.diagnostics);
+        rule_partial_constructors(header, source, &checker.line_starts, &mut checker.diagnostics);
         for imp in &header.2 {
             rule_import_exact_name(
                 imp,
