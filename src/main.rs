@@ -496,11 +496,35 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StyleMode, format_hover_snippet, rewrite_hover_tag_brackets, strip_hover_comment_prefix,
+        StyleMode, format_hover_snippet, log_enabled, rewrite_hover_tag_brackets,
+        strip_hover_comment_prefix,
     };
     use indoc::indoc;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{CodeActionOrCommand, Hover, HoverContents, TextEdit, Uri};
+    use tracing::Level;
+
+    #[test]
+    fn log_keeps_own_and_framework_events_at_any_level() {
+        assert!(log_enabled("hemlis_language_server", Level::TRACE));
+        assert!(log_enabled("hemlis_lib::nr", Level::INFO));
+        assert!(log_enabled("tower_lsp_server::service::layers", Level::INFO));
+    }
+
+    #[test]
+    fn log_drops_dependency_events_below_warn() {
+        // The targets `log`-bridged events are checked under, not "log".
+        assert!(!log_enabled("notify::inotify", Level::TRACE));
+        assert!(!log_enabled("mio::poll", Level::TRACE));
+        assert!(!log_enabled("notify::inotify", Level::INFO));
+        assert!(log_enabled("notify::inotify", Level::WARN));
+        assert!(log_enabled("mio::poll", Level::ERROR));
+    }
+
+    #[test]
+    fn log_drops_lsp_codec_traffic() {
+        assert!(!log_enabled("tower_lsp_server::codec", Level::TRACE));
+    }
 
     #[test]
     fn hover_snippet_dedents_short_definitions() {
@@ -7046,6 +7070,21 @@ fn pos_from_tup(fi: Option<ast::Fi>, (line, col): ast::Pos) -> Position {
     )
 }
 
+/// Whether an event from `target` at `level` is written to the log file. Only our own
+/// crates and the LSP framework are kept verbose; every other dependency (notify, mio, ...)
+/// is limited to warnings and errors.
+///
+/// This has to match on the real target. Events from dependencies using the `log` crate are
+/// re-emitted with target "log", but `tracing-log` asks the subscriber whether they are
+/// enabled using the record's own target (`notify::inotify`), and that answer is the one
+/// that sticks - so a check on "log" never matches and lets every TRACE event through.
+fn log_enabled(target: &str, level: tracing::Level) -> bool {
+    target != "tower_lsp_server::codec"
+        && (level <= tracing::Level::WARN
+            || target.starts_with("hemlis")
+            || target.starts_with("tower_lsp_server"))
+}
+
 /// Delete `hemlis-*.log` files older than a day, leaving logs of other running instances alone.
 fn remove_old_logs(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -7115,12 +7154,7 @@ async fn main() {
             .with_thread_ids(true)
             .with_level(true)
             .with_writer(log_file)
-            .with_filter(FilterFn::new(|x| {
-                // Dependencies using the `log` crate (notify, mio, ...) all arrive with
-                // target "log"; only keep their warnings and errors.
-                x.target() != "tower_lsp_server::codec"
-                    && (x.target() != "log" || *x.level() <= tracing::Level::WARN)
-            }));
+            .with_filter(FilterFn::new(|x| log_enabled(x.target(), *x.level())));
 
         std::panic::set_hook(Box::new(|panic| {
             if let Some(location) = panic.location() {
