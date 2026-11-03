@@ -496,11 +496,39 @@ fn try_find_comments_before(source: &str, line: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StyleMode, format_hover_snippet, rewrite_hover_tag_brackets, strip_hover_comment_prefix,
+        StyleMode, format_hover_snippet, log_enabled, rewrite_hover_tag_brackets,
+        strip_hover_comment_prefix,
     };
     use indoc::indoc;
     use std::str::FromStr;
     use tower_lsp_server::ls_types::{CodeActionOrCommand, Hover, HoverContents, TextEdit, Uri};
+    use tracing::Level;
+
+    #[test]
+    fn log_keeps_own_and_framework_events_up_to_the_ceiling() {
+        assert!(log_enabled("hemlis_language_server", Level::INFO, Level::INFO));
+        assert!(log_enabled("hemlis_lib::nr", Level::INFO, Level::INFO));
+        assert!(log_enabled("tower_lsp_server::service::layers", Level::INFO, Level::INFO));
+        assert!(!log_enabled("hemlis_language_server", Level::DEBUG, Level::INFO));
+        assert!(log_enabled("hemlis_language_server", Level::DEBUG, Level::DEBUG));
+        assert!(log_enabled("hemlis_language_server", Level::TRACE, Level::TRACE));
+    }
+
+    #[test]
+    fn log_drops_dependency_events_below_warn() {
+        // The targets `log`-bridged events are checked under, not "log" - and no
+        // ceiling lets them through.
+        assert!(!log_enabled("notify::inotify", Level::TRACE, Level::TRACE));
+        assert!(!log_enabled("mio::poll", Level::TRACE, Level::TRACE));
+        assert!(!log_enabled("notify::inotify", Level::INFO, Level::INFO));
+        assert!(log_enabled("notify::inotify", Level::WARN, Level::INFO));
+        assert!(log_enabled("mio::poll", Level::ERROR, Level::INFO));
+    }
+
+    #[test]
+    fn log_drops_lsp_codec_traffic() {
+        assert!(!log_enabled("tower_lsp_server::codec", Level::TRACE, Level::TRACE));
+    }
 
     #[test]
     fn hover_snippet_dedents_short_definitions() {
@@ -4234,7 +4262,7 @@ impl LanguageServer for Backend {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "!! {:?} FINISHED! {:?}",
             params.text_document.version,
             params.text_document.uri.to_string()
@@ -4260,7 +4288,7 @@ impl LanguageServer for Backend {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "!! {:?} FINISHED! {:?}",
             params.text_document.version,
             params.text_document.uri.to_string()
@@ -6677,7 +6705,7 @@ impl Backend {
             } else {
                 true
             };
-            tracing::info!(
+            tracing::debug!(
                 "exports_changed={:?} {:?} {:?}",
                 exports_changed,
                 fi,
@@ -6752,7 +6780,7 @@ impl Backend {
             if size_last_iter == to_check.len() {
                 break;
             }
-            tracing::info!("CASCADE ITER {:?} {:?}", size_last_iter, to_check.len());
+            tracing::debug!("CASCADE ITER {:?} {:?}", size_last_iter, to_check.len());
             size_last_iter = to_check.len();
             let done = to_check
                 .difference(&checked)
@@ -6762,7 +6790,7 @@ impl Backend {
                     let m = &*self.modules.try_get(x).try_unwrap()?;
                     let fi = *self.ud_to_fi.try_get(x).try_unwrap()?;
                     let version = *self.fi_to_version.try_get(&fi).try_unwrap()?;
-                    tracing::info!("RESOLVING {:?} {}", x, to_check.len());
+                    tracing::debug!("RESOLVING {:?} {}", x, to_check.len());
                     let _ = self.resolve_module(m, fi, version);
                     Some((
                         **x,
@@ -6773,7 +6801,7 @@ impl Backend {
                             .map(|ex| ex.iter().any(|x| x.contains(name)))
                             .unwrap_or(false)
                         {
-                            tracing::info!("REEXPORT {:?} {}", x, to_check.len());
+                            tracing::debug!("REEXPORT {:?} {}", x, to_check.len());
                             // It's a re-export which means we need to check everything that imports this as well!
                             self.importers
                                 .try_get(x)
@@ -6790,7 +6818,7 @@ impl Backend {
                 })
                 .collect::<Vec<_>>();
             for (x, mut extra, fi, version) in done.into_iter() {
-                tracing::info!("DONE CHECK {:?}", x);
+                tracing::debug!("DONE CHECK {:?}", x);
                 checked.insert(x);
                 to_check.append(&mut extra);
                 to_notify.push((fi, version));
@@ -6945,21 +6973,21 @@ impl Backend {
             tracing::info!("!! {:?} ABORTED {:?}", version, uri.to_string());
             return None;
         }
-        tracing::info!("!! {:?} GOT LOCK {:?}", version, uri.to_string());
+        tracing::debug!("!! {:?} GOT LOCK {:?}", version, uri.to_string());
 
         // I have to copy it! :(
         self.fi_to_source.insert(fi, source.to_string());
         record_line_index(fi, source);
-        tracing::info!("!! {:?} A {:?}", version, uri.to_string());
+        tracing::debug!("!! {:?} A {:?}", version, uri.to_string());
         self.fi_to_uri.insert(fi, uri.clone());
-        tracing::info!("!! {:?} B {:?}", version, uri.to_string());
+        tracing::debug!("!! {:?} B {:?}", version, uri.to_string());
         let (m, fi) = self.parse(fi, source);
 
-        tracing::info!("!! {:?} PARSING DONE {:?}", version, uri.to_string());
+        tracing::debug!("!! {:?} PARSING DONE {:?}", version, uri.to_string());
 
         // TODO: We could exit earlier if we have the same syntactical structure here
         let to_notify = if let Some(m) = m {
-            tracing::info!("!! {:?} PRE RESOLVE {:?}", version, uri.to_string());
+            tracing::debug!("!! {:?} PRE RESOLVE {:?}", version, uri.to_string());
             if let Some((exports_changed, me)) = self.resolve_module(&m, fi, version) {
                 // If the module name changed (e.g. user is typing a new name),
                 // clean up stale entries keyed by the old Ud.
@@ -6976,16 +7004,16 @@ impl Backend {
                     }
                 }
                 self.modules.insert(me, m);
-                tracing::info!("!! {:?} H {:?}", version, uri.to_string());
+                tracing::debug!("!! {:?} H {:?}", version, uri.to_string());
                 self.fi_to_ud.insert(fi, me);
-                tracing::info!("!! {:?} I {:?}", version, uri.to_string());
+                tracing::debug!("!! {:?} I {:?}", version, uri.to_string());
                 self.ud_to_fi.insert(me, fi);
-                tracing::info!("!! {:?} J {:?}", version, uri.to_string());
+                tracing::debug!("!! {:?} J {:?}", version, uri.to_string());
 
                 if exports_changed {
-                    tracing::info!("CASCADE CHANGE - START");
+                    tracing::debug!("CASCADE CHANGE - START");
                     let to_notify = self.resolve_cascading(me, fi, version);
-                    tracing::info!("CASCADE CHANGE - END");
+                    tracing::debug!("CASCADE CHANGE - END");
                     to_notify
                 } else {
                     Vec::new()
@@ -6996,7 +7024,7 @@ impl Backend {
         } else {
             Vec::new()
         };
-        tracing::info!("!! {:?} DROP LOCK {:?}", version, uri.to_string());
+        tracing::debug!("!! {:?} DROP LOCK {:?}", version, uri.to_string());
         drop(lock);
         Some((fi, version, to_notify))
     }
@@ -7092,6 +7120,30 @@ fn pos_from_tup(fi: Option<ast::Fi>, (line, col): ast::Pos) -> Position {
     )
 }
 
+/// Whether an event from `target` at `level` is written to the log file. Our own crates and
+/// the LSP framework are logged up to `own_max`; every other dependency (notify, mio, ...)
+/// is limited to warnings and errors.
+///
+/// This has to match on the real target. Events from dependencies using the `log` crate are
+/// re-emitted with target "log", but `tracing-log` asks the subscriber whether they are
+/// enabled using the record's own target (`notify::inotify`), and that answer is the one
+/// that sticks - so a check on "log" never matches and lets every TRACE event through.
+fn log_enabled(target: &str, level: tracing::Level, own_max: tracing::Level) -> bool {
+    target != "tower_lsp_server::codec"
+        && (level <= tracing::Level::WARN
+            || (level <= own_max
+                && (target.starts_with("hemlis") || target.starts_with("tower_lsp_server"))))
+}
+
+/// The most verbose level our own crates log at, from `HEMLIS_LOG` (`error`, `warn`, `info`,
+/// `debug` or `trace`). Defaults to `info`; the per-module resolution chatter is `debug`.
+fn own_log_level() -> tracing::Level {
+    std::env::var("HEMLIS_LOG")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(tracing::Level::INFO)
+}
+
 /// Delete `hemlis-*.log` files older than a day, leaving logs of other running instances alone.
 fn remove_old_logs(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -7155,17 +7207,15 @@ async fn main() {
         let log_file = File::create(&log_file_path).unwrap();
         eprintln!("Logging to {:?}", log_file_path);
 
+        let own_max = own_log_level();
         let layer = json_subscriber::layer()
             .with_file(true)
             .with_line_number(true)
             .with_thread_ids(true)
             .with_level(true)
             .with_writer(log_file)
-            .with_filter(FilterFn::new(|x| {
-                // Dependencies using the `log` crate (notify, mio, ...) all arrive with
-                // target "log"; only keep their warnings and errors.
-                x.target() != "tower_lsp_server::codec"
-                    && (x.target() != "log" || *x.level() <= tracing::Level::WARN)
+            .with_filter(FilterFn::new(move |x| {
+                log_enabled(x.target(), *x.level(), own_max)
             }));
 
         std::panic::set_hook(Box::new(|panic| {
