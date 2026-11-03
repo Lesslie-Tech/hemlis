@@ -135,6 +135,11 @@ pub const RULES: &[RuleInfo] = &[
         description: "Module header without an export list",
     },
     RuleInfo {
+        name: style_rules::PARTIAL_CONSTRUCTORS,
+        kind: RuleKind::Module,
+        description: "Partial constructor lists `T(A, B)` in imports/exports (use `T(..)` or `T`)",
+    },
+    RuleInfo {
         name: NO_UNUSED_IMPORTS,
         kind: RuleKind::Module,
         description: "Imports, import aliases and imported constructors that are never used (fix: delete)",
