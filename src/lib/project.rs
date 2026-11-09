@@ -41,6 +41,8 @@ pub struct ProjectData {
     pub defines: BTreeMap<ast::Ud, BTreeMap<nr::Name, nr::DefineSpans>>,
     /// Operator -> the name it aliases, across all modules.
     pub operator_aliases: BTreeMap<nr::Name, nr::Name>,
+    /// Every name declared as a member of a `class`, across all modules.
+    pub class_members: BTreeSet<nr::Name>,
     /// Resolver errors and warnings, in resolution order.
     pub errors: Vec<nr::NRerrors>,
     /// Modules that never resolved because a dependency never became available, with the
@@ -109,6 +111,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
     let mut resolved = BTreeMap::new();
     let mut defines = BTreeMap::new();
     let mut operator_aliases = BTreeMap::new();
+    let mut class_members = BTreeSet::new();
     let mut errors = Vec::new();
 
     let mut remaining: Vec<&ParsedModule> = modules.iter().collect();
@@ -146,6 +149,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
             resolved.insert(m.me, n.resolved);
             defines.insert(m.me, n.defines);
             operator_aliases.append(&mut n.operator_aliases);
+            class_members.append(&mut n.class_members);
             done.insert(m.me);
         }
     }
@@ -166,6 +170,7 @@ pub fn resolve_project(files: &[String]) -> ProjectData {
         resolved,
         defines,
         operator_aliases,
+        class_members,
         errors,
         deadlocked,
         read_errors,
