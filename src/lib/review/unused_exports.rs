@@ -5,7 +5,9 @@
 //! call graph has a call into it from another module, or when it is a root: named or suffixed in
 //! the config, listed explicitly, or found by scanning Elixir/Erlang sources. Values and operators
 //! are reported by default; types and classes only with `report-types`, because the compiled
-//! code cannot confirm them. Constructors are left to `no-unused-constructors`.
+//! code cannot confirm them. Constructors are left to `no-unused-constructors`. A class's members
+//! are never reported: they are used through its instances, not by name, and PureScript requires
+//! them to stay exported alongside the class.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -128,6 +130,12 @@ pub fn check(project: &ProjectData, ctx: &Context) -> Vec<Finding> {
                 nr::Export::ConstructorsAll(t, _, _) | nr::Export::ConstructorsSome(t, _, _) => *t,
             };
             if name.module() != m.me || !seen.insert(name) {
+                continue;
+            }
+            // A class's members are used through its instances, not by name, and PureScript
+            // requires them to be exported along with the class, so `--fix` dropping one from
+            // the export list would most likely not compile. (PAY-4506)
+            if project.class_members.contains(&name) {
                 continue;
             }
             let text = project.name(name.name());

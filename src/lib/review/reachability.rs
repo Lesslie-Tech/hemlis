@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::unused_exports::{reportable_kind, Context};
-use super::Finding;
+use super::{Edit, Finding};
 use crate::project::ProjectData;
 use crate::{ast, nr};
 
@@ -199,11 +199,15 @@ pub fn check_unused_modules(project: &ProjectData, ctx: &Context, liveness: &Liv
             }
         }
         if any && !any_live {
+            // Safe only when nothing else imports the module: an empty-looking import (brought
+            // in solely for its instances) would otherwise lose its source file.
+            let fix = (!project.modules.iter().any(|other| other.me != m.me && other.deps.contains(&m.me)))
+                .then(|| vec![Edit::DeleteFile(m.fi)]);
             findings.push(Finding {
                 rule: UNUSED_MODULES,
                 span: header.0 .0 .1,
                 message: format!("Module `{}` has no definition reachable from any entry point", module_name),
-                fix: None,
+                fix,
             });
         }
     }

@@ -201,6 +201,11 @@ pub struct N<'s> {
     pub locals: Vec<Name>,
     pub imports: BTreeMap<Option<ast::Ud>, BTreeMap<ast::Ud, Vec<Export>>>,
 
+    // Term-scope names declared as members of a `class`: used through instances, not by name, so
+    // `no-unused-exports` must never report them and `--fix` must never drop them from the
+    // export list (PureScript requires a class's members to be exported along with it). (PAY-4506)
+    pub class_members: BTreeSet<Name>,
+
     // NOTE[et]: Do not like this flag - at all!
     pub self_is_exported: bool,
 
@@ -227,6 +232,7 @@ impl<'s> N<'s> {
             imports: BTreeMap::new(),
             defines: BTreeMap::new(),
             locals: Vec::new(),
+            class_members: BTreeSet::new(),
 
             self_is_exported: false,
             operator_aliases: BTreeMap::new(),
@@ -1036,6 +1042,7 @@ impl<'s> N<'s> {
                 self.def_global(Class, d.0 .0, d.0 .1, dec.span(), is_redecl);
                 for mem @ ast::ClassMember(name, _) in mem.iter() {
                     self.def_global(Term, name.0 .0, name.0 .1, mem.span(), false);
+                    self.class_members.insert(Name(Term, self.me, name.0 .0, Visibility::Public));
                 }
             }
             ast::Decl::Foreign(d, _) => {

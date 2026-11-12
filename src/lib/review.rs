@@ -172,7 +172,7 @@ pub const RULES: &[RuleInfo] = &[
     RuleInfo {
         name: reachability::UNUSED_MODULES,
         kind: RuleKind::Project,
-        description: "Modules none of whose definitions any entry point reaches",
+        description: "Modules none of whose definitions any entry point reaches (fix: delete the file, when unimported)",
     },
 ];
 
@@ -207,6 +207,9 @@ pub enum Edit {
     /// Delete whole lines, inclusive, plus the `--` comment lines directly above and one of the
     /// blank lines left around the hole.
     DeleteLines { fi: ast::Fi, from: usize, to: usize },
+    /// Delete the whole file: the fix for `no-unused-modules`, when nothing imports it. Any other
+    /// edit queued for the same file in the same pass is dropped in its favour.
+    DeleteFile(ast::Fi),
 }
 
 pub struct Finding {
@@ -566,7 +569,7 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
         return EXIT_OK;
     }
 
-    let s = match setup(&opts, &files) {
+    let mut s = match setup(&opts, &files) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("ERR: {}", e);
@@ -615,7 +618,12 @@ pub fn run_cli(opts: ReviewOptions, files: Vec<String>) -> i32 {
             break (pass, failed);
         }
         match apply_fixes(&project, by_file) {
-            Ok(files_written) => eprintln!("pass {}: applied {} fixes in {} files", passes, fixed_now, files_written),
+            Ok((files_written, deleted)) => {
+                eprintln!("pass {}: applied {} fixes in {} files", passes, fixed_now, files_written);
+                // Deleted files no longer exist to read; drop them so the next pass does not
+                // treat them as a read error.
+                s.analysis_files.retain(|f| !deleted.contains(f));
+            }
             Err(e) => {
                 eprintln!("ERR: {}", e);
                 return EXIT_ERROR;
@@ -741,10 +749,18 @@ fn delete_lines_range(src: &str, from: usize, to: usize) -> Option<(usize, usize
 }
 
 /// Applies edits per file, last-to-first so earlier offsets stay valid. An edit overlapping one
-/// already applied is skipped; the next pass picks it up.
-fn apply_fixes(project: &ProjectData, by_file: BTreeMap<&str, Vec<&Edit>>) -> Result<usize, String> {
+/// already applied is skipped; the next pass picks it up. Returns the number of files touched and
+/// the paths of any files deleted outright, so the caller can drop them from later passes.
+fn apply_fixes(project: &ProjectData, by_file: BTreeMap<&str, Vec<&Edit>>) -> Result<(usize, Vec<String>), String> {
     let mut written = 0;
+    let mut deleted = Vec::new();
     for (path, edits) in by_file {
+        if edits.iter().any(|e| matches!(e, Edit::DeleteFile(_))) {
+            fs::remove_file(path).map_err(|e| format!("could not delete '{}': {}", path, e))?;
+            deleted.push(path.to_string());
+            written += 1;
+            continue;
+        }
         let m = project
             .modules
             .iter()
@@ -757,6 +773,7 @@ fn apply_fixes(project: &ProjectData, by_file: BTreeMap<&str, Vec<&Edit>>) -> Re
                     source::span_to_byte_range(&m.src, span).map(|(lo, hi)| (lo, hi, text.as_str()))
                 }
                 Edit::DeleteLines { from, to, .. } => delete_lines_range(&m.src, *from, *to).map(|(lo, hi)| (lo, hi, "")),
+                Edit::DeleteFile(_) => None,
             })
             .collect();
         // An edit inside another edit's range is redundant (an unused entry of an import that
@@ -779,7 +796,7 @@ fn apply_fixes(project: &ProjectData, by_file: BTreeMap<&str, Vec<&Edit>>) -> Re
         fs::write(path, out).map_err(|e| format!("could not write '{}': {}", path, e))?;
         written += 1;
     }
-    Ok(written)
+    Ok((written, deleted))
 }
 
 #[cfg(test)]
@@ -861,6 +878,76 @@ mod tests {
         let b = fs::read_to_string(dir.join("B.purs")).unwrap();
         // `bar` stays in the first list: the resolver tracks use per name, not per declaration.
         assert_eq!(b, "module B (main) where\n\nimport A (foo, bar)\nimport A (bar) as Only\n\nmain :: Int\nmain = foo + Only.bar\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn class_members_are_never_reported_as_unused_exports() {
+        let dir = temp_project("class-members");
+        fs::write(
+            dir.join("A.purs"),
+            "module A (class ColumnValue, render, defaultAlignment, unused) where\n\nclass ColumnValue v where\n  render :: v -> String\n  defaultAlignment :: v -> Int\n\nunused :: Int\nunused = 1\n",
+        )
+        .unwrap();
+        fs::write(dir.join("B.purs"), "module B (main) where\n\nimport A as A\n\nmain :: Int\nmain = 1\n").unwrap();
+
+        let code = run_cli(fix_opts(&dir, &[unused_exports::NAME]), Vec::new());
+
+        let a = fs::read_to_string(dir.join("A.purs")).unwrap();
+        // `render` and `defaultAlignment` stay: a class's members are used through its instances,
+        // not by name, and dropping one from the export list would most likely not compile.
+        assert_eq!(
+            a,
+            "module A (class ColumnValue, render, defaultAlignment) where\n\nclass ColumnValue v where\n  render :: v -> String\n  defaultAlignment :: v -> Int\n\nunused :: Int\nunused = 1\n",
+            "{}",
+            a
+        );
+        // `main` in B is still unused, so the run still reports findings.
+        assert_eq!(code, EXIT_FINDINGS);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_deletes_an_unused_module_when_nothing_imports_it() {
+        let dir = temp_project("unused-module-delete");
+        fs::write(dir.join("Dead.purs"), "module Dead (deadFn) where\n\ndeadFn :: Int\ndeadFn = 1\n").unwrap();
+        fs::write(dir.join("Main.purs"), "module Main (main) where\n\nmain :: Int\nmain = 1\n").unwrap();
+
+        fs::write(
+            dir.join("hemlis-review.json"),
+            r#"{ "files": ["*.purs"], "rules": { "no-unused-exports": { "roots-named": ["main"] } } }"#,
+        )
+        .unwrap();
+        let opts = fix_opts(&dir, &[reachability::UNUSED_MODULES]);
+
+        let code = run_cli(opts, Vec::new());
+
+        assert!(!dir.join("Dead.purs").exists());
+        assert_eq!(code, EXIT_OK);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_keeps_an_unused_module_that_is_still_imported() {
+        let dir = temp_project("unused-module-keep");
+        fs::write(dir.join("Dead.purs"), "module Dead (deadFn) where\n\ndeadFn :: Int\ndeadFn = 1\n").unwrap();
+        fs::write(
+            dir.join("Main.purs"),
+            "module Main (main) where\n\nimport Dead as Dead\n\nmain :: Int\nmain = 1\n",
+        )
+        .unwrap();
+
+        fs::write(
+            dir.join("hemlis-review.json"),
+            r#"{ "files": ["*.purs"], "rules": { "no-unused-exports": { "roots-named": ["main"] } } }"#,
+        )
+        .unwrap();
+        let opts = fix_opts(&dir, &[reachability::UNUSED_MODULES]);
+
+        let code = run_cli(opts, Vec::new());
+
+        assert!(dir.join("Dead.purs").exists());
+        assert_eq!(code, EXIT_FINDINGS);
         let _ = fs::remove_dir_all(&dir);
     }
 
